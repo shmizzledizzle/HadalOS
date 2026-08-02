@@ -1,0 +1,9 @@
+# HadalOS's own packages are ~amd64 and always will be: they track this
+# repository, not Gentoo's stabilisation process.
+sys-kernel/hadalos-kernel ~amd64
+sys-boot/hadalos-limine-hook ~amd64
+app-admin/hadalos-portage-hook ~amd64
+
+# The mainline-tip kernel is a live ebuild and is NOT accepted here. Pulling
+# Linus's tree into a release image would make that image unreproducible by
+# construction. Install it deliberately on a machine, never into an ISO.

@@ -52,8 +52,11 @@ Foundation. Nothing boots yet.
 | `hadal` CLI (`ask` / `explain` / `why` / `status`) | working |
 | Portage build-failure capture | 13/13 |
 | End-to-end chain (model → polkit → executor) | 27/27 |
-| Cross-file capability consistency check | passing, negative-tested |
-| `sys-kernel/hadalos-sources` | not started |
+| `sys-kernel/hadalos-kernel` (7.1.5 pinned + 9999 mainline) | written, Manifest generated, **never built** |
+| Kernel config fragment | 98 symbols, checked against every unit directive |
+| catalyst specs (stage1 → stage3 → livecd ×2) | written, chain validated, **never run** |
+| Limine ISO assembly | 25/25 — real ISO built and inspected |
+| Static consistency checks (capability / kernel / catalyst) | passing, all negative-tested |
 | `hadalwm` | not started |
 | HadalOS Shell | not started |
 | catalyst specs | not started |
@@ -62,14 +65,18 @@ Everything marked *untested on hardware* has been syntax-checked only. The
 boot layer is the significant remaining gap — it has been functionally tested
 against synthetic kernel trees but has never booted a machine.
 
-101 checks currently pass, on real Linux, across four suites:
+126 checks currently pass, on real Linux, across five suites:
 
 ```bash
 wsl -d Debian -u root -- bash scripts/wsl-verify.sh
 ```
 
-Then, as root on a systemd machine: `scripts/integration-test.sh` and
-`scripts/e2e-test.sh`.
+Then, as root on a systemd machine: `scripts/integration-test.sh`,
+`scripts/e2e-test.sh` and `scripts/test-mkiso.sh`.
+
+The kernel and catalyst layers are the honest exception — they are validated
+statically but have never been built, because that needs a Gentoo host. See
+[catalyst/README.md](catalyst/README.md).
 
 ---
 

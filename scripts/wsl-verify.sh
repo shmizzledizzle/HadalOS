@@ -42,12 +42,18 @@ step "shell syntax"
 while IFS= read -r f; do
     printf '  %-64s ' "${f#$BUILD/}"
     bash -n "$f" && echo OK
-done < <(find "$BUILD/scripts" "$BUILD/overlay" -type f \
-            \( -name '*.sh' -o -name 'hadalos-*' -o -name '*.install' \) \
+done < <(find "$BUILD/scripts" "$BUILD/overlay" "$BUILD/catalyst" -type f \
+            \( -name '*.sh' -o -name 'hadalos-*' -o -name '*.install' -o -name '*.ebuild' \) \
             -not -name '*.service')
 
 step "capability consistency"
 python3 "$BUILD/scripts/check-consistency.py" | tail -8
+
+step "kernel config vs. systemd units"
+python3 "$BUILD/scripts/check-kernel-config.py" | tail -8
+
+step "catalyst specs"
+python3 "$BUILD/scripts/check-catalyst-specs.py" | tail -4
 
 bash "$BUILD/scripts/test-portage-hook.sh" | tail -20
 
