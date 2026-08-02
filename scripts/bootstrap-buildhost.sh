@@ -81,7 +81,20 @@ free_gb=$(( $(stat -f -c '%a * %S' "$parent") / 1024 / 1024 / 1024 ))
 if (( free_gb < MIN_FREE_GB )); then
     die "only ${free_gb} GB free at $parent; need at least ${MIN_FREE_GB} GB"
 fi
-log "disk: ${free_gb} GB free at $parent"
+
+fstype="$(stat -f -c %T "$parent" 2>/dev/null || echo unknown)"
+log "disk: ${free_gb} GB free at $parent (${fstype})"
+
+# A tmpfs build root is backed by RAM. Extracting a stage3 into one on a
+# 16 GB box does not fail cleanly — it swaps until the OOM killer arrives.
+if [[ $fstype == tmpfs || $fstype == ramfs ]]; then
+    die "$parent is $fstype (RAM-backed). Pick a location on real storage."
+fi
+
+if (( free_gb < 100 )); then
+    warn "under 100 GB free — enough for stages, tight for a full catalyst"
+    warn "chain (stage1 + stage3 + livecd + distfiles + binpkgs)."
+fi
 
 nproc_count="$(nproc)"
 mem_gb=$(( $(awk '/MemTotal/ {print $2}' /proc/meminfo) / 1024 / 1024 ))
@@ -116,6 +129,38 @@ else
 fi
 
 run mkdir -p "$ROOT"
+
+# ── btrfs: disable copy-on-write before anything is written ─────────────
+# Portage's write pattern (unpack, compile in place, rewrite, delete) is the
+# worst case for CoW: the build tree fragments badly and never recovers, and
+# every subsequent emerge on this host is slower for it.
+#
+# Timing is the whole point. chattr +C only affects files created *after* it
+# is set, so it has to happen on an empty directory — which means here,
+# before the stage3 is extracted, and not as a later fix-up.
+if [[ $fstype == btrfs ]]; then
+    log "btrfs detected — disabling copy-on-write on the build root"
+    if command -v btrfs >/dev/null && ! (( DRY_RUN )); then
+        # A dedicated subvolume also keeps the build tree out of any snapshot
+        # the host takes of / — a snapshotted 40 GB build tree is a bad
+        # surprise on a rollback.
+        if [[ ! -d $ROOT/.. ]] || ! btrfs subvolume show "$ROOT" >/dev/null 2>&1; then
+            rmdir "$ROOT" 2>/dev/null && btrfs subvolume create "$ROOT" >/dev/null \
+                && log "created subvolume $ROOT" \
+                || mkdir -p "$ROOT"
+        fi
+    fi
+    if ! (( DRY_RUN )); then
+        chattr +C "$ROOT" 2>/dev/null \
+            && log "nodatacow set on $ROOT" \
+            || warn "could not set nodatacow on $ROOT — builds will fragment"
+        # Verify rather than assume: chattr silently no-ops on some setups.
+        lsattr -d "$ROOT" 2>/dev/null | grep -q 'C' \
+            || warn "nodatacow does NOT appear to be active on $ROOT"
+    else
+        printf '   would run: btrfs subvolume create %s && chattr +C %s\n' "$ROOT" "$ROOT"
+    fi
+fi
 
 if ! (( DRY_RUN )); then
     tarball="$parent/$(basename "$STAGE3")"
