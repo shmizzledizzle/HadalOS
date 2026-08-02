@@ -1,4 +1,4 @@
-# Trench Linux — Architecture of Record
+# HadalOS — Architecture of Record
 
 A Gentoo-derived Linux distribution with a locally-hosted AI (Hadal) as a
 first-class system component, booted by Limine, running mainline Linux, with a
@@ -16,7 +16,7 @@ Everything here is a decision that has been made. Open questions live in
 | Base | Gentoo, `amd64`, **systemd** profile | 2026-08-01 |
 | Init | systemd — required for D-Bus system services, socket activation, and the sandboxing directives that make the capability broker enforceable | 2026-08-01 |
 | Bootloader | Limine (`sys-boot/limine`, 12.x) | 2026-08-01 |
-| Kernel | mainline `torvalds/linux`, pinned per release, via `sys-kernel/trench-sources` | 2026-08-01 |
+| Kernel | mainline `torvalds/linux`, pinned per release, via `sys-kernel/hadalos-sources` | 2026-08-01 |
 | X server | **XLibre** (`X11Libre/ports-gentoo` overlay), not Xorg | 2026-08-01 |
 | WM core | Rust + `x11rb` | 2026-08-01 |
 | Shell UI | C# / Avalonia | 2026-08-01 |
@@ -41,7 +41,7 @@ vs. "writing a Wayland compositor," which is a categorically larger job.
 ### Why mainline-tip is safe *here* specifically
 
 Riding `torvalds/linux` normally means fighting out-of-tree modules on every
-rebase. Trench's reference hardware is RX 9060 (RDNA4) and Intel Iris Xe —
+rebase. HadalOS's reference hardware is RX 9060 (RDNA4) and Intel Iris Xe —
 both fully in-tree. There is no proprietary NVIDIA module to lag behind the
 kernel. RDNA4 + ROCm actively *wants* new kernels.
 
@@ -54,10 +54,10 @@ carries at least two entries — newest and last-known-good.** See §3.
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│  Trench Shell (C#/Avalonia)                                 │
+│  HadalOS Shell (C#/Avalonia)                                 │
 │  panel · launcher · settings · Hadal overlay (hotkey)       │
 ├─────────────────────────────────────────────────────────────┤
-│  trenchwm (Rust/x11rb)          │  trench-greeter (greetd)  │
+│  hadalwm (Rust/x11rb)          │  hadalos-greeter (greetd)  │
 ├─────────────────────────────────┴───────────────────────────┤
 │  XLibre X server                                            │
 ├─────────────────────────────────────────────────────────────┤
@@ -134,7 +134,7 @@ The RAG index (reusing Hadal's existing resumable `build_index.py`) is
 re-pointed at the Gentoo wiki, the handbook, the ebuild tree, and kernel
 `Documentation/`.
 
-**journald.** `trench why` — reads the previous boot's failed units and
+**journald.** `hadal why` — reads the previous boot's failed units and
 explains them.
 
 **Shell.** A zsh/bash widget that turns a natural-language line into a
@@ -168,11 +168,11 @@ split — the distro consumes it rather than reinventing it.
 ## 3. Boot
 
 `sys-boot/limine` has no installkernel integration (unlike GRUB and
-systemd-boot), so Trench provides its own `kernel-install` plugin that
+systemd-boot), so HadalOS provides its own `kernel-install` plugin that
 generates `limine.conf` from installed kernels.
 
 Invariant: **the generated config always contains a last-known-good entry**,
-pinned in `/etc/trench/lastgood`, and never garbage-collects the kernel it
+pinned in `/etc/hadalos/lastgood`, and never garbage-collects the kernel it
 points at. Riding mainline without this is how you end up at a UEFI shell.
 
 Limine also gives menu theming for free, which is where distro branding lands.
@@ -182,15 +182,15 @@ Limine also gives menu theming for free, which is where distro branding lands.
 ## 4. Repository layout
 
 ```
-overlay/          Gentoo ebuild overlay (::trench)
+overlay/          Gentoo ebuild overlay (::hadalos)
 catalyst/         stage + livecd specs
 dbus/             D-Bus interface definitions and bus policy
 policy/           polkit action definitions
 systemd/          unit files
 src/hadal-brokerd Rust — D-Bus service, capability broker
-src/trenchwm      Rust — X11 window manager
-src/trench-shell  C#/Avalonia — panel, launcher, settings, Hadal overlay
-src/trench-greeter greetd greeter
+src/hadalwm      Rust — X11 window manager
+src/hadalos-shell  C#/Avalonia — panel, launcher, settings, Hadal overlay
+src/hadalos-greeter greetd greeter
 scripts/          build-host bootstrap and release tooling
 ```
 

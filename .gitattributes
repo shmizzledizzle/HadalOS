@@ -25,7 +25,7 @@
 *.axaml     text eol=lf
 
 # Scripts installed without an extension.
-overlay/**/files/trench-*        text eol=lf
+overlay/**/files/hadalos-*        text eol=lf
 scripts/*                        text eol=lf
 
 # Windows-side helpers stay CRLF.

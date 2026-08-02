@@ -1,20 +1,20 @@
 [Unit]
 Description=Record the running kernel as last known good
-Documentation=man:trench-limine-update(8)
+Documentation=man:hadalos-limine-update(8)
 After=multi-user.target
 # Only meaningful once the system has settled far enough that "it booted"
 # is a claim worth making.
-ConditionPathExists=/boot/trench
+ConditionPathExists=/boot/hadalos
 
 [Service]
 Type=oneshot
 ExecStartPre=/usr/bin/sleep 60
-ExecStart=/usr/bin/trench-mark-boot-good
+ExecStart=/usr/bin/hadalos-mark-boot-good
 RemainAfterExit=no
 
 # Touches exactly one file plus the generated bootloader config.
 ProtectSystem=strict
-ReadWritePaths=/etc/trench /boot
+ReadWritePaths=/etc/hadalos /boot
 ProtectHome=yes
 PrivateNetwork=yes
 PrivateTmp=yes

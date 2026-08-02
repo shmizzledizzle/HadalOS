@@ -1,6 +1,6 @@
 [Unit]
 Description=Hadal capability broker (org.hadal.Broker1)
-Documentation=https://github.com/shmizzledizzle/Trench
+Documentation=https://github.com/shmizzledizzle/HadalOS
 Requires=hadald.service
 After=hadald.service dbus.service
 Requires=dbus.service

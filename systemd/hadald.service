@@ -1,6 +1,6 @@
 [Unit]
 Description=Hadal model host
-Documentation=https://github.com/shmizzledizzle/Trench
+Documentation=https://github.com/shmizzledizzle/HadalOS
 After=network.target
 Before=hadal-brokerd.service
 
@@ -32,7 +32,7 @@ OOMScoreAdjust=500
 
 # ── Isolation ──────────────────────────────────────────────────────────
 # hadald holds the model and nothing else. It has no privilege, no route to
-# the filesystem, and — critically — no network. Trench's claim that the
+# the filesystem, and — critically — no network. HadalOS's claim that the
 # assistant is local is enforced by the kernel here, not by a promise in a
 # README.
 #

@@ -1,7 +1,7 @@
 <!DOCTYPE node PUBLIC "-//freedesktop//DTD D-BUS Object Introspection 1.0//EN"
  "http://www.freedesktop.org/standards/dbus/1.0/introspect.dtd">
 <!--
-  org.hadal.Broker1 — the OS-component boundary for Trench Linux.
+  org.hadal.Broker1 — the OS-component boundary for HadalOS.
 
   This is the interface that makes Hadal part of the operating system rather
   than an application that ships with it. Any process on the system may open a

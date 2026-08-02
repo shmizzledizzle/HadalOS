@@ -10,7 +10,7 @@
 #   $5… initrd images     (add only)
 #
 # Exit 77 means "not applicable, skip me" — that is how we stay inert on a
-# machine configured for a BLS/GRUB layout instead of Trench's.
+# machine configured for a BLS/GRUB layout instead of HadalOS's.
 
 set -euo pipefail
 
@@ -19,14 +19,14 @@ VERSION="${2:?}"
 
 BOOT_ROOT="${KERNEL_INSTALL_BOOT_ROOT:-/boot}"
 LAYOUT="${KERNEL_INSTALL_LAYOUT:-}"
-DEST="$BOOT_ROOT/trench/$VERSION"
-LASTGOOD_FILE="/etc/trench/lastgood"
+DEST="$BOOT_ROOT/hadalos/$VERSION"
+LASTGOOD_FILE="/etc/hadalos/lastgood"
 
-log() { printf '90-trench-limine: %s\n' "$*" >&2; }
+log() { printf '90-hadalos-limine: %s\n' "$*" >&2; }
 
-# Set `layout=trench` in /etc/kernel/install.conf to enable. If some other
+# Set `layout=hadalos` in /etc/kernel/install.conf to enable. If some other
 # layout is configured, this is not our machine to touch.
-[[ -z $LAYOUT || $LAYOUT == trench ]] || exit 77
+[[ -z $LAYOUT || $LAYOUT == hadalos ]] || exit 77
 
 case "$COMMAND" in
 add)
@@ -73,9 +73,9 @@ esac
 # Regenerating after every add/remove keeps limine.conf a pure function of
 # what is on disk, so a half-finished emerge can never leave a stale entry
 # pointing at a kernel that isn't there.
-if command -v trench-limine-update >/dev/null 2>&1; then
-    trench-limine-update
+if command -v hadalos-limine-update >/dev/null 2>&1; then
+    hadalos-limine-update
 else
-    log "trench-limine-update not found; limine.conf NOT regenerated"
+    log "hadalos-limine-update not found; limine.conf NOT regenerated"
     exit 1
 fi
