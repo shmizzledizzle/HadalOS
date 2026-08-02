@@ -1,0 +1,160 @@
+<!DOCTYPE node PUBLIC "-//freedesktop//DTD D-BUS Object Introspection 1.0//EN"
+ "http://www.freedesktop.org/standards/dbus/1.0/introspect.dtd">
+<!--
+  org.hadal.Broker1 — the OS-component boundary for Trench Linux.
+
+  This is the interface that makes Hadal part of the operating system rather
+  than an application that ships with it. Any process on the system may open a
+  session; what that session is permitted to *do* is decided here, not by the
+  model.
+
+  Design rule, enforced by the shape of this interface: the model never
+  receives a shell and never names a command. It proposes actions drawn from a
+  closed enum, with typed parameters. Execution is a separate, authorized,
+  client-initiated call.
+-->
+<node>
+
+  <!--
+    Root object: /org/hadal/Broker1
+  -->
+  <interface name="org.hadal.Broker1">
+
+    <!--
+      Opens a session. Returns the object path of an org.hadal.Session1.
+
+      options:
+        "tier"      s   "reflex" | "deep" | "auto"   (default "auto")
+        "surface"   s   free-form origin hint, e.g. "shell", "portage",
+                        "desktop", "settings". Used for policy decisions and
+                        audit, NOT trusted for authorization.
+        "locale"    s
+    -->
+    <method name="CreateSession">
+      <arg type="a{sv}" name="options"   direction="in"/>
+      <arg type="o"     name="session"   direction="out"/>
+    </method>
+
+    <!--
+      The capabilities this caller could request, given current policy.
+      Each entry: capability id -> "allow" | "auth" | "deny".
+      Clients use this to grey out affordances rather than to enforce anything.
+    -->
+    <method name="AvailableCapabilities">
+      <arg type="a{ss}" name="capabilities" direction="out"/>
+    </method>
+
+    <!-- Which model tiers are actually loadable right now. -->
+    <property name="AvailableTiers" type="as" access="read"/>
+
+    <!-- true when hadald is up and has a model resident. -->
+    <property name="Ready" type="b" access="read"/>
+
+    <property name="Version" type="s" access="read"/>
+  </interface>
+
+  <!--
+    Per-session object: /org/hadal/Broker1/session/<n>
+  -->
+  <interface name="org.hadal.Session1">
+
+    <!--
+      Submit a prompt. Returns immediately with a request id; output arrives
+      as Delta signals. Long generations must survive a client that is slow,
+      backgrounded, or locked — same job/poll model the Hadal web app already
+      uses.
+
+      context:
+        "cwd"           s
+        "unit"          s   systemd unit under discussion
+        "portage_log"   s   path to a build log (must pass read-path policy)
+        "selection"     s   user-highlighted text
+        "attachments"   as  paths (each checked against read-path policy)
+    -->
+    <method name="Ask">
+      <arg type="s"     name="prompt"  direction="in"/>
+      <arg type="a{sv}" name="context" direction="in"/>
+      <arg type="u"     name="request" direction="out"/>
+    </method>
+
+    <method name="Cancel">
+      <arg type="u" name="request" direction="in"/>
+    </method>
+
+    <!--
+      Execute a previously proposed action.
+
+      `token` is an opaque, single-use, session-bound handle minted by the
+      broker when it emitted ActionProposed. Clients cannot construct one, and
+      the model never sees one. This call triggers the polkit check for the
+      capability the proposal was classified under; for Mutate-tier
+      capabilities that is auth_admin, every time, with no retained
+      authorization.
+
+      Returns the action's own structured result. Never a shell transcript.
+    -->
+    <method name="Execute">
+      <arg type="s"     name="token"  direction="in"/>
+      <arg type="a{sv}" name="result" direction="out"/>
+    </method>
+
+    <!--
+      Explicitly drop a proposal without running it. Tokens also expire.
+    -->
+    <method name="Discard">
+      <arg type="s" name="token" direction="in"/>
+    </method>
+
+    <method name="Close"/>
+
+    <!-- Streaming output for `request`. -->
+    <signal name="Delta">
+      <arg type="u" name="request"/>
+      <arg type="s" name="text"/>
+    </signal>
+
+    <!--
+      reason: "complete" | "cancelled" | "error" | "timeout" | "policy"
+    -->
+    <signal name="Finished">
+      <arg type="u" name="request"/>
+      <arg type="s" name="reason"/>
+    </signal>
+
+    <!--
+      The model has proposed a concrete action.
+
+      capability  the policy bucket this falls under (see policy/)
+      action      closed-enum action id, e.g. "portage.emerge-apply"
+      params      typed, already validated against that action's schema —
+                  an atom list, a unit name, a config key. Never argv.
+      rationale   the model's stated reason, for display to the user
+      token       pass to Execute() to run it
+
+      Emitting this signal performs no privileged work. Nothing happens until
+      a client calls Execute and polkit agrees.
+    -->
+    <signal name="ActionProposed">
+      <arg type="u"     name="request"/>
+      <arg type="s"     name="capability"/>
+      <arg type="s"     name="action"/>
+      <arg type="a{sv}" name="params"/>
+      <arg type="s"     name="rationale"/>
+      <arg type="s"     name="token"/>
+    </signal>
+
+    <!--
+      Raised when the model asked for something policy forbids. Surfaced so
+      the user can grant the capability deliberately, rather than the request
+      failing silently.
+    -->
+    <signal name="CapabilityDenied">
+      <arg type="u" name="request"/>
+      <arg type="s" name="capability"/>
+      <arg type="s" name="detail"/>
+    </signal>
+
+    <property name="Tier"  type="s" access="read"/>
+    <property name="Owner" type="u" access="read"/>
+  </interface>
+</node>

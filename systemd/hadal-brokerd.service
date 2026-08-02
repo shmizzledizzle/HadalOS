@@ -1,0 +1,52 @@
+[Unit]
+Description=Hadal capability broker (org.hadal.Broker1)
+Documentation=https://github.com/shmizzledizzle/Trench
+Requires=hadald.service
+After=hadald.service dbus.service
+Requires=dbus.service
+
+[Service]
+Type=dbus
+BusName=org.hadal.Broker1
+ExecStart=/usr/libexec/hadal-brokerd
+Restart=on-failure
+RestartSec=2s
+
+# ── Why this runs as root, and why that is not the usual mistake ───────
+# The broker executes authorized actions (emerge, systemctl), so it needs
+# privilege. What makes that defensible is that it contains no model code
+# and never evaluates model output as a command:
+#
+#   * it shares hadald's network namespace (below), so it cannot reach the
+#     network any more than hadald can;
+#   * every action is a closed-enum variant with a typed, validated
+#     parameter struct — there is no argv path from a generation to exec;
+#   * every mutating variant is gated on a polkit auth_admin check against
+#     its own action id, resolved per invocation and never retained.
+#
+# The privilege lives in the component that has no language model in it.
+# That separation is the whole design.
+JoinsNamespaceOf=hadald.service
+PrivateNetwork=yes
+IPAddressDeny=any
+
+ProtectHome=yes
+PrivateTmp=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+NoNewPrivileges=no
+SystemCallArchitectures=native
+
+# Audit trail is not optional for a component that can change the system.
+LogLevelMax=info
+StateDirectory=hadal-broker
+
+[Install]
+WantedBy=multi-user.target

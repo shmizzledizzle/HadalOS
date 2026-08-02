@@ -1,0 +1,81 @@
+#!/bin/bash
+# kernel-install plugin: place kernel + initrd where Limine expects them and
+# regenerate limine.conf.
+#
+# Called by systemd's kernel-install(8) as:
+#   $1  add | remove
+#   $2  kernel version
+#   $3  entry directory   (BLS layouts only; unused here)
+#   $4  kernel image      (add only)
+#   $5… initrd images     (add only)
+#
+# Exit 77 means "not applicable, skip me" — that is how we stay inert on a
+# machine configured for a BLS/GRUB layout instead of Trench's.
+
+set -euo pipefail
+
+COMMAND="${1:?}"
+VERSION="${2:?}"
+
+BOOT_ROOT="${KERNEL_INSTALL_BOOT_ROOT:-/boot}"
+LAYOUT="${KERNEL_INSTALL_LAYOUT:-}"
+DEST="$BOOT_ROOT/trench/$VERSION"
+LASTGOOD_FILE="/etc/trench/lastgood"
+
+log() { printf '90-trench-limine: %s\n' "$*" >&2; }
+
+# Set `layout=trench` in /etc/kernel/install.conf to enable. If some other
+# layout is configured, this is not our machine to touch.
+[[ -z $LAYOUT || $LAYOUT == trench ]] || exit 77
+
+case "$COMMAND" in
+add)
+    KERNEL_IMAGE="${4:?kernel image not supplied}"
+    shift 4 || true
+    INITRDS=("$@")
+
+    install -d -m 0755 "$DEST"
+    install -m 0644 "$KERNEL_IMAGE" "$DEST/vmlinuz"
+
+    # kernel-install can hand us several initrds (microcode first, then the
+    # generated one). Limine's linux protocol accepts repeated module_path,
+    # but concatenation is what the kernel actually expects for early cpio
+    # microcode, and it keeps the generated config to one module line.
+    if (( ${#INITRDS[@]} )); then
+        cat "${INITRDS[@]}" >"$DEST/initrd.tmp"
+        chmod 0644 "$DEST/initrd.tmp"
+        mv "$DEST/initrd.tmp" "$DEST/initrd"
+        log "installed $VERSION with ${#INITRDS[@]} initrd image(s)"
+    else
+        rm -f "$DEST/initrd"
+        log "installed $VERSION (no initrd)"
+    fi
+    ;;
+
+remove)
+    # Never remove the kernel the fallback entry points at. This is the
+    # difference between "my new kernel panics" and "my machine does not
+    # boot and I am on a phone reading a wiki."
+    if [[ -r $LASTGOOD_FILE ]] && [[ "$(tr -d '[:space:]' <"$LASTGOOD_FILE")" == "$VERSION" ]]; then
+        log "refusing to remove $VERSION — it is the recorded last known good kernel"
+        log "clear $LASTGOOD_FILE first if you really mean it"
+        exit 1
+    fi
+    rm -rf "$DEST"
+    log "removed $VERSION"
+    ;;
+
+*)
+    exit 0
+    ;;
+esac
+
+# Regenerating after every add/remove keeps limine.conf a pure function of
+# what is on disk, so a half-finished emerge can never leave a stale entry
+# pointing at a kernel that isn't there.
+if command -v trench-limine-update >/dev/null 2>&1; then
+    trench-limine-update
+else
+    log "trench-limine-update not found; limine.conf NOT regenerated"
+    exit 1
+fi
