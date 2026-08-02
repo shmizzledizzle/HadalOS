@@ -34,11 +34,37 @@ SOURCES = {
         BROKER / "action.rs",
         re.compile(r'Action::\w+\s*\{\s*\.\.\s*\}\s*=>\s*"([a-z-]+)"'),
     ),
-    "polkit policy": (
-        ROOT / "policy" / "org.hadal.broker.policy",
-        re.compile(r'<action id="org\.hadal\.broker\.([a-z-]+)">'),
-    ),
 }
+
+POLICY_FILE = ROOT / "policy" / "org.hadal.broker.policy"
+
+
+def polkit_actions(path: Path) -> set[str]:
+    """Parse the policy as XML rather than scraping it with a regex.
+
+    Not pedantry. A regex happily matches action ids in a file polkit cannot
+    read: a `--` inside an XML comment (say, writing `emerge --pretend`) makes
+    the document ill-formed, and polkit's parser stops there and silently
+    drops every action below it. That failure looked exactly like a working
+    system until half the capabilities were quietly unauthorizable.
+
+    Parsing here fails loudly at authoring time instead.
+    """
+    import xml.etree.ElementTree as ET
+
+    try:
+        tree = ET.parse(path)
+    except ET.ParseError as e:
+        print(f"ERROR  {path.name} is not well-formed XML: {e}")
+        print("       polkit will silently ignore every action after this point.")
+        raise SystemExit(1)
+
+    prefix = "org.hadal.broker."
+    return {
+        el.attrib["id"][len(prefix):]
+        for el in tree.getroot().iter("action")
+        if el.attrib.get("id", "").startswith(prefix)
+    }
 
 # Capabilities deliberately NOT described to the model, and why.
 #
@@ -82,6 +108,11 @@ def main() -> int:
         for m in missing_files:
             print(f"ERROR  {m}")
         return 1
+
+    if not POLICY_FILE.exists():
+        print(f"ERROR  polkit policy: {POLICY_FILE} not found")
+        return 1
+    found["polkit policy"] = polkit_actions(POLICY_FILE)
 
     protocol = action_protocol((BROKER / "model.rs").read_text(encoding="utf-8"))
     found["model.rs ACTION_PROTOCOL"] = set(

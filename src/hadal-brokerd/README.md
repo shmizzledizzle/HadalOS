@@ -65,8 +65,10 @@ The worst case is a suggestion you decline.
 cargo build --release
 ```
 
-Requires a Rust toolchain (MSRV 1.82). No TLS stack: this daemon speaks
-plaintext HTTP to loopback inside a namespace with no route out.
+Requires a Rust toolchain. **MSRV 1.87**, set by zbus 5.18 rather than by this
+crate's own source — distribution rustc is often too old (Debian 13 ships 1.85
+and fails resolution). No TLS stack: this daemon speaks plaintext HTTP to
+loopback inside a namespace with no route out.
 
 ## Testing
 

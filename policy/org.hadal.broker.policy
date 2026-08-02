@@ -87,7 +87,10 @@
     </defaults>
   </action>
 
-  <!-- emerge --pretend: resolves, changes nothing. -->
+  <!-- emerge in pretend mode: resolves, changes nothing.
+       (Note for editors: XML forbids a double hyphen inside a comment. Writing
+       the flag out literally here silently truncated this file at parse time,
+       and polkit dropped every action below it.) -->
   <action id="org.hadal.broker.emerge-pretend">
     <description>Let Hadal simulate a package operation</description>
     <message>Hadal needs to work out what a package change would do.</message>
