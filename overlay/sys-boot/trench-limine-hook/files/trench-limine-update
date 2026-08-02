@@ -98,7 +98,9 @@ main() {
         for v in "${versions[@]}"; do
             local label="Trench Linux $v"
             (( first )) && label="$label (current)"
-            [[ $v == "$lastgood" ]] && label="$label — last known good"
+            # ASCII only: entry titles render in BIOS text mode, where a
+            # UTF-8 dash is a gamble for no benefit.
+            [[ $v == "$lastgood" ]] && label="$label [last known good]"
             emit_entry "$v" "$label" "$cmdline"
             first=0
         done
