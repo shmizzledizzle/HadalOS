@@ -124,7 +124,34 @@ per-capability allow/ask/never without inventing its own policy store.
 `read-path` is constrained by prefix allowlist — not "the model may read
 files," but "the model may read files under these roots."
 
-### 2.4 Integration points
+### 2.4 What the capability system does not do
+
+**polkit authorizes root for everything.** A session opened by a root-owned
+client is permitted every capability, including the Mutate tier, with no
+prompt. This is polkit's model working as designed — root is already
+omnipotent, and gating it against itself would be theatre — but it has a
+consequence worth stating plainly rather than discovering later:
+
+> For a root caller, the client-side confirmation is the only gate. A
+> compromised root client could call `Execute` directly and skip it.
+
+This was found by running the end-to-end test as root, where every denial
+assertion passed for the wrong reason. The test now runs as an unprivileged
+user, which is the case that actually matters.
+
+The threat being defended against is *prompt injection producing a bad
+proposal* — a build log or a web page that talks the model into suggesting
+something destructive. It is not a malicious root user, which no
+userspace design can address.
+
+The practical upshot inverts the usual pattern:
+
+> **Do not run `hadal` as root.** You never need to. The broker already holds
+> the privilege and executes on your behalf once polkit agrees, so running the
+> client as your own user gets you the full capability set *and* keeps the
+> authorization gate meaningful. `sudo hadal` is strictly worse than `hadal`.
+
+### 2.5 Integration points
 
 **Portage build-failure explanation.** A `/etc/portage/bashrc` hook captures
 the failing build log and hands it to the broker. This is the flagship
@@ -144,7 +171,7 @@ explains them.
 **Desktop.** Hotkey overlay panel; per-window context ("explain this error
 dialog"); settings search answered by Hadal.
 
-### 2.5 Deferred to v2
+### 2.6 Deferred to v2
 
 Boot-rescue Hadal (Limine's fallback entry drops to a rescue rootfs carrying
 the reflex model + index, explaining offline why boot failed) and the
@@ -152,7 +179,7 @@ conversational ISO installer. Both are the best demonstrations of the whole
 idea. Both roughly double v1 scope, so they are v2 — but the Limine
 two-entry layout in §3 is designed now so that v2 doesn't require re-doing it.
 
-### 2.6 The RAM floor
+### 2.7 The RAM floor
 
 A distribution that requires 20 GB free for its assistant is a distribution
 nobody else can run. Tiering is mandatory:

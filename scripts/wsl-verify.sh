@@ -17,7 +17,7 @@ set -euo pipefail
 
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD="${HADALOS_BUILD:-$HOME/hadalos-build}"
-CRATE="$BUILD/src/hadal-brokerd"
+WORKSPACE="$BUILD/src"
 
 export PATH="$HOME/.cargo/bin:$PATH"
 export CARGO_TERM_COLOR=always
@@ -32,6 +32,7 @@ mkdir -p "$BUILD"
 # tar rather than cp -r so target/ in the destination survives, and rather
 # than rsync so this has no dependency beyond coreutils and tar.
 (cd "$SRC" && tar -cf - \
+    --exclude='./src/target' \
     --exclude='./src/hadal-brokerd/target' \
     --exclude='./.git' \
     .) | (cd "$BUILD" && tar -xf -)
@@ -48,15 +49,19 @@ done < <(find "$BUILD/scripts" "$BUILD/overlay" -type f \
 step "capability consistency"
 python3 "$BUILD/scripts/check-consistency.py" | tail -8
 
+bash "$BUILD/scripts/test-portage-hook.sh" | tail -20
+
 step "cargo test (native linux)"
-cd "$CRATE"
-cargo test
+cd "$WORKSPACE"
+cargo test --workspace
 
 step "cargo clippy"
-cargo clippy --all-targets -- -D warnings
+cargo clippy --workspace --all-targets -- -D warnings
 
 step "cargo build --release"
-cargo build --release
-ls -lh "$CRATE/target/release/hadal-brokerd" | awk '{print "  binary: " $5}'
+cargo build --workspace --release
+for b in hadal-brokerd hadal; do
+    ls -lh "$WORKSPACE/target/release/$b" | awk -v n="$b" '{print "  " n ": " $5}'
+done
 
 printf '\n\033[1;32m══ all checks passed\033[0m\n'

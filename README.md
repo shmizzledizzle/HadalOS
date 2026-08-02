@@ -47,15 +47,29 @@ Foundation. Nothing boots yet.
 | Last-known-good pinning | written, untested on hardware |
 | systemd sandboxing for `hadald` / broker | written, untested on hardware |
 | Overlay skeleton | created |
-| `hadal-brokerd` — capability model, validators, scanner | compiles clean, 30/30 tests pass |
-| `hadal-brokerd` — D-Bus surface | compiles clean (clippy clean, debug + release) |
+| `hadal-brokerd` — capability model, validators, scanner | 30/30 unit tests |
+| `hadal-brokerd` — D-Bus surface | 31/31 against real D-Bus + polkit |
+| `hadal` CLI (`ask` / `explain` / `why` / `status`) | working |
+| Portage build-failure capture | 13/13 |
+| End-to-end chain (model → polkit → executor) | 27/27 |
 | Cross-file capability consistency check | passing, negative-tested |
 | `sys-kernel/hadalos-sources` | not started |
 | `hadalwm` | not started |
 | HadalOS Shell | not started |
 | catalyst specs | not started |
 
-Everything marked *untested on hardware* has been syntax-checked only.
+Everything marked *untested on hardware* has been syntax-checked only. The
+boot layer is the significant remaining gap — it has been functionally tested
+against synthetic kernel trees but has never booted a machine.
+
+101 checks currently pass, on real Linux, across four suites:
+
+```bash
+wsl -d Debian -u root -- bash scripts/wsl-verify.sh
+```
+
+Then, as root on a systemd machine: `scripts/integration-test.sh` and
+`scripts/e2e-test.sh`.
 
 ---
 
