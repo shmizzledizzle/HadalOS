@@ -232,7 +232,17 @@ impl Session {
             }
         }
 
-        tracing::info!(capability = %capability, %sender, "executing: {summary}");
+        // The audit record carries everything needed to reconstruct why this
+        // ran: who asked, from which surface, which generation produced it,
+        // and the reason the model gave.
+        tracing::info!(
+            capability = %capability,
+            %sender,
+            surface = %self.surface,
+            request = proposal.request,
+            rationale = %proposal.rationale,
+            "executing: {summary}"
+        );
 
         self.executor
             .run(&proposal.action)
@@ -249,7 +259,14 @@ impl Session {
         for (_, h) in cancels.drain() {
             h.abort();
         }
-        *self.proposals.lock().await = ProposalStore::new();
+        // Closing a session invalidates its pending proposals. A token that
+        // outlived the conversation that produced it would be a grant with no
+        // context left to judge it by.
+        let mut proposals = self.proposals.lock().await;
+        if !proposals.is_empty() {
+            tracing::info!("session closed with {} proposal(s) unconfirmed", proposals.len());
+        }
+        *proposals = ProposalStore::new();
     }
 
     #[zbus(signal)]

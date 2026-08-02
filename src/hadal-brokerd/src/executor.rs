@@ -81,11 +81,14 @@ pub struct Executor {
     portage_conf: std::path::PathBuf,
 }
 
+/// Optional site override for which roots `read-path` may reach.
+const READ_ROOTS_CONF: &str = "/etc/hadalos/read-roots.conf";
+
 impl Executor {
     pub fn new(conn: Connection) -> Self {
         Self {
             conn,
-            paths: PathPolicy::default(),
+            paths: load_path_policy(),
             portage_conf: std::path::PathBuf::from("/etc/portage"),
         }
     }
@@ -119,10 +122,14 @@ impl Executor {
             }
 
             Action::QueryPackage { atom } => {
+                // Keep the underlying error rather than replacing it: equery
+                // failing to run and equery running but erroring are different
+                // problems, and flattening them to one message sends people
+                // to install a package they already have.
                 let out = self
                     .spawn("/usr/bin/equery", &["--quiet".into(), "list".into(), atom.as_str().into()])
                     .await
-                    .or_else(|_| Err(err("equery unavailable; install app-portage/gentoolkit")))?;
+                    .map_err(|e| err(format!("{e} (is app-portage/gentoolkit installed?)")))?;
                 ok_text("package", out)
             }
 
@@ -321,6 +328,42 @@ impl Executor {
         }
         Ok(text)
     }
+}
+
+/// One absolute path per line; `#` comments and blanks ignored. Absent file
+/// means the built-in defaults.
+///
+/// Widening this cannot expose secrets: the permanent denylist in
+/// `action::PathPolicy::resolve` is consulted after canonicalisation and
+/// independently of these roots. That is the whole reason it is safe to make
+/// this configurable at all.
+fn load_path_policy() -> PathPolicy {
+    let Ok(text) = std::fs::read_to_string(READ_ROOTS_CONF) else {
+        return PathPolicy::default();
+    };
+
+    let roots: Vec<std::path::PathBuf> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .filter(|l| {
+            if std::path::Path::new(l).is_absolute() {
+                true
+            } else {
+                tracing::warn!("{READ_ROOTS_CONF}: ignoring non-absolute root {l:?}");
+                false
+            }
+        })
+        .map(std::path::PathBuf::from)
+        .collect();
+
+    if roots.is_empty() {
+        tracing::warn!("{READ_ROOTS_CONF} has no usable entries; using defaults");
+        return PathPolicy::default();
+    }
+
+    tracing::info!("read roots from {READ_ROOTS_CONF}: {} entries", roots.len());
+    PathPolicy::with_roots(roots)
 }
 
 async fn read_tail(path: &Path) -> Result<String, ExecError> {

@@ -22,7 +22,12 @@ pub struct Subject<'a> {
     details: HashMap<&'a str, Value<'a>>,
 }
 
+// The fields below are dictated by polkit's D-Bus signatures, not by what we
+// happen to read. Deserialisation fails if the shape does not match, so every
+// field must be present even when unused — dropping the unread ones would
+// break the wire format rather than tidy it.
 #[derive(Debug, Deserialize, Type)]
+#[allow(dead_code)]
 pub struct AuthorizationResult {
     pub is_authorized: bool,
     pub is_challenge: bool,
@@ -30,6 +35,7 @@ pub struct AuthorizationResult {
 }
 
 #[derive(Debug, Deserialize, Type)]
+#[allow(dead_code)]
 pub struct ActionDescription {
     pub action_id: String,
     pub description: String,

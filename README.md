@@ -47,8 +47,8 @@ Foundation. Nothing boots yet.
 | Last-known-good pinning | written, untested on hardware |
 | systemd sandboxing for `hadald` / broker | written, untested on hardware |
 | Overlay skeleton | created |
-| `hadal-brokerd` — capability model, validators, scanner | written, **not compiled** |
-| `hadal-brokerd` — D-Bus surface | written, **not compiled** |
+| `hadal-brokerd` — capability model, validators, scanner | compiles clean, 30/30 tests pass |
+| `hadal-brokerd` — D-Bus surface | compiles clean (clippy clean, debug + release) |
 | Cross-file capability consistency check | passing, negative-tested |
 | `sys-kernel/hadalos-sources` | not started |
 | `hadalwm` | not started |

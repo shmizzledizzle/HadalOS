@@ -21,7 +21,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use crate::capability::Capability;
 
@@ -209,14 +209,19 @@ impl TryFrom<String> for SafePath {
         if raw.contains('\0') {
             return Err(reject("path contains NUL"));
         }
-        let p = PathBuf::from(&raw);
-        if !p.is_absolute() {
+        // POSIX semantics stated outright rather than inherited from the host.
+        // `Path::is_absolute` answers a different question on each platform —
+        // on Windows this string is *not* absolute, lacking a drive letter —
+        // and a validator whose meaning depends on where it was compiled is
+        // not one to rest a security boundary on. HadalOS targets Linux; say
+        // so directly.
+        if !raw.starts_with('/') {
             return Err(reject("path is not absolute"));
         }
-        if p.components().any(|c| matches!(c, Component::ParentDir)) {
+        if raw.split('/').any(|c| c == "..") {
             return Err(reject("path contains '..'"));
         }
-        Ok(SafePath(p))
+        Ok(SafePath(PathBuf::from(&raw)))
     }
 }
 
@@ -341,6 +346,14 @@ pub enum EmergeMode {
 /// with root. Each supported change is instead a named operation with typed
 /// operands, so the executor knows precisely which file it is touching and in
 /// what format.
+// clippy::enum_variant_names fires on the shared `Portage` prefix. Keeping it:
+// the variant names are the wire protocol — serde derives `portage-use` and
+// friends from them, and those strings are documented to the model in
+// ACTION_PROTOCOL. Dropping the prefix would rename `PortageUse` to `Use`,
+// silently changing the schema and colliding with a keyword-ish name, all to
+// satisfy a lint that assumes the prefix is redundant. It is not: non-Portage
+// variants (kernel cmdline, for one) are expected here.
+#[allow(clippy::enum_variant_names)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum ConfigChange {
@@ -563,12 +576,10 @@ impl Action {
                     return Err(reject("query length out of range"));
                 }
             }
-            Action::WriteConfig { change } => {
-                if let ConfigChange::PortageUse { flags, .. } = change {
-                    if flags.is_empty() || flags.len() > 32 {
-                        return Err(reject("USE flag count out of range"));
-                    }
-                }
+            Action::WriteConfig { change: ConfigChange::PortageUse { flags, .. } }
+                if flags.is_empty() || flags.len() > 32 =>
+            {
+                return Err(reject("USE flag count out of range"))
             }
             _ => {}
         }
@@ -666,7 +677,18 @@ mod tests {
         assert!(path("/var/log/portage/../../etc/shadow").is_err());
         assert!(path("relative/path").is_err());
         assert!(path("/var/log/x\0y").is_err());
+        assert!(path("..").is_err());
         assert!(path("/var/log/portage/build.log").is_ok());
+    }
+
+    /// Pins the POSIX semantics down so they cannot drift back to the host's.
+    /// Every assertion here must hold identically on Linux and on the Windows
+    /// authoring machine.
+    #[test]
+    fn absoluteness_is_posix_not_host_defined() {
+        assert!(path("/var/log/portage/build.log").is_ok());
+        assert!(path("C:\\Windows\\System32\\config\\SAM").is_err());
+        assert!(path("\\\\server\\share\\file").is_err());
     }
 
     #[test]

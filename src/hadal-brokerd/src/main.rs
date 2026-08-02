@@ -68,13 +68,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!("{} listening at {}", broker::NAME, broker::PATH);
 
-    // systemd sends SIGTERM on stop; without handling it the unit is killed
-    // mid-execution rather than declining new work.
+    wait_for_shutdown().await?;
+    Ok(())
+}
+
+/// systemd sends SIGTERM on stop; without handling it the unit is killed
+/// mid-execution rather than declining new work.
+///
+/// The `cfg` is not portability for its own sake — this daemon only ever runs
+/// on Linux. It exists so the crate still builds on the authoring machine,
+/// where `cargo test` can then run the validator and scanner suites natively
+/// instead of merely cross-compiling them.
+#[cfg(unix)]
+async fn wait_for_shutdown() -> Result<(), Box<dyn std::error::Error>> {
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     tokio::select! {
         _ = sigterm.recv() => tracing::info!("SIGTERM received, shutting down"),
         _ = tokio::signal::ctrl_c() => tracing::info!("interrupted, shutting down"),
     }
+    Ok(())
+}
 
+#[cfg(not(unix))]
+async fn wait_for_shutdown() -> Result<(), Box<dyn std::error::Error>> {
+    tokio::signal::ctrl_c().await?;
+    tracing::info!("interrupted, shutting down");
     Ok(())
 }

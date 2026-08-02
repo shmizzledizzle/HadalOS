@@ -65,8 +65,8 @@ The worst case is a suggestion you decline.
 cargo build --release
 ```
 
-Requires a Rust toolchain (MSRV 1.82) and `pkg-config`. No TLS stack: this
-daemon speaks plaintext HTTP to loopback inside a namespace with no route out.
+Requires a Rust toolchain (MSRV 1.82). No TLS stack: this daemon speaks
+plaintext HTTP to loopback inside a namespace with no route out.
 
 ## Testing
 
@@ -78,6 +78,34 @@ The tests worth reading first are the rejection cases in `action.rs` — every
 one of them is a command injection if the newtype validators are wrong — and
 the scanner tests in `model.rs`, which cover fences split across token
 boundaries.
+
+## Verifying from the Windows authoring machine
+
+The daemon only runs on Linux, but all three checks work from the dev laptop.
+`cargo check` does no linking, so the Linux target needs no cross-linker:
+
+```bash
+rustup target add x86_64-unknown-linux-gnu
+```
+
+```bash
+cargo clippy --target x86_64-unknown-linux-gnu --all-targets
+```
+
+Tests build for the host and run natively, because the logic under test is
+platform-independent by construction — see
+`action::tests::absoluteness_is_posix_not_host_defined`, which exists
+specifically to keep it that way:
+
+```bash
+cargo test
+```
+
+Then the cross-language check that Rust cannot do:
+
+```bash
+python ../../scripts/check-consistency.py
+```
 
 ## Installing
 
