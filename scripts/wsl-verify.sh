@@ -57,6 +57,13 @@ python3 "$BUILD/scripts/check-catalyst-specs.py" | tail -4
 
 bash "$BUILD/scripts/test-portage-hook.sh" | tail -20
 
+# Needs root for loop mounts and btrfs subvolumes.
+if [[ $EUID -eq 0 ]]; then
+    bash "$BUILD/scripts/test-bootstrap.sh" | tail -16
+else
+    printf '\n  (skipping bootstrap storage tests — need root)\n'
+fi
+
 step "cargo test (native linux)"
 cd "$WORKSPACE"
 cargo test --workspace

@@ -16,7 +16,8 @@
 
 set -euo pipefail
 
-MIRROR="http://gentoo-mirror.flux.utah.edu"
+# Override with HADALOS_MIRROR for a local or closer mirror.
+MIRROR="${HADALOS_MIRROR:-http://gentoo-mirror.flux.utah.edu}"
 ROOT=""
 DRY_RUN=0
 ENTER_ONLY=0
@@ -25,7 +26,10 @@ JOBS=""
 # Stage builds, distfiles, binpkgs and a kernel tree together want real room.
 # 60 GB is the point below which you will be deleting things instead of
 # building them.
-MIN_FREE_GB=60
+# Overridable so the test suite can exercise the storage logic on a small
+# loopback filesystem. Lowering it on a real build host only moves where you
+# run out of room.
+MIN_FREE_GB="${HADALOS_MIN_FREE_GB:-60}"
 
 log()  { printf '\033[36m::\033[0m %s\n' "$*"; }
 warn() { printf '\033[33m!!\033[0m %s\n' "$*" >&2; }
@@ -75,20 +79,36 @@ for tool in curl tar mountpoint chroot; do
 done
 
 parent="$(dirname "$ROOT")"
-[[ -d $parent ]] || die "parent directory $parent does not exist"
 
-free_gb=$(( $(stat -f -c '%a * %S' "$parent") / 1024 / 1024 / 1024 ))
-if (( free_gb < MIN_FREE_GB )); then
-    die "only ${free_gb} GB free at $parent; need at least ${MIN_FREE_GB} GB"
+# Probe the nearest ancestor that exists. Requiring the immediate parent to
+# be there already is pointless friction — /var/hadalos/build is a perfectly
+# ordinary place to ask for — and the space and filesystem checks below need
+# a real path to stat regardless.
+probe="$parent"
+while [[ ! -d $probe && $probe != / ]]; do
+    probe="$(dirname "$probe")"
+done
+[[ -d $probe ]] || die "no existing ancestor of $ROOT — is the path absolute?"
+
+free_gb=$(( $(stat -f -c '%a * %S' "$probe") / 1024 / 1024 / 1024 ))
+fstype="$(stat -f -c %T "$probe" 2>/dev/null || echo unknown)"
+
+if [[ $probe == "$parent" ]]; then
+    log "disk: ${free_gb} GB free at $probe (${fstype})"
+else
+    log "disk: ${free_gb} GB free at $probe (${fstype}) — will create $parent"
 fi
 
-fstype="$(stat -f -c %T "$parent" 2>/dev/null || echo unknown)"
-log "disk: ${free_gb} GB free at $parent (${fstype})"
-
-# A tmpfs build root is backed by RAM. Extracting a stage3 into one on a
-# 16 GB box does not fail cleanly — it swaps until the OOM killer arrives.
+# Checked before the size threshold: on a RAM-backed filesystem "not enough
+# space" is a true but useless diagnosis, and sends people off to free up
+# disk that was never the problem.
 if [[ $fstype == tmpfs || $fstype == ramfs ]]; then
-    die "$parent is $fstype (RAM-backed). Pick a location on real storage."
+    die "$probe is $fstype (RAM-backed). Pick a location on real storage."
+fi
+
+if (( free_gb < MIN_FREE_GB )); then
+    die "only ${free_gb} GB free at $probe; need at least ${MIN_FREE_GB} GB" \
+        "(override with HADALOS_MIN_FREE_GB if you know what you are doing)"
 fi
 
 if (( free_gb < 100 )); then
@@ -111,6 +131,63 @@ fi
 LOAD=$(( JOBS + 4 ))
 log "makeopts: -j${JOBS} -l${LOAD}"
 
+# ── prepare the build root ──────────────────────────────────────────────
+# Before fetching anything. Discovering that the destination cannot be set up
+# correctly is worth knowing now, not after a 300 MB download.
+#
+# The parent may not exist yet; the build root itself is created below,
+# because on btrfs it wants to be a subvolume rather than a directory.
+run mkdir -p "$parent"
+
+# ── btrfs: disable copy-on-write before anything is written ─────────────
+# Portage's write pattern (unpack, compile in place, rewrite, delete) is the
+# worst case for CoW: the build tree fragments badly and never recovers, and
+# every subsequent emerge on this host is slower for it.
+#
+# Timing is the whole point. chattr +C only affects files created *after* it
+# is set, so it has to happen while the directory is still empty — here,
+# before the stage3 is extracted, and not as a later fix-up.
+if [[ $fstype == btrfs ]]; then
+    log "btrfs detected — creating the build root as a nodatacow subvolume"
+
+    if (( DRY_RUN )); then
+        printf '   would run: btrfs subvolume create %s && chattr +C %s\n' "$ROOT" "$ROOT"
+    else
+        # A dedicated subvolume also keeps the build tree out of any snapshot
+        # taken of / — a snapshotted 40 GB build tree is an unpleasant
+        # surprise on a rollback.
+        if btrfs subvolume show "$ROOT" >/dev/null 2>&1; then
+            log "reusing existing subvolume $ROOT"
+        elif [[ -d $ROOT ]]; then
+            # Already a plain directory. Only safe to convert while empty —
+            # if it has contents, those files were created under CoW and
+            # setting the flag now would not apply to them.
+            if rmdir "$ROOT" 2>/dev/null; then
+                btrfs subvolume create "$ROOT" >/dev/null \
+                    && log "converted empty directory to subvolume" \
+                    || { mkdir -p "$ROOT"; warn "subvolume creation failed; using a directory"; }
+            else
+                warn "$ROOT already exists and is not empty — leaving it as is"
+                warn "  files already in it were written with CoW enabled; to get"
+                warn "  a clean nodatacow tree, remove it and re-run"
+            fi
+        else
+            btrfs subvolume create "$ROOT" >/dev/null \
+                && log "created subvolume $ROOT" \
+                || { mkdir -p "$ROOT"; warn "subvolume creation failed; using a directory"; }
+        fi
+
+        chattr +C "$ROOT" 2>/dev/null \
+            && log "nodatacow set on $ROOT" \
+            || warn "could not set nodatacow on $ROOT — builds will fragment"
+        # Verify rather than assume: chattr silently no-ops on some setups.
+        lsattr -d "$ROOT" 2>/dev/null | grep -q 'C' \
+            || warn "nodatacow does NOT appear to be active on $ROOT"
+    fi
+else
+    run mkdir -p "$ROOT"
+fi
+
 # ── fetch stage3 ────────────────────────────────────────────────────────
 STAGE_PATH="releases/amd64/autobuilds"
 LATEST_URL="$MIRROR/$STAGE_PATH/latest-stage3-amd64-systemd.txt"
@@ -126,40 +203,6 @@ else
         | head -n1)" || die "could not resolve latest stage3"
     [[ -n $STAGE3 ]] || die "latest-stage3 file did not contain a tarball path"
     log "stage3: $STAGE3"
-fi
-
-run mkdir -p "$ROOT"
-
-# ── btrfs: disable copy-on-write before anything is written ─────────────
-# Portage's write pattern (unpack, compile in place, rewrite, delete) is the
-# worst case for CoW: the build tree fragments badly and never recovers, and
-# every subsequent emerge on this host is slower for it.
-#
-# Timing is the whole point. chattr +C only affects files created *after* it
-# is set, so it has to happen on an empty directory — which means here,
-# before the stage3 is extracted, and not as a later fix-up.
-if [[ $fstype == btrfs ]]; then
-    log "btrfs detected — disabling copy-on-write on the build root"
-    if command -v btrfs >/dev/null && ! (( DRY_RUN )); then
-        # A dedicated subvolume also keeps the build tree out of any snapshot
-        # the host takes of / — a snapshotted 40 GB build tree is a bad
-        # surprise on a rollback.
-        if [[ ! -d $ROOT/.. ]] || ! btrfs subvolume show "$ROOT" >/dev/null 2>&1; then
-            rmdir "$ROOT" 2>/dev/null && btrfs subvolume create "$ROOT" >/dev/null \
-                && log "created subvolume $ROOT" \
-                || mkdir -p "$ROOT"
-        fi
-    fi
-    if ! (( DRY_RUN )); then
-        chattr +C "$ROOT" 2>/dev/null \
-            && log "nodatacow set on $ROOT" \
-            || warn "could not set nodatacow on $ROOT — builds will fragment"
-        # Verify rather than assume: chattr silently no-ops on some setups.
-        lsattr -d "$ROOT" 2>/dev/null | grep -q 'C' \
-            || warn "nodatacow does NOT appear to be active on $ROOT"
-    else
-        printf '   would run: btrfs subvolume create %s && chattr +C %s\n' "$ROOT" "$ROOT"
-    fi
 fi
 
 if ! (( DRY_RUN )); then
