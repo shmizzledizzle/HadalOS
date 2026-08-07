@@ -453,7 +453,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ),
         }
     } else {
-        tracing::info!("--no-spawn: connect with WAYLAND_DISPLAY={socket_name}");
+        tracing::info!("--no-spawn: no client started");
+    }
+
+    // Printed rather than logged, and printed once. The socket name is the one
+    // thing someone testing interactively needs from a second terminal, and
+    // "listening on cusk-1" buried in a log line is easy to miss — connecting
+    // to a compositor that has since exited fails as NoCompositor, which reads
+    // like a client bug rather than a stale socket.
+    for line in [
+        String::new(),
+        "  cusk is running. From another terminal, while this one stays open:".into(),
+        String::new(),
+        format!("      WAYLAND_DISPLAY={socket_name} alacritty"),
+        String::new(),
+        "      click           focus and raise".into(),
+        "      super + drag    move".into(),
+        "      super + right   resize from the nearest corner".into(),
+        "      close window    quit".into(),
+        String::new(),
+    ] {
+        println!("{line}");
     }
 
     let mut clients = Vec::new();
