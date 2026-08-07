@@ -20,3 +20,6 @@ target/
 
 # Claude Code local session state
 /.claude/
+
+# hadald build output
+/src/hadald/target/
