@@ -1,0 +1,35 @@
+2026-08-06 13:14:27 system_app_crash (text, 1987 bytes)
+SystemUptimeMs: 38095
+Process: com.android.statementservice
+PID: 4261
+UID: 10160
+Frozen: false
+Flags: 0x30883e45
+Package: com.android.statementservice v1 (1.0)
+Foreground: No
+Process-Runtime: 1276
+Timestamp: 2026-08-06 19:14:27.239+0000
+Build: google/bluejay/bluejay:16/BP4A.251205.006/14401865:user/release-keys
+Crash-Handler: com.android.internal.os.RuntimeInit$KillApplicationHandler
+Loading-Progress: 1.0
+Dropped-Count: 0
+
+java.lang.RuntimeException: Unable to start receiver com.android.statementservice.domain.DomainVerificationReceiverV2
+	at android.app.ActivityThread.handleReceiver(ActivityThread.java:5308)
+	at android.app.ActivityThread.-$$Nest$mhandleReceiver(Unknown Source:0)
+	at android.app.ActivityThread$H.handleMessage(ActivityThread.java:2715)
+	at android.os.Handler.dispatchMessage(Handler.java:132)
+	at android.os.Looper.dispatchMessage(Looper.java:333)
+	at android.os.Looper.loopOnce(Looper.java:263)
+	at android.os.Looper.loop(Looper.java:367)
+	at android.app.ActivityThread.main(ActivityThread.java:9287)
+	at java.lang.reflect.Method.invoke(Native Method)
+	at com.android.internal.os.RuntimeInit$MethodAndArgsCaller.run(RuntimeInit.java:566)
+	at com.android.internal.os.ZygoteInit.main(ZygoteInit.java:929)
+Caused by: java.lang.IllegalStateException: WorkManager is not initialized properly.  You have explicitly disabled WorkManagerInitializer in your manifest, have not manually called WorkManager#initialize at this point, and your Application does not implement Configuration.Provider.
+	at androidx.work.impl.WorkManagerImpl.getInstance(WorkManagerImpl.java:180)
+	at androidx.work.WorkManager$Companion.getInstance(WorkManager.kt:175)
+	at com.android.statementservice.domain.DomainVerificationReceiverV2.scheduleUnlockedV2(DomainVerificationReceiverV2.kt:80)
+	at com.android.statementservice.domain.DomainVerificationReceiverV2.onReceive(DomainVerificationReceiverV2.kt:67)
+	at android.app.ActivityThread.handleReceiver(ActivityThread.java:5301)
+	... 10 more

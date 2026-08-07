@@ -27,6 +27,12 @@ ARCHITECTURE.md instead.
   benchmarked on a Tensor G1. If the reflex model cannot hold a conversational
   latency budget on the 6a's TPU/CPU, the whole resident-model premise needs
   revisiting.
+- **Can a reflex model actually do the flagship job?** The premise is that a
+  1–3B model can turn a crash report into the sentence a person needs.
+  Untested. `fixtures/crash/` now holds two real cases from the device to test
+  it against, including a control whose correct answer is "ignore this" — a
+  model that cannot stay quiet about unfixable platform bugs is worse than no
+  model. Answer this before building any of §2.2.
 
 ## Blocking phase 3
 

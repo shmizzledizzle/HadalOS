@@ -1,0 +1,35 @@
+2026-08-06 13:16:04 system_app_crash (text, 2161 bytes)
+SystemUptimeMs: 139023
+Process: com.android.settings
+PID: 3785
+UID: 1000
+Frozen: false
+Flags: 0x38cbbe45
+Package: com.android.settings v36 (16)
+Foreground: Yes
+Process-Runtime: 115825
+Timestamp: 2026-08-06 13:16:04.476-0600
+Build: google/bluejay/bluejay:16/BP4A.251205.006/14401865:user/release-keys
+Crash-Handler: com.android.internal.os.RuntimeInit$KillApplicationHandler
+Loading-Progress: 1.0
+Dropped-Count: 0
+
+java.lang.IllegalStateException: Gatekeeper Password is missing!!
+	at com.android.settings.biometrics.BiometricUtils.requestGatekeeperHat(BiometricUtils.java:133)
+	at com.android.settings.biometrics.BiometricEnrollIntroduction.lambda$onActivityResult$2(BiometricEnrollIntroduction.java:440)
+	at com.android.settings.biometrics.BiometricEnrollIntroduction.$r8$lambda$-Zu237qgkgniJaFDzGJ351vvex4(BiometricEnrollIntroduction.java:0)
+	at com.android.settings.biometrics.BiometricEnrollIntroduction$$ExternalSyntheticLambda0.onChallengeGenerated(R8$$SyntheticClass:0)
+	at com.android.settings.biometrics.fingerprint.FingerprintEnrollIntroduction$$ExternalSyntheticLambda3.onChallengeGenerated(R8$$SyntheticClass:0)
+	at android.hardware.fingerprint.FingerprintCallback.sendChallengeGenerated(FingerprintCallback.java:243)
+	at android.hardware.fingerprint.FingerprintManager$FingerprintServiceReceiver.lambda$onChallengeGenerated$6(FingerprintManager.java:1611)
+	at android.hardware.fingerprint.FingerprintManager$FingerprintServiceReceiver.$r8$lambda$EP01_M5GmAMUcfSf5atyl-GZGQg(Unknown Source:0)
+	at android.hardware.fingerprint.FingerprintManager$FingerprintServiceReceiver$$ExternalSyntheticLambda9.run(D8$$SyntheticClass:0)
+	at android.os.Handler.handleCallback(Handler.java:1070)
+	at android.os.Handler.dispatchMessage(Handler.java:125)
+	at android.os.Looper.dispatchMessage(Looper.java:333)
+	at android.os.Looper.loopOnce(Looper.java:263)
+	at android.os.Looper.loop(Looper.java:367)
+	at android.app.ActivityThread.main(ActivityThread.java:9287)
+	at java.lang.reflect.Method.invoke(Native Method)
+	at com.android.internal.os.RuntimeInit$MethodAndArgsCaller.run(RuntimeInit.java:566)
+	at com.android.internal.os.ZygoteInit.main(ZygoteInit.java:929)
