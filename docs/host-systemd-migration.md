@@ -273,6 +273,34 @@ eselect profile show
 
 Set it by name, not by number — the numbers shift between syncs.
 
+### The profile switch is not sufficient on its own
+
+`make.conf` USE overrides the profile, and this machine's `make.conf` is
+catalyst stage3 boilerplate that pins the wrong side of the choice:
+
+```
+USE="dist-kernel wayland screencast -systemd elogind kde plasma pipewire server udev"
+```
+
+With `-systemd` forced and `elogind` masked off by the new profile, *neither*
+flag is set, and every package carrying
+`REQUIRED_USE="exactly-one-of ( elogind systemd )"` fails to resolve.
+`kde-plasma/plasma-meta` is the one that surfaces it, with
+`firewall? ( systemd )` failing alongside for the same reason.
+
+`/etc/portage/package.use/dbus` has the same problem and bites one step later —
+systemd soft-blocks elogind, so once elogind is unmerged `sys-apps/dbus[elogind]`
+either fails to build or pulls elogind back in and deadlocks the resolve.
+
+```bash
+sudo sed -i 's/-systemd elogind/systemd/' /etc/portage/make.conf
+sudo sed -i 's/\belogind\b/systemd/' /etc/portage/package.use/dbus
+portageq envvar USE | tr ' ' '\n' | grep -E '^-?(systemd|elogind)$'   # expect: systemd
+```
+
+Worth grepping the whole of `/etc/portage` for `elogind` before rebuilding —
+anything left pointing at it is a resolve failure waiting to happen.
+
 ---
 
 ## Step 3 — preview, then rebuild
