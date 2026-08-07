@@ -30,12 +30,10 @@ ARCHITECTURE.md instead.
 
 ## Blocking phase 3
 
-- **CalyxOS build reproducibility.** Their Android 16 status for `bluejay` was
-  "currently unsupported" as of their June 2025 post. Needs re-checking against
-  their current tree before phase 3 is scheduled at all — this may mean
-  targeting their Android 15 branch instead.
 - **AVB re-locking with a custom key.** Real on Pixels, but untested by us, and
-  getting it wrong on a device with no other OS on it is a bad afternoon.
+  getting it wrong on a device with no other OS on it is a bad afternoon. Now
+  the *only* remaining phase 3 unknown, and the only irreversible step in the
+  plan.
 
 ## Unscoped
 
@@ -45,7 +43,11 @@ ARCHITECTURE.md instead.
   own beyond the confirmation dialog.
 - Whether `read-network-activity` should read from `NetworkStatsManager`
   (framework, aggregated, easy) or eBPF traffic-controller maps directly
-  (precise, per-uid, harder, and the same source Datura uses).
+  (precise, per-uid, harder, and the same source Datura uses). Leaning
+  framework: `cmd netstats` reports *"No shell command implementation"* on the
+  device, so there is no CLI shortcut to lean on either way, and
+  `dumpsys netstats` already exposes 31 per-uid records — the aggregated data
+  is real and present.
 
 ---
 

@@ -39,12 +39,12 @@ applied to data a phone actually has. ARCHITECTURE.md §1.1.
 
 ## Status
 
-Foundation. Nothing boots. Nothing has touched the phone.
+Foundation. Nothing boots. The phone has been read from, never written to.
 
 | Component | State |
 |---|---|
 | Architecture / decision record | written |
-| Action grammar + validators | 32/32 unit tests |
+| Action grammar + validators | 38/38 unit tests, 23/23 on device |
 | Capability tiers + confirmation contract | covered by the above |
 | `android.hadal.IHadalBroker` AIDL | not started |
 | SELinux domains + `neverallow` rules | not started |
@@ -57,9 +57,14 @@ Foundation. Nothing boots. Nothing has touched the phone.
 cd src/hadal-brokerd && cargo test
 ```
 
-Everything above the test line is validated only against the host toolchain.
-Nothing has been cross-compiled, nothing has run on the device, and no
-bootloader has been unlocked.
+The action grammar has been cross-compiled to `aarch64-linux-android` and its
+corpus run on the target device (Pixel 6a, CalyxOS 7.2.2.0, Android 16) —
+23/23. Everything below that line is host-validated only. No bootloader has
+been unlocked and nothing has been flashed.
+
+```bash
+./scripts/build-android.sh && ./scripts/probe-device.sh
+```
 
 ---
 

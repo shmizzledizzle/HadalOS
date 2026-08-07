@@ -343,6 +343,13 @@ impl From<LogTag> for String {
 
 /// A DropBoxManager entry tag. A closed set — these are defined by the
 /// platform, so an open string would only ever be a typo or an attack.
+///
+/// The line drawn here is *diagnostic value*, not completeness. A real
+/// bluejay/CalyxOS device also emits `storage_trim`, `keymaster` and
+/// `netstats` entries; those are telemetry rather than something a user would
+/// ever ask about, and admitting them would widen the surface for nothing. If
+/// one of them turns out to matter, adding it is a deliberate act — which is
+/// the point of the enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DropBoxTag {
@@ -350,14 +357,22 @@ pub enum DropBoxTag {
     DataAppAnr,
     DataAppNativeCrash,
     DataAppWtf,
+    DataAppStrictmode,
     SystemAppCrash,
     SystemAppAnr,
     SystemAppNativeCrash,
+    SystemAppStrictmode,
     SystemServerCrash,
     SystemServerAnr,
     SystemServerWtf,
+    SystemServerStrictmode,
     SystemTombstone,
     SystemLastKmsg,
+    /// Kernel audit records, which on an enforcing device means SELinux
+    /// denials. Directly relevant to a broker whose own confinement is
+    /// expressed in sepolicy.
+    SystemAudit,
+    SystemBoot,
 }
 
 impl DropBoxTag {
@@ -367,16 +382,42 @@ impl DropBoxTag {
             DropBoxTag::DataAppAnr => "data_app_anr",
             DropBoxTag::DataAppNativeCrash => "data_app_native_crash",
             DropBoxTag::DataAppWtf => "data_app_wtf",
+            DropBoxTag::DataAppStrictmode => "data_app_strictmode",
             DropBoxTag::SystemAppCrash => "system_app_crash",
             DropBoxTag::SystemAppAnr => "system_app_anr",
             DropBoxTag::SystemAppNativeCrash => "system_app_native_crash",
+            DropBoxTag::SystemAppStrictmode => "system_app_strictmode",
             DropBoxTag::SystemServerCrash => "system_server_crash",
             DropBoxTag::SystemServerAnr => "system_server_anr",
             DropBoxTag::SystemServerWtf => "system_server_wtf",
+            DropBoxTag::SystemServerStrictmode => "system_server_strictmode",
             DropBoxTag::SystemTombstone => "SYSTEM_TOMBSTONE",
             DropBoxTag::SystemLastKmsg => "SYSTEM_LAST_KMSG",
+            DropBoxTag::SystemAudit => "SYSTEM_AUDIT",
+            DropBoxTag::SystemBoot => "SYSTEM_BOOT",
         }
     }
+
+    /// Every tag, so a caller can enumerate the surface without hard-coding it.
+    pub const ALL: &'static [DropBoxTag] = &[
+        DropBoxTag::DataAppCrash,
+        DropBoxTag::DataAppAnr,
+        DropBoxTag::DataAppNativeCrash,
+        DropBoxTag::DataAppWtf,
+        DropBoxTag::DataAppStrictmode,
+        DropBoxTag::SystemAppCrash,
+        DropBoxTag::SystemAppAnr,
+        DropBoxTag::SystemAppNativeCrash,
+        DropBoxTag::SystemAppStrictmode,
+        DropBoxTag::SystemServerCrash,
+        DropBoxTag::SystemServerAnr,
+        DropBoxTag::SystemServerWtf,
+        DropBoxTag::SystemServerStrictmode,
+        DropBoxTag::SystemTombstone,
+        DropBoxTag::SystemLastKmsg,
+        DropBoxTag::SystemAudit,
+        DropBoxTag::SystemBoot,
+    ];
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -961,6 +1002,47 @@ mod tests {
     fn restartable_service_passes() {
         let a = Action::RestartService { service: svc("hadald").unwrap() };
         assert!(a.check_limits().is_ok());
+    }
+
+    /// Pinned against what a real bluejay/CalyxOS 7.2.2.0 device actually
+    /// emits. An enum that cannot name a tag present on the target device is
+    /// a capability the user simply cannot reach.
+    #[test]
+    fn dropbox_tags_cover_what_the_device_emits() {
+        let observed = [
+            "system_app_crash",
+            "SYSTEM_LAST_KMSG",
+            "SYSTEM_BOOT",
+            "SYSTEM_AUDIT",
+        ];
+        for tag in observed {
+            assert!(
+                DropBoxTag::ALL.iter().any(|t| t.as_platform_tag() == tag),
+                "no DropBoxTag names {tag:?}, which the target device emits"
+            );
+        }
+    }
+
+    #[test]
+    fn dropbox_tag_platform_strings_are_unique() {
+        use std::collections::HashSet;
+        let s: HashSet<_> = DropBoxTag::ALL.iter().map(|t| t.as_platform_tag()).collect();
+        assert_eq!(s.len(), DropBoxTag::ALL.len());
+    }
+
+    /// The wire names are the protocol the model is told about, so they must
+    /// round-trip through serde exactly as written.
+    #[test]
+    fn dropbox_tags_round_trip() {
+        for t in DropBoxTag::ALL {
+            let json = serde_json::to_string(t).expect("serialise");
+            let back: DropBoxTag = serde_json::from_str(&json).expect("deserialise");
+            assert_eq!(*t, back);
+        }
+        let a: Action =
+            serde_json::from_str(r#"{"action":"read-crash-report","tag":"system_audit"}"#)
+                .expect("system_audit must be reachable");
+        assert_eq!(a.capability(), Capability::ReadCrashReport);
     }
 
     #[test]

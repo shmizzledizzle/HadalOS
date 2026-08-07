@@ -190,10 +190,28 @@ socket, the model never does.
 
 **Google removed Pixel device trees and driver binaries from AOSP as of
 Android 16** (June 2025), moving the reference target to Cuttlefish, a virtual
-device. CalyxOS's own statement: *"Without official source code, these devices
-are currently unsupported for AOSP 16 builds"* — Pixel 6a included — and they
-are carrying Android 15 device trees forward by hand against GPL kernel
-sources.
+device. That part stands and is the reason our base is CalyxOS's tree rather
+than Google's.
+
+**CalyxOS solved it for `bluejay`.** An earlier draft of this section quoted
+their June 2025 statement — *"Without official source code, these devices are
+currently unsupported for AOSP 16 builds"* — and treated Android 16 on the 6a
+as an open risk. That statement is now over a year stale. Measured on the
+target device, 2026-08-07:
+
+```
+ro.build.fingerprint   google/bluejay/bluejay:16/BP4A.251205.006/14401865:user/release-keys
+ro.build.version.sdk   36            (Android 16)
+ro.calyxos.version     7.2.2.0
+ro.build.flavor        calyx_bluejay-user
+security_patch         2026-06-01
+kernel                 6.1.145-android14-11 (GKI)
+```
+
+So a maintained Android 16 `bluejay` tree exists and ships. Phase 3 is
+materially less risky than first written: the device tree question is answered,
+and the remaining work is rebasing onto their tree rather than reconstructing
+one.
 
 This has three consequences and they drive the whole plan:
 
@@ -207,11 +225,26 @@ This has three consequences and they drive the whole plan:
    layout. §3 of the desktop document has no work item here — this is the one
    place where the port is a straight deletion.
 
-**The wipe.** CalyxOS's installer re-locks the bootloader for verified boot. If
-it is currently locked, unlocking it again **erases the device**. Flashing a
-self-built ROM also means either running unlocked, or signing with your own AVB
-key and re-locking — Pixels support custom AVB keys, so the latter is real, but
-it is a step to plan for rather than discover.
+**The wipe — confirmed, not hypothetical.** Measured on the device:
+
+```
+ro.boot.flash.locked         1
+ro.boot.verifiedbootstate    green
+ro.boot.vbmeta.device_state  locked
+```
+
+The bootloader **is locked** and verified boot is green. Unlocking it
+**erases the device**, with no way to take a backup across the operation.
+Flashing a self-built ROM then means either running permanently unlocked —
+which gives up the verified-boot guarantee this project otherwise leans on
+heavily — or signing with a custom AVB key and re-locking. Pixels support
+custom AVB keys, so the latter is real, but getting it wrong on a device with
+no other OS on it is an afternoon lost.
+
+This is the single irreversible step in the whole plan, which is why §5 puts it
+last and why phases 1 and 2 are built to need none of it.
+
+**SELinux is Enforcing**, as required for §2.3 to mean anything.
 
 ---
 

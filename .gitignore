@@ -17,3 +17,6 @@ target/
 .vscode/
 .idea/
 *.swp
+
+# Claude Code local session state
+/.claude/
