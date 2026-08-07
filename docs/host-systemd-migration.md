@@ -1138,6 +1138,15 @@ git of its own. It must be applied to the real HadalOS repo by hand.
 | `files/hadalos-limine-update` | honour `$HADALOS_ETC` |
 | `scripts/test-limine-hook.sh` | **new** — 15 unprivileged regression tests |
 | `README.md` | status table: the boot layer has booted a machine |
+| `src/hadal-brokerd/src/model.rs` | two scanner tests pinning real model output (fence-line JSON) |
+
+Separately, in the **Hadal** repo (`~/Documents/Hadal`):
+
+| File | Change |
+|---|---|
+| `.gitignore` | **add `tls.key`** — a real EC private key is currently tracked |
+| `rag/build_index.py` | re-point `SOURCES` from Terraria mod sources to the Gentoo corpus |
+| `hadal_mcp.py` | `resolve()` routes on a caller-supplied string; needs the policy in `docs/tier-routing.md` |
 
 The `/boot` assumption is worth a single fix rather than five: have the scripts
 locate the boot root the way `kernel-install` does — check `$BOOT_ROOT`, then a
