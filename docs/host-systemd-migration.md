@@ -301,6 +301,47 @@ portageq envvar USE | tr ' ' '\n' | grep -E '^-?(systemd|elogind)$'   # expect: 
 Worth grepping the whole of `/etc/portage` for `elogind` before rebuilding —
 anything left pointing at it is a resolve failure waiting to happen.
 
+### Then a three-way blocker: sysvinit / systemd / elogind
+
+Fixing USE gets every package wanting systemd, at which point Portage reports
+`sysvinit`, `systemd` and `elogind` as mutually uninstallable. Two independent
+causes, plus one red herring.
+
+**`elogind` is in `@world`.** Portage is obliged to keep anything in the world
+file, and systemd soft-blocks it. Deadlock:
+
+```bash
+sudo emerge --deselect sys-auth/elogind      # world file only; unmerges nothing
+```
+
+**`openrc[sysvinit]`** is on by default (`+sysvinit` in IUSE) and pulls in
+`sys-apps/sysvinit`, which `systemd[sysv-utils]` blocks.
+
+The red herring is `sys-kernel/dracut`, which appears to demand sysvinit but
+does not — its dependency is an any-of that systemd satisfies:
+
+```
+|| ( >=sys-apps/sysvinit-2.87-r3  sys-apps/openrc[sysv-utils(-)]
+     sys-apps/systemd[sysv-utils(+)]  … )
+```
+
+Portage listed sysvinit only because it was already installed. Once systemd
+arrives with `sysv-utils`, dracut is satisfied.
+
+```bash
+echo 'sys-apps/openrc -sysvinit'    | sudo tee /etc/portage/package.use/openrc
+echo 'sys-apps/systemd sysv-utils'  | sudo tee /etc/portage/package.use/systemd
+```
+
+**Turning off `openrc[sysvinit]` does not endanger the fallback.** In the
+openrc ebuild that flag governs only the *dependency*; the meson option that
+installs sysv-compat binaries is driven by the separate `sysv-utils` flag
+(`$(meson_use sysv-utils sysvinit)` — confusingly named). `/sbin/openrc-init`
+is installed unconditionally, which `qlist sys-apps/openrc` confirms.
+
+Leave openrc's `sysv-utils` **off**. Turning it on would block
+`systemd[sysv-utils]` and recreate the same conflict from the other side.
+
 ---
 
 ## Step 3 — preview, then rebuild
