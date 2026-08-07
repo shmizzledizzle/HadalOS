@@ -32,6 +32,7 @@
 //! `PrivateNetwork=`. See `README.md` here for the deployment.
 
 mod config;
+mod retrieve;
 mod upstream;
 
 use std::sync::Arc;
@@ -51,6 +52,11 @@ struct Ctx {
     cfg: Config,
     key: String,
     http: reqwest::Client,
+    /// None when no index is configured, or when loading failed. Retrieval is
+    /// an enhancement, so a broken index degrades to answering without it —
+    /// but loudly, because silently unretrieved is exactly the failure this
+    /// index exists to prevent.
+    index: Option<retrieve::Index>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -92,6 +98,31 @@ async fn main() -> std::process::ExitCode {
         }
     };
 
+    let index = match &cfg.index_dir {
+        None => None,
+        Some(dir) => match retrieve::Index::load(dir) {
+            Ok(i) => {
+                tracing::info!(
+                    "retrieval index: {} chunks from {} (model {})",
+                    i.len(), dir.display(), i.model
+                );
+                if i.model != cfg.embed_model {
+                    tracing::warn!(
+                        "index was built with '{}' but --embed-model is '{}' — queries will be \
+                         embedded by a different model than the documents, and retrieval will be \
+                         close to random",
+                        i.model, cfg.embed_model
+                    );
+                }
+                Some(i)
+            }
+            Err(e) => {
+                tracing::error!("retrieval disabled: {e}");
+                None
+            }
+        },
+    };
+
     let ctx = Arc::new(Ctx {
         http: reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(600))
@@ -99,12 +130,14 @@ async fn main() -> std::process::ExitCode {
             .expect("http client"),
         cfg: cfg.clone(),
         key,
+        index,
     });
 
     let app = Router::new()
         .route("/api/tags", get(tags))
         .route("/api/generate", post(generate))
         .route("/api/embed", post(embed))
+        .route("/api/retrieve", post(retrieve_handler))
         .with_state(ctx);
 
     let listener = match tokio::net::TcpListener::bind(cfg.listen).await {
@@ -275,6 +308,80 @@ fn note_egress_embed(cfg: &Config, inputs: &[String], kind: &str) {
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
         let _ = f.write_all(line.as_bytes());
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct RetrieveRequest {
+    #[serde(default)]
+    query: String,
+    #[serde(default = "default_k")]
+    k: usize,
+}
+
+fn default_k() -> usize {
+    5
+}
+
+/// Retrieve reference passages for a query.
+///
+/// The broker calls this and decides what to do with the result; hadald only
+/// ranks. Returns an empty list rather than an error when no index is loaded,
+/// so a caller can always ask and simply get nothing back.
+async fn retrieve_handler(
+    State(ctx): State<Arc<Ctx>>,
+    Json(req): Json<RetrieveRequest>,
+) -> Result<Response, Response> {
+    let Some(index) = &ctx.index else {
+        return Ok(Json(serde_json::json!({ "passages": [], "reason": "no index loaded" }))
+            .into_response());
+    };
+    if req.query.trim().is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "empty query").into_response());
+    }
+
+    // Embedded as a *query*, not a passage. Retrieval models place questions
+    // and documents in different regions of the space; using the document
+    // encoding for a question silently degrades every result.
+    let (body, _) = upstream::embed_body(
+        &ctx.cfg.embed_model,
+        &[format!("search_query: {}", req.query)],
+    );
+    let resp = ctx
+        .http
+        .post(format!("{}/embeddings", ctx.cfg.upstream))
+        .bearer_auth(&ctx.key)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| {
+            (StatusCode::BAD_GATEWAY, format!("embedding the query failed: {e}")).into_response()
+        })?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let detail = resp.text().await.unwrap_or_default();
+        tracing::error!("query embedding returned {status}: {}", detail.trim());
+        return Err((StatusCode::BAD_GATEWAY, format!("upstream returned {status}"))
+            .into_response());
+    }
+
+    let parsed: upstream::EmbeddingsResponse = resp.json().await.map_err(|e| {
+        (StatusCode::BAD_GATEWAY, format!("malformed embeddings reply: {e}")).into_response()
+    })?;
+    let Some(vector) = parsed.ordered().into_iter().next() else {
+        return Err((StatusCode::BAD_GATEWAY, "no embedding returned").into_response());
+    };
+
+    let hits = index.search(&vector, req.k.clamp(1, 20));
+    tracing::info!("retrieve: {} hits for {} chars", hits.len(), req.query.len());
+
+    Ok(Json(serde_json::json!({
+        "passages": hits.iter().map(|(s, c)| serde_json::json!({
+            "ref": c.r#ref, "score": s, "text": c.text
+        })).collect::<Vec<_>>(),
+        "text": retrieve::format_passages(&hits),
+    }))
+    .into_response())
 }
 
 async fn generate(

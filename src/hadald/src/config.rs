@@ -29,6 +29,9 @@ pub struct Config {
     /// embedding and chat are different model families — nothing sensible
     /// serves both.
     pub embed_model: String,
+    /// Directory holding manifest.json, vectors.f32 and chunks.jsonl.
+    /// Absent means no retrieval — hadald answers from the model alone.
+    pub index_dir: Option<PathBuf>,
     /// File holding the API key. Never an environment variable — see below.
     pub key_file: PathBuf,
     /// Append a line per outbound request here, so "what left this machine"
@@ -106,6 +109,7 @@ impl Config {
         let mut upstream = DEFAULT_UPSTREAM.to_string();
         let mut model = String::new();
         let mut embed_model = DEFAULT_EMBED_MODEL.to_string();
+        let mut index_dir = None;
         let mut key_file = PathBuf::from("/etc/hadal/upstream.key");
         let mut egress_log = None;
         let mut log_bodies = false;
@@ -121,6 +125,7 @@ impl Config {
                 "--upstream" => upstream = val("--upstream")?,
                 "--model" => model = val("--model")?,
                 "--embed-model" => embed_model = val("--embed-model")?,
+                "--index" => index_dir = Some(PathBuf::from(val("--index")?)),
                 "--key-file" => key_file = PathBuf::from(val("--key-file")?),
                 "--egress-log" => egress_log = Some(PathBuf::from(val("--egress-log")?)),
                 "--log-bodies" => log_bodies = true,
@@ -150,6 +155,7 @@ impl Config {
             upstream: upstream.trim_end_matches('/').to_string(),
             model,
             embed_model,
+            index_dir,
             key_file,
             egress_log,
             log_bodies,

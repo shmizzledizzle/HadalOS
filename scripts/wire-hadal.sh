@@ -22,6 +22,9 @@ BIN="$OS/src/target/debug"
 HADALD="$HERE/src/hadald/target/debug/hadald"
 MODEL="${HADAL_MODEL:-nvidia/llama-3.3-nemotron-super-49b-v1.5}"
 KEY="${HADAL_KEY:-$HOME/.config/hadal/upstream.key}"
+# Retrieval index. Absent or unreadable means hadald answers from the model
+# alone and says so at startup — it never silently skips retrieval.
+INDEX="${HADAL_INDEX:-$HOME/Documents/Hadal/rag/index-gentoo}"
 RUNDIR="${XDG_RUNTIME_DIR:-/tmp}/hadal-wire"
 
 say()  { printf '\033[1m%s\033[0m\n' "$*"; }
@@ -59,7 +62,15 @@ run)
     mkdir -p "$RUNDIR"; chown "$OWNER" "$RUNDIR"
 
     say "starting hadald as $OWNER (model: $MODEL)"
+    index_args=()
+    if [[ -f $INDEX/chunks.jsonl ]]; then
+        index_args=(--index "$INDEX")
+        say "  retrieval index: $INDEX"
+    else
+        say "  no retrieval index at $INDEX — answering from the model alone"
+    fi
     runuser -u "$OWNER" -- "$HADALD" --serve --model "$MODEL" \
+        "${index_args[@]}" \
         --key-file "$KEY" --egress-log "$RUNDIR/egress.log" \
         > "$RUNDIR/hadald.log" 2>&1 &
     echo $! > "$RUNDIR/hadald.pid"
@@ -97,6 +108,8 @@ status)
         "$([ -f /etc/dbus-1/system.d/org.hadal.Broker1.conf ] && echo installed || echo MISSING)"
     printf '  %-34s %s\n' "polkit actions" \
         "$([ -f /usr/share/polkit-1/actions/org.hadal.broker.policy ] && echo installed || echo MISSING)"
+    printf '  %-34s %s\n' "retrieval index" \
+        "$([ -f "$INDEX/chunks.jsonl" ] && echo "$(wc -l < "$INDEX/chunks.jsonl") chunks" || echo MISSING)"
     printf '  %-34s %s\n' "hadald :11434" \
         "$((exec 3<>/dev/tcp/127.0.0.1/11434) 2>/dev/null && echo up || echo down)"
     printf '  %-34s %s\n' "org.hadal.Broker1 on system bus" \
