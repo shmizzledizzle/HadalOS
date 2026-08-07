@@ -1121,3 +1121,25 @@ drop-in survival, and the refusal to write an empty config. 15/15.
 Verified as a *regression* test, not just a passing one: reverting only the
 initrd collection fix makes it fail with exactly the two assertions that
 describe that bug.
+
+---
+
+## Upstream carry-list
+
+Everything below exists **only in the local overlay snapshot**, which has no
+git of its own. It must be applied to the real HadalOS repo by hand.
+
+| File | Change |
+|---|---|
+| `overlay/sys-boot/hadalos-limine-hook/hadalos-limine-hook-0.1.0.ebuild` | `inherit systemd`; install the timer; postinst points at the timer and documents a non-`/boot` ESP |
+| `files/hadalos-mark-boot-good.service` | drop `[Install]`, `After=multi-user.target`, `ExecStartPre=sleep 60`; add `Environment=KERNEL_INSTALL_BOOT_ROOT` |
+| `files/hadalos-mark-boot-good.timer` | **new** — `OnBootSec=90s`, `WantedBy=timers.target`, carries the `ConditionPathExists` |
+| `files/90-hadalos-limine.install` | collect initrds from `$KERNEL_INSTALL_STAGING_AREA`; honour `$HADALOS_ETC` |
+| `files/hadalos-limine-update` | honour `$HADALOS_ETC` |
+| `scripts/test-limine-hook.sh` | **new** — 15 unprivileged regression tests |
+| `README.md` | status table: the boot layer has booted a machine |
+
+The `/boot` assumption is worth a single fix rather than five: have the scripts
+locate the boot root the way `kernel-install` does — check `$BOOT_ROOT`, then a
+mounted ESP at `/efi`, then `/boot` — instead of defaulting. Three of the six
+bugs were that assumption wearing different hats.
