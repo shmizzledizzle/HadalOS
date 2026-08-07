@@ -1052,3 +1052,46 @@ The generalisable lesson for the mobile port: **paths that only run in a crisis
 need tests that run them on purpose.** `KERNEL_INSTALL_STAGING_AREA` appears in
 no test in `scripts/`; neither does any assertion that `lastgood` becomes
 non-empty after a boot.
+
+### Phase 3 verified end to end
+
+```
+02:18:14  recorded 6.18.41-gentoo-dist-bin as last known good
+02:18:14  hadalos-limine-update: wrote /efi/limine.conf (1 kernel(s), last known good: ...)
+02:22:32  Starting ... Finished          timer-triggered, 72 ms, correctly a no-op
+```
+
+Everything the boot layer claims to do, it now does on hardware: kernel and
+initrd land in `$BOOT_ROOT/hadalos/<ver>/`, `limine.conf` is generated with the
+drop-in fallbacks appended, the machine boots from it, `lastgood` is recorded
+after the system settles, and the menu relabels to `[last known good]`.
+
+The 72 ms timer run is also incidental proof the fix took: the earlier
+invocation took a full 60 s because `ExecStartPre=sleep 60` was still present.
+
+A note on reading timer state. `NextElapseUSecRealtime=` being **empty is
+correct** for an `OnBootSec=` timer that has already elapsed this boot — it
+fires once per boot, so there is nothing further to schedule. The value that
+actually distinguishes armed from inert is `ConditionResult`:
+
+```bash
+systemctl show hadalos-mark-boot-good.timer -p ConditionResult -p LastTriggerUSec
+```
+
+`ConditionResult=no` with `LastTriggerUSec` unset is the inert case, and it
+reports as `enabled` throughout — the same shape as every other silent failure
+in this list.
+
+### Still untested: the refusal path
+
+The one line the whole design rests on has never executed:
+
+```bash
+sudo emerge -av =sys-kernel/gentoo-kernel-bin-<older>
+grep -c '^/' /efi/limine.conf          # 2 generated + 3 fallbacks
+
+# then remove the PINNED version — the plugin must exit 1 with
+# "refusing to remove <ver> — it is the recorded last known good kernel"
+```
+
+Given six-for-six on this code path, do not assume it works.
