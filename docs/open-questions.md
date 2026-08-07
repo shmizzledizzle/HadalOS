@@ -46,3 +46,16 @@ ARCHITECTURE.md instead.
 - Whether `read-network-activity` should read from `NetworkStatsManager`
   (framework, aggregated, easy) or eBPF traffic-controller maps directly
   (precise, per-uid, harder, and the same source Datura uses).
+
+---
+
+## Resolved
+
+- ~~**Which NDK?**~~ r27d, unpacked to `~/Android/android-ndk-r27d`. Latest LTS
+  patch; ::gentoo has no `android-ndk` and there is no need for one, since the
+  tarball needs no root.
+- ~~**`aarch64-linux-android` std.**~~ Confirmed absent from Gentoo's
+  `dev-lang/rust` (only `x86_64-unknown-linux-gnu` is installed). Resolved with
+  rustup in `~/.cargo` / `~/.rustup`, installed `--no-modify-path` so the system
+  cargo still wins in `PATH`. `scripts/build-android.sh` puts rustup's cargo
+  first explicitly.
