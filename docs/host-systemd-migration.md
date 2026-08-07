@@ -297,6 +297,40 @@ sudo emerge -avuDN --keep-going @world
 
 ---
 
+## Step 3b — do not rely on `/sbin/init` being swapped
+
+`emerge -pv sys-apps/systemd` on the **OpenRC** profile shows
+`USE="... -sysv-utils ..."`. With `sysv-utils` off, systemd does **not** install
+`/sbin/init`, and an entry with no `init=` would keep booting OpenRC — you would
+do the whole migration and reboot into exactly what you started with, which is
+a confusing failure rather than an obvious one.
+
+The systemd profile normally flips `sysv-utils` on, which displaces
+`sys-apps/sysvinit` and makes `/sbin/init` systemd. **Check that in the step 3
+preview.** But do not depend on it either way: now that Limine exists, name the
+init explicitly and the question stops mattering.
+
+Add a third entry to `/efi/limine.conf` *before* rebooting:
+
+```
+/Gentoo Linux 6.18.41 (systemd)
+    protocol: linux
+    kernel_path: boot():/EFI/Gentoo/vmlinuz-6.18.41-gentoo-dist-bin.efi
+    module_path: boot():/EFI/Gentoo/initramfs-6.18.41-gentoo-dist-bin.img
+    cmdline: root=UUID=c2463ee6-5148-476b-a3d4-b7b06dab732c rootfstype=btrfs rootflags=subvol=@ rw init=/usr/lib/systemd/systemd
+```
+
+This is why phase 1 came first. The migration is now a *menu choice* rather
+than a system-wide switch: OpenRC and systemd boot from the same root, from
+adjacent entries, and picking the wrong one costs a reboot instead of a rescue
+USB. Keep both entries until you have run on systemd for a while.
+
+**Do not rebuild the initramfs as part of this.** A dracut initramfs mounts
+root and execs whatever `init=` names; it does not care which init that is.
+Rebuilding it here changes two things at once for no benefit.
+
+---
+
 ## Step 4 — configure systemd before rebooting
 
 ```bash
