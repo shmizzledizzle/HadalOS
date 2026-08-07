@@ -139,3 +139,59 @@ and `KERNEL_INSTALL_LAYOUT`, `KERNEL_INSTALL_INITRD_GENERATOR` and
 three independent checks, visible as source.
 
 Whether the model uses it is the next measurement.
+
+### Result: no improvement, and the reason is not the corpus
+
+| run | path | syntax | `uki_generator` | invented pkgs |
+|---|---|---|---|---|
+| no retrieval | ✗ | ✗ | absent | 2 |
+| retrieval on question | ✗✗ | ✗ | absent | 1 |
+| + evidence in query | ✓ | ✓ | named, but "either/or" | 0 |
+| **+ plugin source** | ✓ | ✓ | **absent** | 0 |
+
+Adding the plugin source did not fix the completeness gap. It arguably made it
+worse: the previous run at least named `uki_generator`, wrongly; this one omits
+it. Following either answer fails on the next run.
+
+**It was not a retrieval failure.** Reconstructing the exact query the broker
+built for this run:
+
+```
+0.631  gentoo-scripts/…05-check-config.install:1-37    <- top hit
+0.609  gentoo-handbook/wiki__Installkernel:169-243
+```
+
+`05-check-config` source in the prompt: **true**.
+`KERNEL_INSTALL_UKI_GENERATOR` in the prompt: **true**.
+And the log itself mentions `uki_generator` three times.
+
+So the model had the fact twice over — as retrieved source showing three
+independent `exit 1` checks, and in the log — and still reported only the key
+the error message named.
+
+### What this actually shows
+
+Corpus completeness has stopped being the bottleneck. What remains is a
+*reasoning* step: noticing that a check with three independent gates will fail
+again on the next gate once the first is fixed. That is inference from the
+source, not recall from it.
+
+Note the error message invites exactly this mistake. `05-check-config.install`
+exits at the **first** missing key, so the log only ever names one — and a
+human following it hits the same wall. This machine did, at 01:51 on
+2026-08-07. The model is reproducing a real human failure mode faithfully,
+which is arguably correct behaviour for "explain this log" and is not what
+anyone wants.
+
+Two things left to try, and they are different experiments:
+
+- **A larger model on the same fixture.** This is a synthesis step, and the
+  earlier crash-fixture result — where a 49B beat a 70B — was about diagnosis,
+  not synthesis. `gpt-oss-120b` or `nemotron-ultra-253b` would test whether the
+  finding inverts.
+- **Asking the question directly.** A prompt that says *"and state what will
+  fail next once this is fixed"* tests whether the inference is absent or
+  merely unprompted. Cheaper, and it isolates the variable.
+
+Run the prompt experiment first: if it succeeds, the corpus and the model are
+both fine and the persona is the gap.
