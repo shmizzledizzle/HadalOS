@@ -709,6 +709,46 @@ default is correct and the fallbacks carry their own explicit `init=`.
 Two things will then bite, both consequences of the boot layer never having run
 on real hardware.
 
+### 0. The service unit is never installed at all
+
+Found on the first real merge. `src_install` calls `systemd_dounit`, which
+lives in `systemd.eclass`, but the ebuild has no `inherit`:
+
+```
+line 307: systemd_dounit: command not found
+ * QA Notice: command not found: systemd_dounit
+```
+
+Portage treats this as a **QA notice, not an error** — the package merges
+successfully, `emerge` exits 0, and the merge list quietly contains four files
+with no `.service` among them:
+
+```
+/etc/hadalos/limine.d/.keep_sys-boot_hadalos-limine-hook-0
+/usr/lib/kernel/install.d/90-hadalos-limine.install
+/usr/bin/hadalos-mark-boot-good
+/usr/bin/hadalos-limine-update
+```
+
+So step 5 of the package's own `pkg_postinst` —
+`systemctl enable hadalos-mark-boot-good.service` — cannot succeed, because
+the unit does not exist. Fix:
+
+```bash
+EAPI=8
+
+inherit systemd        # <- systemd_dounit comes from here
+
+DESCRIPTION="..."
+```
+
+**This stacks with the bug below**, and that is the part worth internalising.
+Even once the unit installs, `ConditionPathExists=/boot/hadalos` never matches
+on this machine. Two independent, individually silent failures, both landing on
+the same feature: last-known-good pinning would appear installed and record
+nothing. Neither is visible without checking the merge list and then the
+condition result by hand.
+
 ### 1. `BOOT_ROOT` is `/efi` here, and the service unit hardcodes `/boot`
 
 `90-hadalos-limine.install` correctly honours the environment:
