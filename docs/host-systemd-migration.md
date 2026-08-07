@@ -1082,16 +1082,42 @@ systemctl show hadalos-mark-boot-good.timer -p ConditionResult -p LastTriggerUSe
 reports as `enabled` throughout — the same shape as every other silent failure
 in this list.
 
-### Still untested: the refusal path
+### The refusal path — tested, and it holds
 
-The one line the whole design rests on has never executed:
+Exercised against the shipped plugin and the real `/etc/hadalos/lastgood`,
+using a sandbox boot root so nothing on the ESP was at risk:
 
-```bash
-sudo emerge -av =sys-kernel/gentoo-kernel-bin-<older>
-grep -c '^/' /efi/limine.conf          # 2 generated + 3 fallbacks
-
-# then remove the PINNED version — the plugin must exit 1 with
-# "refusing to remove <ver> — it is the recorded last known good kernel"
+```
+remove 6.18.41 (pinned)   -> exit 1, "refusing to remove ... last known good", dir survives
+remove 9.9.9-test         -> exit 0, dir removed, config regenerated
 ```
 
-Given six-for-six on this code path, do not assume it works.
+And the §3 invariants, with a newer kernel staged beside the pin:
+
+```
+/HadalOS 6.19.0-gentoo-dist-bin (current)
+/HadalOS 6.18.41-gentoo-dist-bin [last known good]     pin keeps its entry when older
+
+/HadalOS 7.10.0 (current)                              sort -V, not lexical
+/HadalOS 7.9.0
+/HadalOS 7.2.0
+```
+
+A stale pin naming an uninstalled kernel is ignored rather than fatal, and a
+config is still written. **First clean result of the day** — after six bugs,
+this part works exactly as designed.
+
+### And the finding that actually mattered
+
+None of the above was testable, because `LASTGOOD_FILE` was hardcoded to
+`/etc/hadalos/lastgood`. Exercising the most important behaviour in the boot
+layer required write access to `/etc`, which is why nothing exercised it.
+
+Both scripts now honour `$HADALOS_ETC`, and `scripts/test-limine-hook.sh`
+covers the whole set unprivileged — refusal, unpinned removal, staging-area
+initrd collection, the two-entry invariant, version ordering, stale pins,
+drop-in survival, and the refusal to write an empty config. 15/15.
+
+Verified as a *regression* test, not just a passing one: reverting only the
+initrd collection fix makes it fail with exactly the two assertions that
+describe that bug.
