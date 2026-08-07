@@ -677,14 +677,22 @@ The NVRAM entry `Boot01FF` remains the outer backstop throughout. Leave it.
 
 ### 3.1 Overlay, cmdline, layout
 
-The `::hadalos` overlay is not configured on this machine.
+The `::hadalos` overlay is not configured on this machine, and
+`/etc/portage/repos.conf` **does not exist** — Gentoo ships the default repo
+config at `/usr/share/portage/config/repos.conf`, so nothing has needed to
+create it. `mkdir -p` first or the write silently goes nowhere and `emerge`
+reports *"there are no ebuilds to satisfy"*.
 
 ```bash
+sudo mkdir -p /etc/portage/repos.conf
 sudo tee /etc/portage/repos.conf/hadalos.conf >/dev/null <<'EOF'
 [hadalos]
 location = /home/shmizzy/Documents/HadalOS-Mobile/HadalOS/overlay
 auto-sync = no
 EOF
+
+portageq get_repos /                    # must now list: gentoo hadalos
+portageq get_repo_path / hadalos        # must print the overlay path
 
 # The generator reads this; without it it scrapes /proc/cmdline instead.
 echo 'root=UUID=c2463ee6-5148-476b-a3d4-b7b06dab732c rootfstype=btrfs rootflags=subvol=@ rw' \
