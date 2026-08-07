@@ -383,12 +383,24 @@ impl DropBoxTag {
 // Paths
 // ─────────────────────────────────────────────────────────────────────────
 
-/// A syntactically acceptable absolute path.
+/// An absolute path that is syntactically acceptable and does not *literally*
+/// name a denied location.
 ///
-/// Deliberately *only* syntactic. Whether this path may actually be read is a
-/// policy question answered by [`PathPolicy::resolve`] at execution time,
-/// against the canonicalised path — because a check performed at parse time
-/// would be answering a question about a symlink that could since have moved.
+/// Path policy is enforced at two layers, and both are necessary:
+///
+/// 1. **Here, at parse time**, against the literal string. Cheap, and it means
+///    a proposal naming `/data/data/...` outright never travels any further
+///    than the parser — it is not logged as a pending action, not shown to the
+///    user, not handed to an executor.
+/// 2. **At execution time**, in [`PathPolicy::resolve`], against the
+///    *canonicalised* path. This is the load-bearing one: only it catches a
+///    symlink inside an allowed root that points somewhere denied, or that
+///    moved between parsing and reading.
+///
+/// Layer 1 cannot replace layer 2 — a parse-time check is answering a question
+/// about a symlink that could since have changed. Layer 2 alone is sufficient
+/// for safety but lets obvious garbage propagate. Keeping both is the same
+/// belt-and-braces reasoning as the denylist itself.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct SafePath(PathBuf);
@@ -418,6 +430,13 @@ impl TryFrom<String> for SafePath {
         }
         if raw.split('/').any(|c| c == "..") {
             return Err(reject("path contains '..'"));
+        }
+        // Layer 1 of the path denylist — see the type's documentation. The
+        // canonicalised check in `PathPolicy::resolve` still runs later and is
+        // the one that actually holds the line; this only stops a literal
+        // `/data/data/...` from being carried around before it gets there.
+        if is_denied(Path::new(&raw)) {
+            return Err(reject("path is on the permanent denylist"));
         }
         Ok(SafePath(PathBuf::from(&raw)))
     }
@@ -977,6 +996,87 @@ mod tests {
         assert!(path("/data/anr/traces.txt").is_ok());
         assert!(path("C:\\Windows\\System32\\config\\SAM").is_err());
         assert!(path("\\\\server\\share\\file").is_err());
+    }
+
+    /// Layer 1: a proposal that literally names a denied location must not
+    /// even parse. Without this an obviously-illegitimate `read-path` is
+    /// carried as a pending action until the executor finally refuses it.
+    #[test]
+    fn literal_denied_paths_are_rejected_at_parse_time() {
+        for bad in [
+            "/data/data/com.bank/databases/accounts.db",
+            "/data/user/0/com.signal/shared_prefs/x.xml",
+            "/data/misc/keystore/user_0/1000_USRPKEY",
+            "/storage/emulated/0/DCIM/photo.jpg",
+            "/proc/1/environ",
+            "/data/local/tmp/hadal/tls.key",
+        ] {
+            assert!(path(bad).is_err(), "should reject {bad:?} at parse time");
+        }
+        assert!(path("/data/anr/traces.txt").is_ok());
+        assert!(path("/data/tombstones/tombstone_00").is_ok());
+    }
+
+    /// Layer 2 is the one that actually holds the line: a symlink sitting
+    /// inside an allowed root, whose name is entirely innocent, pointing at
+    /// something denied. Layer 1 cannot see this and is not supposed to.
+    #[cfg(unix)]
+    #[test]
+    fn layer_two_catches_a_symlink_layer_one_cannot() {
+        use std::fs;
+
+        let base = std::env::temp_dir().join(format!("hadal-pathtest-{}", std::process::id()));
+        let root = base.join("allowed");
+        let hidden = base.join("elsewhere");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&root).expect("mkdir root");
+        fs::create_dir_all(&hidden).expect("mkdir hidden");
+
+        let secret = hidden.join("id_ed25519");
+        fs::write(&secret, b"not a real key").expect("write secret");
+
+        let link = root.join("innocent.log");
+        std::os::unix::fs::symlink(&secret, &link).expect("symlink");
+
+        // Layer 1 sees an ordinary path under an allowed root and permits it.
+        let proposed = SafePath::try_from(link.to_string_lossy().into_owned())
+            .expect("literal path is not denied, and must not be");
+
+        // Layer 2 canonicalises, lands on the real filename, and refuses.
+        let policy = PathPolicy::with_roots(vec![root.clone()]);
+        let err = policy.resolve(&proposed).expect_err("symlink to a denied file must be refused");
+        assert!(err.to_string().contains("denylist"), "unexpected reason: {err}");
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// A symlink that escapes the allowed roots entirely is caught by the
+    /// second gate rather than the denylist, but must still be refused.
+    #[cfg(unix)]
+    #[test]
+    fn layer_two_catches_escape_from_the_allowed_roots() {
+        use std::fs;
+
+        let base = std::env::temp_dir().join(format!("hadal-escapetest-{}", std::process::id()));
+        let root = base.join("allowed");
+        let outside = base.join("outside");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&root).expect("mkdir root");
+        fs::create_dir_all(&outside).expect("mkdir outside");
+
+        let target = outside.join("notes.txt");
+        fs::write(&target, b"ordinary file, wrong place").expect("write target");
+
+        let link = root.join("notes.txt");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+
+        let proposed =
+            SafePath::try_from(link.to_string_lossy().into_owned()).expect("parses fine");
+        let policy = PathPolicy::with_roots(vec![root.clone()]);
+        let err = policy.resolve(&proposed).expect_err("escape must be refused");
+        assert!(err.to_string().contains("outside"), "unexpected reason: {err}");
+
+        let _ = fs::remove_dir_all(&base);
     }
 
     /// App private storage is the most sensitive thing on the device and is
