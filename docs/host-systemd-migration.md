@@ -400,6 +400,30 @@ Rebuilding it here changes two things at once for no benefit.
 
 ---
 
+## Step 3c — what the rebuild does to the *running* session
+
+The rebuild unmerges `sys-auth/elogind` while your Plasma session is still
+using it. The daemon stays resident but its files are gone, so seat and session
+management, screen locking, suspend and polkit authentication can all start
+misbehaving before you reboot. **That is expected, not a failure.** Finish
+step 4 and reboot promptly rather than trying to keep working in that session.
+
+This is also where the two fallbacks stop being interchangeable, which is worth
+being precise about:
+
+- `init=/sbin/openrc-init` protects against **"systemd will not start."** It
+  boots the same `@` subvolume — where elogind is already gone and half the
+  system has been rebuilt — so it gets you a shell, not necessarily a working
+  desktop.
+- The **snapshot entry** protects against **"the userland is now broken."** It
+  is the only thing that returns the machine to its pre-migration state.
+
+So the snapshot entry has to exist in `limine.conf` *before* the rebuild runs,
+not before the reboot. Taking the snapshot without adding a way to boot it is
+the easy mistake here.
+
+---
+
 ## Step 4 — configure systemd before rebooting
 
 ```bash
