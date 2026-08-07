@@ -878,6 +878,36 @@ sudo systemctl daemon-reload
 sudo systemctl enable hadalos-mark-boot-good.service
 ```
 
+**The condition is not the only place `/boot` is assumed.**
+`hadalos-mark-boot-good` itself does:
+
+```bash
+BOOT_ROOT="${KERNEL_INSTALL_BOOT_ROOT:-/boot}"
+...
+if [[ ! -e $BOOT_ROOT/hadalos/$RUNNING/vmlinuz ]]; then
+    log "running kernel $RUNNING is not in the HadalOS boot layout; nothing to record"
+    exit 0
+fi
+```
+
+`KERNEL_INSTALL_BOOT_ROOT` is exported **only by kernel-install**. When systemd
+runs the script there is no such variable, so `BOOT_ROOT` falls back to `/boot`,
+the check fails, and it **exits 0** — the unit reports success while recording
+nothing. The same default then breaks the `hadalos-limine-update` call on the
+last line.
+
+So three places need correcting, and missing any one leaves the feature inert:
+
+| | Consequence if missed |
+|---|---|
+| `ConditionPathExists=` | unit skipped before it runs |
+| `ReadWritePaths=` | `ProtectSystem=strict` blocks the write |
+| `Environment=KERNEL_INSTALL_BOOT_ROOT=` | script exits 0 having recorded nothing |
+
+The upstream fix is for the script to locate the boot root the way
+`kernel-install` does rather than defaulting to `/boot`, or for the unit to
+carry the environment itself.
+
 Then verify — and note that the failure mode is *silence*, so an inactive
 service is not evidence of success:
 
