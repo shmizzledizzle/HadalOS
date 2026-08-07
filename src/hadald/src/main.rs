@@ -104,6 +104,7 @@ async fn main() -> std::process::ExitCode {
     let app = Router::new()
         .route("/api/tags", get(tags))
         .route("/api/generate", post(generate))
+        .route("/api/embed", post(embed))
         .with_state(ctx);
 
     let listener = match tokio::net::TcpListener::bind(cfg.listen).await {
@@ -182,6 +183,89 @@ fn note_egress(cfg: &Config, prompt: &str, system: &str) {
         }
         // Deliberately loud. An unwritable audit log is not a detail.
         Err(e) => tracing::error!("cannot open egress log {}: {e}", path.display()),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct EmbedRequest {
+    #[serde(default)]
+    input: Vec<String>,
+}
+
+/// Ollama's `/api/embed`, backed by an OpenAI-compatible `/v1/embeddings`.
+///
+/// Exists so Hadal's `rag/build_index.py` and `rag/search.py` work unchanged:
+/// they already speak this shape. The embedding model is separate from the
+/// chat model — retrieval models are their own thing — and is selected with
+/// `--embed-model`.
+///
+/// Non-streaming, so unlike `generate` this waits for the whole reply. Batches
+/// are the caller's business; `build_index.py` sends 32 at a time.
+async fn embed(
+    State(ctx): State<Arc<Ctx>>,
+    Json(req): Json<EmbedRequest>,
+) -> Result<Response, Response> {
+    if req.input.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "empty input").into_response());
+    }
+
+    let (body, kind) = upstream::embed_body(&ctx.cfg.embed_model, &req.input);
+    note_egress_embed(&ctx.cfg, &req.input, kind.as_str());
+
+    let resp = ctx
+        .http
+        .post(format!("{}/embeddings", ctx.cfg.upstream))
+        .bearer_auth(&ctx.key)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| {
+            tracing::error!("upstream unreachable: {e}");
+            (StatusCode::BAD_GATEWAY, format!("upstream unreachable: {e}")).into_response()
+        })?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        tracing::error!("embeddings upstream returned {status}");
+        return Err((StatusCode::BAD_GATEWAY, format!("upstream returned {status}"))
+            .into_response());
+    }
+
+    let parsed: upstream::EmbeddingsResponse = resp.json().await.map_err(|e| {
+        (StatusCode::BAD_GATEWAY, format!("malformed embeddings reply: {e}")).into_response()
+    })?;
+
+    let vectors = parsed.ordered();
+    if vectors.len() != req.input.len() {
+        // Silently returning fewer vectors than inputs would pair chunks with
+        // the wrong text for the rest of the batch.
+        tracing::error!("upstream returned {} vectors for {} inputs", vectors.len(), req.input.len());
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            format!("upstream returned {} vectors for {} inputs", vectors.len(), req.input.len()),
+        )
+            .into_response());
+    }
+
+    Ok(Json(serde_json::json!({ "embeddings": vectors })).into_response())
+}
+
+fn note_egress_embed(cfg: &Config, inputs: &[String], kind: &str) {
+    let Some(path) = &cfg.egress_log else { return };
+    use std::io::Write;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let bytes: usize = inputs.iter().map(String::len).sum();
+    let line = format!(
+        "{stamp} embed model={} upstream={} input_type={kind} count={} bytes={bytes}\n",
+        cfg.embed_model,
+        cfg.upstream,
+        inputs.len()
+    );
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = f.write_all(line.as_bytes());
     }
 }
 

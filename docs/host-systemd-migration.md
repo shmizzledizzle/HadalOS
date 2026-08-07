@@ -1145,7 +1145,8 @@ Separately, in the **Hadal** repo (`~/Documents/Hadal`):
 | File | Change |
 |---|---|
 | `.gitignore` | **add `tls.key`** — a real EC private key is currently tracked |
-| `rag/build_index.py` | re-point `SOURCES` from Terraria mod sources to the Gentoo corpus |
+| `rag/build_index.py` | `HADAL_PROFILE=gentoo` switch: SOURCES, EXTS, EMBED_MODEL/DIM, and a separate `index-gentoo/` dir |
+| `rag/fetch_corpus_gentoo.py` | **new** — renders man pages, copies package READMEs, fetches the Handbook |
 | `hadal_mcp.py` | `resolve()` routes on a caller-supplied string; needs the policy in `docs/tier-routing.md` |
 
 The `/boot` assumption is worth a single fix rather than five: have the scripts

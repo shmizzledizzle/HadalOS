@@ -5,6 +5,11 @@ use std::path::{Path, PathBuf};
 
 pub const DEFAULT_LISTEN: &str = "127.0.0.1:11434";
 pub const DEFAULT_UPSTREAM: &str = "https://integrate.api.nvidia.com/v1";
+/// 1024 dimensions, accepts `input_type`, verified against the live endpoint.
+/// Changing this invalidates any existing index — the vectors are not
+/// comparable across models, and `rag/index/manifest.json` records which one
+/// built them.
+pub const DEFAULT_EMBED_MODEL: &str = "nvidia/nv-embedqa-e5-v5";
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -14,6 +19,10 @@ pub struct Config {
     pub upstream: String,
     /// Model id passed through to the upstream.
     pub model: String,
+    /// Retrieval model for /api/embed. Separate from `model` because
+    /// embedding and chat are different model families — nothing sensible
+    /// serves both.
+    pub embed_model: String,
     /// File holding the API key. Never an environment variable — see below.
     pub key_file: PathBuf,
     /// Append a line per outbound request here, so "what left this machine"
@@ -90,6 +99,7 @@ impl Config {
         let mut listen = DEFAULT_LISTEN.to_string();
         let mut upstream = DEFAULT_UPSTREAM.to_string();
         let mut model = String::new();
+        let mut embed_model = DEFAULT_EMBED_MODEL.to_string();
         let mut key_file = PathBuf::from("/etc/hadal/upstream.key");
         let mut egress_log = None;
         let mut log_bodies = false;
@@ -104,6 +114,7 @@ impl Config {
                 "--listen" => listen = val("--listen")?,
                 "--upstream" => upstream = val("--upstream")?,
                 "--model" => model = val("--model")?,
+                "--embed-model" => embed_model = val("--embed-model")?,
                 "--key-file" => key_file = PathBuf::from(val("--key-file")?),
                 "--egress-log" => egress_log = Some(PathBuf::from(val("--egress-log")?)),
                 "--log-bodies" => log_bodies = true,
@@ -132,6 +143,7 @@ impl Config {
             listen,
             upstream: upstream.trim_end_matches('/').to_string(),
             model,
+            embed_model,
             key_file,
             egress_log,
             log_bodies,

@@ -119,6 +119,106 @@ pub fn chat_body(model: &str, system: &str, prompt: &str) -> serde_json::Value {
     })
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// Embeddings
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Retrieval models embed a question and a document differently, and mixing
+/// the two costs real accuracy. Ollama's `nomic-embed-text` signals this with
+/// a `search_document:` / `search_query:` text prefix; NVIDIA's embedqa models
+/// use an `input_type` field instead.
+///
+/// Translating between them here means Hadal's `build_index.py` and
+/// `search.py` keep working unmodified — they already emit the nomic prefixes,
+/// and those carry exactly the intent `input_type` needs.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum InputType {
+    Passage,
+    Query,
+}
+
+impl InputType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            InputType::Passage => "passage",
+            InputType::Query => "query",
+        }
+    }
+}
+
+/// Strip a nomic-style prefix, returning the intent it encoded.
+///
+/// Defaults to `Passage`: indexing is the bulk operation, and mislabelling a
+/// query as a passage degrades one search, whereas mislabelling every document
+/// degrades the whole index.
+pub fn split_input_type(text: &str) -> (InputType, &str) {
+    for (prefix, kind) in [
+        ("search_query:", InputType::Query),
+        ("search_document:", InputType::Passage),
+        ("query:", InputType::Query),
+        ("passage:", InputType::Passage),
+    ] {
+        if let Some(rest) = text.strip_prefix(prefix) {
+            return (kind, rest.trim_start());
+        }
+    }
+    (InputType::Passage, text)
+}
+
+/// Build an OpenAI-compatible embeddings request.
+///
+/// A batch must be one `input_type`. Callers that mix intents get the majority
+/// label, which is fine because real callers never mix: indexing sends
+/// documents, searching sends one query.
+pub fn embed_body(model: &str, inputs: &[String]) -> (serde_json::Value, InputType) {
+    let mut kind = InputType::Passage;
+    let stripped: Vec<String> = inputs
+        .iter()
+        .map(|t| {
+            let (k, rest) = split_input_type(t);
+            if k == InputType::Query {
+                kind = InputType::Query;
+            }
+            rest.to_string()
+        })
+        .collect();
+
+    (
+        serde_json::json!({
+            "model": model,
+            "input": stripped,
+            "input_type": kind.as_str(),
+            "encoding_format": "float",
+        }),
+        kind,
+    )
+}
+
+#[derive(Debug, Deserialize)]
+pub struct EmbeddingsResponse {
+    pub data: Vec<EmbeddingItem>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct EmbeddingItem {
+    pub embedding: Vec<f32>,
+    #[serde(default)]
+    pub index: usize,
+}
+
+impl EmbeddingsResponse {
+    /// Vectors in the caller's original order.
+    ///
+    /// The upstream returns an `index` per item and is not obliged to return
+    /// them in order. Sorting on it costs nothing; assuming order silently
+    /// mismatches every chunk with the wrong text, and an index built that way
+    /// looks fine and retrieves nonsense.
+    pub fn ordered(mut self) -> Vec<Vec<f32>> {
+        self.data.sort_by_key(|d| d.index);
+        self.data.into_iter().map(|d| d.embedding).collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -214,6 +314,43 @@ mod tests {
             }
         }
         assert_eq!(got, text);
+    }
+
+    #[test]
+    fn nomic_prefixes_become_input_type() {
+        assert_eq!(split_input_type("search_document: hello"), (InputType::Passage, "hello"));
+        assert_eq!(split_input_type("search_query: hello"), (InputType::Query, "hello"));
+        // No prefix: treated as a document, because indexing is the bulk case.
+        assert_eq!(split_input_type("hello"), (InputType::Passage, "hello"));
+    }
+
+    #[test]
+    fn embed_body_strips_prefixes_and_labels_the_batch() {
+        let (b, kind) = embed_body(
+            "m",
+            &["search_document: alpha".into(), "search_document: beta".into()],
+        );
+        assert_eq!(kind, InputType::Passage);
+        assert_eq!(b["input_type"], "passage");
+        assert_eq!(b["input"][0], "alpha");
+        assert_eq!(b["input"][1], "beta");
+
+        let (b, kind) = embed_body("m", &["search_query: what broke?".into()]);
+        assert_eq!(kind, InputType::Query);
+        assert_eq!(b["input_type"], "query");
+        assert_eq!(b["input"][0], "what broke?");
+    }
+
+    /// Out-of-order upstream results must not silently pair vectors with the
+    /// wrong text — an index built that way looks healthy and retrieves noise.
+    #[test]
+    fn embeddings_are_returned_in_request_order() {
+        let raw = r#"{"data":[
+            {"embedding":[3.0],"index":2},
+            {"embedding":[1.0],"index":0},
+            {"embedding":[2.0],"index":1}]}"#;
+        let parsed: EmbeddingsResponse = serde_json::from_str(raw).unwrap();
+        assert_eq!(parsed.ordered(), vec![vec![1.0], vec![2.0], vec![3.0]]);
     }
 
     #[test]
