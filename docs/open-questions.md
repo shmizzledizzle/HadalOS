@@ -41,6 +41,12 @@ ARCHITECTURE.md instead.
   bothered you with this" checkable rather than a matter of tone. Undecided
   whether the model emits that verdict or a second pass classifies it.
 
+- **Closing the loop.** `Execute`'s result reaches the user and never the
+  model, so `hadal explain` reads a log aloud rather than diagnosing it. See
+  `docs/open-loop.md`. The mechanism already exists — `build_prompt`'s
+  "data, not instructions" context channel — and the open decision is whether
+  the CLI or the session drives the follow-up, plus what bounds it.
+
 ## Blocking phase 3
 
 - **AVB re-locking with a custom key.** Real on Pixels, but untested by us, and
