@@ -742,6 +742,55 @@ default is correct and the fallbacks carry their own explicit `init=`.
 Two things will then bite, both consequences of the boot layer never having run
 on real hardware.
 
+### 0a. The generated entry has no initrd — this one is unbootable
+
+The most serious of the four, because it produces a config that looks correct
+and panics on root mount. From a successful-looking kernel install:
+
+```
+90-hadalos-limine: installed 6.18.41-gentoo-dist-bin (no initrd)
+hadalos-limine-update: wrote /efi/limine.conf (1 kernel(s))
+
+/efi/hadalos/6.18.41-gentoo-dist-bin/
+  vmlinuz            <- and nothing else
+```
+
+dracut ran and built an initrd; the plugin simply never found it. The cause is
+a convention change:
+
+```bash
+shift 4 || true
+INITRDS=("$@")        # pre-systemd-251 only
+```
+
+Before systemd 251, kernel-install passed initrds as positional arguments.
+It no longer does — the generator writes into `$KERNEL_INSTALL_STAGING_AREA`
+and plugins read from there. systemd's own `90-loaderentry.install` documents
+the canonical collection, and the order matters because microcode must be
+concatenated ahead of the initrd:
+
+```sh
+# All files listed as arguments, and staged files starting with "initrd" are installed as initrds.
+for initrd in "${KERNEL_INSTALL_STAGING_AREA}"/microcode* "${@}" "${KERNEL_INSTALL_STAGING_AREA}"/initrd*; do
+```
+
+The fix mirrors that, guarding each candidate with `[[ -f ]]` so unmatched
+globs are skipped under `set -u`. Reading `"$@"` alone is not a hard failure —
+there is no error, no non-zero exit, just an entry with no `module_path`.
+
+**`default_entry: 1` points at exactly this entry**, so an unattended reboot
+five seconds after the menu appears boots straight into the panic. The
+`00-fallbacks.conf` entries carry their own `module_path` and remain bootable,
+which is the only reason this was recoverable.
+
+**Nothing in `scripts/` exercises this code path.**
+`KERNEL_INSTALL_STAGING_AREA` is never referenced in any test, and the only
+reference to the hook anywhere is `mkiso.sh`. The README's *"Limine ISO
+assembly | 25/25"* covers ISO assembly, not the kernel-install plugin — so
+this did not slip past the suite, it was never in scope. Worth a test that
+runs the plugin with a populated staging area and asserts an `initrd` lands
+next to `vmlinuz`.
+
 ### 0. The service unit is never installed at all
 
 Found on the first real merge. `src_install` calls `systemd_dounit`, which
