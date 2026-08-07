@@ -293,3 +293,30 @@ Remembered floating geometry, which §3 lists as a prerequisite for mode
 switching: a window moved to a tiled workspace and back must return to where it
 was, not to the origin. That is the last piece of floating that tiling depends
 on.
+
+### Two bugs found by "the cursor doesn't change"
+
+Dragging alacritty's titlebar did nothing either, and the reported detail that
+mattered was that the cursor never changed shape over the titlebar or the
+edges. If the client were receiving pointer events at all, its own decorations
+would have reacted.
+
+**Hit-testing stopped at the root surface.** `surface_under` returned
+`window.toplevel().wl_surface()`. Client decorations are *subsurfaces*, so the
+titlebar never received a click, never sent `xdg_toplevel.move`, and dragging
+it did nothing. The window still looked focused, because the root surface was
+getting the events. Fixed with `Window::surface_under(point,
+WindowSurfaceType::ALL)`, which descends into subsurfaces and popups — popups
+for the same reason: a menu that cannot be clicked is worse than one that
+never opens.
+
+Surface positions from that call are window-relative and must be made global
+before the pointer sees them, or every client computes its local coordinates
+from the wrong origin — hit-testing subtly wrong everywhere rather than
+obviously wrong somewhere.
+
+**`cursor_image` is a no-op.** Cusk never renders a cursor, so its appearance
+could not have changed however correct pointer delivery was. That made it a
+useless diagnostic, and it was offered as one. Cursor rendering needs theme
+loading and a render element and is deferred — until it exists, cursor shape
+says nothing about whether pointer routing works.
