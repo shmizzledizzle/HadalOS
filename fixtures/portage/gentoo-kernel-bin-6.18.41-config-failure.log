@@ -1,0 +1,239 @@
+ [32m*[0m Assuming you do not have a separate /boot partition.
+ [32m*[0m Your /efi partition was detected as being mounted.
+ [32m*[0m Files will be installed there for gentoo-kernel-bin to function correctly.
+ [32m*[0m Assuming you do not have a separate /boot/efi partition.
+ [32m*[0m Assuming you do not have a separate /boot/EFI partition.
+ [32m*[0m Installing the kernel via installkernel ...
+[0;38:5:245mlayout=hadalos set via config[0m
+[0;38:5:245mLoaded config.[0m
+[0;38:5:245mMACHINE_ID=e4eb0c9e4018ee02826312c86a74ac9f set via /etc/machine-id.[0m
+[0;38:5:245mFound container virtualization none.[0m
+[0;38:5:245mDirectory "/boot" is not the root of the file system.[0m
+[0;38:5:245mCouldn't find an XBOOTLDR partition.[0m
+[0;38:5:245mLoaded shared library 'libblkid.so.1' via dlopen().[0m
+[0;38:5:245mUsing EFI System Partition at /efi as $BOOT_ROOT.[0m
+[0;38:5:245mUsing entry token: e4eb0c9e4018ee02826312c86a74ac9f[0m
+[0;38:5:245mkernel version (6.18.41-gentoo-dist-bin) set via command line.[0m
+[0;38:5:245mkernel image file (/usr/src/linux-6.18.41-gentoo-dist-bin/arch/x86/boot/bzImage) set via command line.[0m
+[0;38:5:245mUsing ENTRY_DIR=/efi/e4eb0c9e4018ee02826312c86a74ac9f/6.18.41-gentoo-dist-bin[0m
+[0;38:5:245mUsing plugins: [0m
+[0;38:5:245m  /usr/lib/kernel/install.d/00-00machineid-directory.install[0m
+[0;38:5:245m  /usr/lib/kernel/install.d/05-check-chroot.install[0m
+[0;38:5:245m  /usr/lib/kernel/install.d/05-check-config.install[0m
+[0;38:5:245m  /usr/lib/kernel/install.d/10-copy-prebuilt.install[0m
+[0;38:5:245m  /usr/lib/kernel/install.d/35-amd-microcode-systemd.install[0m
+[0;38:5:245m  /usr/lib/kernel/install.d/50-depmod.install[0m
+[0;38:5:245m  /usr/lib/kernel/install.d/52-dracut.install[0m
+[0;38:5:245m  /usr/lib/kernel/install.d/85-check-diskspace.install[0m
+[0;38:5:245m  /usr/lib/kernel/install.d/90-compat.install[0m
+[0;38:5:245m  /usr/lib/kernel/install.d/90-hadalos-limine.install[0m
+[0;38:5:245m  /usr/lib/kernel/install.d/90-loaderentry.install[0m
+[0;38:5:245m  /usr/lib/kernel/install.d/90-uki-copy.install[0m
+[0;38:5:245m  /usr/lib/kernel/install.d/90-zz-update-static.install[0m
+[0;38:5:245m  /usr/lib/kernel/install.d/92-tuned.install[0m
+[0;38:5:245m  /usr/lib/kernel/install.d/95-efistub-kernel-bootcfg.install[0m
+[0;38:5:245m  /usr/lib/kernel/install.d/99-write-log.install[0m
+[0;38:5:245mPlugin environment: [0m
+[0;38:5:245m  LC_COLLATE=C.UTF-8[0m
+[0;38:5:245m  KERNEL_INSTALL_VERBOSE=1[0m
+[0;38:5:245m  KERNEL_INSTALL_IMAGE_TYPE=pe[0m
+[0;38:5:245m  KERNEL_INSTALL_MACHINE_ID=e4eb0c9e4018ee02826312c86a74ac9f[0m
+[0;38:5:245m  KERNEL_INSTALL_ENTRY_TOKEN=e4eb0c9e4018ee02826312c86a74ac9f[0m
+[0;38:5:245m  KERNEL_INSTALL_BOOT_ROOT=/efi[0m
+[0;38:5:245m  KERNEL_INSTALL_LAYOUT=hadalos[0m
+[0;38:5:245m  KERNEL_INSTALL_INITRD_GENERATOR=[0m
+[0;38:5:245m  KERNEL_INSTALL_UKI_GENERATOR=[0m
+[0;38:5:245m  KERNEL_INSTALL_STAGING_AREA=/var/tmp/portage/sys-kernel/gentoo-kernel-bin-6.18.41/temp/kernel-install.staging.FIDuaY[0m
+[0;38:5:245mPlugin arguments: add 6.18.41-gentoo-dist-bin /efi/e4eb0c9e4018ee02826312c86a74ac9f/6.18.41-gentoo-dist-bin /usr/src/linux-6.18.41-gentoo-dist-bin/arch/x86/boot/bzImage[0m
+[0;38:5:245mSuccessfully forked off '(plugins)' as PID 5923.[0m
+[0;38:5:245mAbout to execute /usr/lib/kernel/install.d/00-00machineid-directory.install add 6.18.41-gentoo-dist-bin /efi/e4eb0c9e4018ee02826312c86a74ac9f/6.18.41-gentoo-dist-bin /usr/src/linux-6.18.41-gentoo-dist-bin/arch/x86/boot/bzImage[0m
+[0;38:5:245mSuccessfully forked off '(exec-inner)' as PID 5924.[0m
+[0;38:5:245m'/usr/lib/kernel/install.d/00-00machineid-directory.install' succeeded.[0m
+[0;38:5:245mAbout to execute /usr/lib/kernel/install.d/05-check-chroot.install add 6.18.41-gentoo-dist-bin /efi/e4eb0c9e4018ee02826312c86a74ac9f/6.18.41-gentoo-dist-bin /usr/src/linux-6.18.41-gentoo-dist-bin/arch/x86/boot/bzImage[0m
+[0;38:5:245mSuccessfully forked off '(exec-inner)' as PID 5925.[0m
+[0;38:5:245m'/usr/lib/kernel/install.d/05-check-chroot.install' succeeded.[0m
+[0;38:5:245mAbout to execute /usr/lib/kernel/install.d/05-check-config.install add 6.18.41-gentoo-dist-bin /efi/e4eb0c9e4018ee02826312c86a74ac9f/6.18.41-gentoo-dist-bin /usr/src/linux-6.18.41-gentoo-dist-bin/arch/x86/boot/bzImage[0m
+[0;38:5:245mSuccessfully forked off '(exec-inner)' as PID 5928.[0m
+No initrd_generator= configured by install.conf
+[0;38:5:245m'/usr/lib/kernel/install.d/05-check-config.install' failed with exit status 1.[0m
+[0;1;31m/usr/lib/kernel/install.d/05-check-config.install failed with exit status 1.[0m
+[0;38:5:245m'(plugins)' failed with exit status 1.[0m
+ [31;01m*[0m 
+ [31;01m*[0m The kernel was not deployed successfully. Inspect the failure
+ [31;01m*[0m in the logs above and once you resolve the problems please
+ [31;01m*[0m run the equivalent of the following command to try again:
+ [31;01m*[0m 
+ [31;01m*[0m     emerge --config '=sys-kernel/gentoo-kernel-bin-6.18.41:6.18.41'
+ [31;01m*[0m ERROR: sys-kernel/gentoo-kernel-bin-6.18.41::gentoo failed (config phase):
+ [31;01m*[0m   Kernel install failed, please fix the problems and run emerge --config
+ [31;01m*[0m 
+ [31;01m*[0m Call stack:
+ [31;01m*[0m     ebuild.sh, line  143:  Called pkg_config
+ [31;01m*[0m   environment, line 1342:  Called kernel-install_pkg_config
+ [31;01m*[0m   environment, line 1054:  Called kernel-install_install_all '6.18.41-gentoo-dist-bin'
+ [31;01m*[0m   environment, line 1047:  Called dist-kernel_install_kernel '6.18.41-gentoo-dist-bin' '/usr/src/linux-6.18.41-gentoo-dist-bin/arch/x86/boot/bzImage' '/usr/src/linux-6.18.41-gentoo-dist-bin/System.map'
+ [31;01m*[0m   environment, line  695:  Called die
+ [31;01m*[0m The specific snippet of code:
+ [31;01m*[0m           die "Kernel install failed, please fix the problems and run emerge --config";
+ [31;01m*[0m 
+ [31;01m*[0m If you need support, post the output of `emerge --info '=sys-kernel/gentoo-kernel-bin-6.18.41::gentoo'`,
+ [31;01m*[0m the complete build log and the output of `emerge -pqv '=sys-kernel/gentoo-kernel-bin-6.18.41::gentoo'`.
+ [31;01m*[0m The complete build log is located at '/var/log/portage/sys-kernel:gentoo-kernel-bin-6.18.41:20260807-075130.log'.
+ [31;01m*[0m For convenience, a symlink to the build log is located at '/var/tmp/portage/sys-kernel/gentoo-kernel-bin-6.18.41/temp/build.log'.
+ [31;01m*[0m The ebuild environment file is located at '/var/tmp/portage/sys-kernel/gentoo-kernel-bin-6.18.41/temp/environment'.
+ [31;01m*[0m Working directory: '/var/tmp/portage/sys-kernel/gentoo-kernel-bin-6.18.41/empty'
+ [31;01m*[0m S: '/var/tmp/portage/sys-kernel/gentoo-kernel-bin-6.18.41/work/gentoo-kernel-bin-6.18.41'
+ [32m*[0m Assuming you do not have a separate /boot partition.
+ [32m*[0m Your /efi partition was detected as being mounted.
+ [32m*[0m Files will be installed there for gentoo-kernel-bin to function correctly.
+ [32m*[0m Assuming you do not have a separate /boot/efi partition.
+ [32m*[0m Assuming you do not have a separate /boot/EFI partition.
+ [32m*[0m Installing the kernel via installkernel ...
+[0;38:5:245mlayout=hadalos set via config[0m
+[0;38:5:245mINITRD_GENERATOR (dracut) set via config.[0m
+[0;38:5:245mUKI_GENERATOR (none) set via config.[0m
+[0;38:5:245mLoaded config.[0m
+[0;38:5:245mMACHINE_ID=e4eb0c9e4018ee02826312c86a74ac9f set via /etc/machine-id.[0m
+[0;38:5:245mFound container virtualization none.[0m
+[0;38:5:245mDirectory "/boot" is not the root of the file system.[0m
+[0;38:5:245mCouldn't find an XBOOTLDR partition.[0m
+[0;38:5:245mLoaded shared library 'libblkid.so.1' via dlopen().[0m
+[0;38:5:245mUsing EFI System Partition at /efi as $BOOT_ROOT.[0m
+[0;38:5:245mUsing entry token: e4eb0c9e4018ee02826312c86a74ac9f[0m
+[0;38:5:245mkernel version (6.18.41-gentoo-dist-bin) set via command line.[0m
+[0;38:5:245mkernel image file (/usr/src/linux-6.18.41-gentoo-dist-bin/arch/x86/boot/bzImage) set via command line.[0m
+[0;38:5:245mUsing ENTRY_DIR=/efi/e4eb0c9e4018ee02826312c86a74ac9f/6.18.41-gentoo-dist-bin[0m
+[0;38:5:245mUsing plugins: [0m
+[0;38:5:245m  /usr/lib/kernel/install.d/00-00machineid-directory.install[0m
+[0;38:5:245m  /usr/lib/kernel/install.d/05-check-chroot.install[0m
+[0;38:5:245m  /usr/lib/kernel/install.d/05-check-config.install[0m
+[0;38:5:245m  /usr/lib/kernel/install.d/10-copy-prebuilt.install[0m
+[0;38:5:245m  /usr/lib/kernel/install.d/35-amd-microcode-systemd.install[0m
+[0;38:5:245m  /usr/lib/kernel/install.d/50-depmod.install[0m
+[0;38:5:245m  /usr/lib/kernel/install.d/52-dracut.install[0m
+[0;38:5:245m  /usr/lib/kernel/install.d/85-check-diskspace.install[0m
+[0;38:5:245m  /usr/lib/kernel/install.d/90-compat.install[0m
+[0;38:5:245m  /usr/lib/kernel/install.d/90-hadalos-limine.install[0m
+[0;38:5:245m  /usr/lib/kernel/install.d/90-loaderentry.install[0m
+[0;38:5:245m  /usr/lib/kernel/install.d/90-uki-copy.install[0m
+[0;38:5:245m  /usr/lib/kernel/install.d/90-zz-update-static.install[0m
+[0;38:5:245m  /usr/lib/kernel/install.d/92-tuned.install[0m
+[0;38:5:245m  /usr/lib/kernel/install.d/95-efistub-kernel-bootcfg.install[0m
+[0;38:5:245m  /usr/lib/kernel/install.d/99-write-log.install[0m
+[0;38:5:245mPlugin environment: [0m
+[0;38:5:245m  LC_COLLATE=C.UTF-8[0m
+[0;38:5:245m  KERNEL_INSTALL_VERBOSE=1[0m
+[0;38:5:245m  KERNEL_INSTALL_IMAGE_TYPE=pe[0m
+[0;38:5:245m  KERNEL_INSTALL_MACHINE_ID=e4eb0c9e4018ee02826312c86a74ac9f[0m
+[0;38:5:245m  KERNEL_INSTALL_ENTRY_TOKEN=e4eb0c9e4018ee02826312c86a74ac9f[0m
+[0;38:5:245m  KERNEL_INSTALL_BOOT_ROOT=/efi[0m
+[0;38:5:245m  KERNEL_INSTALL_LAYOUT=hadalos[0m
+[0;38:5:245m  KERNEL_INSTALL_INITRD_GENERATOR=dracut[0m
+[0;38:5:245m  KERNEL_INSTALL_UKI_GENERATOR=none[0m
+[0;38:5:245m  KERNEL_INSTALL_STAGING_AREA=/var/tmp/portage/sys-kernel/gentoo-kernel-bin-6.18.41/temp/kernel-install.staging.lEZ0Z7[0m
+[0;38:5:245mPlugin arguments: add 6.18.41-gentoo-dist-bin /efi/e4eb0c9e4018ee02826312c86a74ac9f/6.18.41-gentoo-dist-bin /usr/src/linux-6.18.41-gentoo-dist-bin/arch/x86/boot/bzImage[0m
+[0;38:5:245mSuccessfully forked off '(plugins)' as PID 6441.[0m
+[0;38:5:245mAbout to execute /usr/lib/kernel/install.d/00-00machineid-directory.install add 6.18.41-gentoo-dist-bin /efi/e4eb0c9e4018ee02826312c86a74ac9f/6.18.41-gentoo-dist-bin /usr/src/linux-6.18.41-gentoo-dist-bin/arch/x86/boot/bzImage[0m
+[0;38:5:245mSuccessfully forked off '(exec-inner)' as PID 6442.[0m
+[0;38:5:245m'/usr/lib/kernel/install.d/00-00machineid-directory.install' succeeded.[0m
+[0;38:5:245mAbout to execute /usr/lib/kernel/install.d/05-check-chroot.install add 6.18.41-gentoo-dist-bin /efi/e4eb0c9e4018ee02826312c86a74ac9f/6.18.41-gentoo-dist-bin /usr/src/linux-6.18.41-gentoo-dist-bin/arch/x86/boot/bzImage[0m
+[0;38:5:245mSuccessfully forked off '(exec-inner)' as PID 6443.[0m
+[0;38:5:245m'/usr/lib/kernel/install.d/05-check-chroot.install' succeeded.[0m
+[0;38:5:245mAbout to execute /usr/lib/kernel/install.d/05-check-config.install add 6.18.41-gentoo-dist-bin /efi/e4eb0c9e4018ee02826312c86a74ac9f/6.18.41-gentoo-dist-bin /usr/src/linux-6.18.41-gentoo-dist-bin/arch/x86/boot/bzImage[0m
+[0;38:5:245mSuccessfully forked off '(exec-inner)' as PID 6446.[0m
+[0;38:5:245m'/usr/lib/kernel/install.d/05-check-config.install' succeeded.[0m
+[0;38:5:245mAbout to execute /usr/lib/kernel/install.d/10-copy-prebuilt.install add 6.18.41-gentoo-dist-bin /efi/e4eb0c9e4018ee02826312c86a74ac9f/6.18.41-gentoo-dist-bin /usr/src/linux-6.18.41-gentoo-dist-bin/arch/x86/boot/bzImage[0m
+[0;38:5:245mSuccessfully forked off '(exec-inner)' as PID 6447.[0m
+[0;38:5:245m'/usr/lib/kernel/install.d/10-copy-prebuilt.install' succeeded.[0m
+[0;38:5:245mAbout to execute /usr/lib/kernel/install.d/35-amd-microcode-systemd.install add 6.18.41-gentoo-dist-bin /efi/e4eb0c9e4018ee02826312c86a74ac9f/6.18.41-gentoo-dist-bin /usr/src/linux-6.18.41-gentoo-dist-bin/arch/x86/boot/bzImage[0m
+[0;38:5:245mSuccessfully forked off '(exec-inner)' as PID 6449.[0m
+initrd_generator=dracut bundles CPU microcode, nothing to do here.
+[0;38:5:245m'/usr/lib/kernel/install.d/35-amd-microcode-systemd.install' succeeded.[0m
+[0;38:5:245mAbout to execute /usr/lib/kernel/install.d/50-depmod.install add 6.18.41-gentoo-dist-bin /efi/e4eb0c9e4018ee02826312c86a74ac9f/6.18.41-gentoo-dist-bin /usr/src/linux-6.18.41-gentoo-dist-bin/arch/x86/boot/bzImage[0m
+[0;38:5:245mSuccessfully forked off '(exec-inner)' as PID 6450.[0m
++depmod -a 6.18.41-gentoo-dist-bin
+[0;38:5:245m'/usr/lib/kernel/install.d/50-depmod.install' succeeded.[0m
+[0;38:5:245mAbout to execute /usr/lib/kernel/install.d/52-dracut.install add 6.18.41-gentoo-dist-bin /efi/e4eb0c9e4018ee02826312c86a74ac9f/6.18.41-gentoo-dist-bin /usr/src/linux-6.18.41-gentoo-dist-bin/arch/x86/boot/bzImage[0m
+[0;38:5:245mSuccessfully forked off '(exec-inner)' as PID 6453.[0m
+dracut[I]: Executing: /usr/bin/dracut --kernel-image /usr/src/linux-6.18.41-gentoo-dist-bin/arch/x86/boot/bzImage --force --verbose --no-uefi /var/tmp/portage/sys-kernel/gentoo-kernel-bin-6.18.41/temp/kernel-install.staging.lEZ0Z7/initrd 6.18.41-gentoo-dist-bin
+dracut[I]: 11systemd-pcrextend: Could not find any command of '/usr/lib/systemd/systemd-pcrextend /usr/lib/systemd/systemd-pcrphase'!
+dracut[I]: 74nfs: Could not find any command of 'rpcbind portmap'!
+dracut[I]: 11systemd-pcrextend: Could not find any command of '/usr/lib/systemd/systemd-pcrextend /usr/lib/systemd/systemd-pcrphase'!
+dracut[I]: 74nfs: Could not find any command of 'rpcbind portmap'!
+dracut[I]: *** Including module: bash ***
+dracut[I]: *** Including module: systemd ***
+dracut[I]: *** Including module: systemd-ask-password ***
+dracut[I]: *** Including module: systemd-battery-check ***
+dracut[I]: *** Including module: systemd-initrd ***
+dracut[I]: *** Including module: systemd-journald ***
+dracut[I]: *** Including module: systemd-modules-load ***
+dracut[I]: *** Including module: systemd-sysctl ***
+dracut[I]: *** Including module: systemd-tmpfiles ***
+dracut[I]: *** Including module: systemd-udevd ***
+dracut[I]: *** Including module: i18n ***
+dracut[I]: No KEYMAP configured.
+dracut[I]: *** Including module: btrfs ***
+dracut[I]: *** Including module: fs-lib ***
+dracut[I]: *** Including module: kernel-modules ***
+dracut[I]: *** Including module: kernel-modules-extra ***
+dracut[I]: *** Including module: rootfs-block ***
+dracut[I]: *** Including module: terminfo ***
+dracut[I]: *** Including module: udev-rules ***
+dracut[I]: *** Including module: dracut-systemd ***
+dracut[I]: *** Including module: initqueue ***
+dracut[I]: *** Including module: usrmount ***
+dracut[I]: *** Including module: systemd-sysusers ***
+dracut[I]: *** Including module: base ***
+dracut[I]: *** Including module: shell-interpreter ***
+dracut[I]: *** Including module: shutdown ***
+dracut[I]: *** Including modules done ***
+dracut[I]: *** Installing kernel module dependencies ***
+dracut[I]: *** Installing kernel module dependencies done ***
+dracut[I]: *** Resolving dependencies for executables and libraries ***
+dracut[I]: *** Resolving dependencies for executables and libraries done ***
+dracut[I]: *** Generating early-microcode cpio image ***
+dracut[I]: *** Store current command line parameters ***
+dracut[I]: *** Stripping files ***
+dracut[I]: *** Stripping files done ***
+dracut[I]: *** Creating image file '/var/tmp/portage/sys-kernel/gentoo-kernel-bin-6.18.41/temp/kernel-install.staging.lEZ0Z7/initrd' ***
+dracut[I]: *** Hardlinking files ***
+dracut[I]: *** Hardlinking files done ***
+dracut[I]: Using auto-determined compression method 'zstd'
+dracut[I]: *** Creating initramfs image file '/var/tmp/portage/sys-kernel/gentoo-kernel-bin-6.18.41/temp/kernel-install.staging.lEZ0Z7/initrd' done ***
+[0;38:5:245m'/usr/lib/kernel/install.d/52-dracut.install' succeeded.[0m
+[0;38:5:245mAbout to execute /usr/lib/kernel/install.d/85-check-diskspace.install add 6.18.41-gentoo-dist-bin /efi/e4eb0c9e4018ee02826312c86a74ac9f/6.18.41-gentoo-dist-bin /usr/src/linux-6.18.41-gentoo-dist-bin/arch/x86/boot/bzImage[0m
+[0;38:5:245mSuccessfully forked off '(exec-inner)' as PID 9451.[0m
+Checking available disk space on /efi...
+Disk space okay. Need at least 46903 KiB, found 944128 KiB.
+[0;38:5:245m'/usr/lib/kernel/install.d/85-check-diskspace.install' succeeded.[0m
+[0;38:5:245mAbout to execute /usr/lib/kernel/install.d/90-compat.install add 6.18.41-gentoo-dist-bin /efi/e4eb0c9e4018ee02826312c86a74ac9f/6.18.41-gentoo-dist-bin /usr/src/linux-6.18.41-gentoo-dist-bin/arch/x86/boot/bzImage[0m
+[0;38:5:245mSuccessfully forked off '(exec-inner)' as PID 9461.[0m
+[0;38:5:245m'/usr/lib/kernel/install.d/90-compat.install' succeeded.[0m
+[0;38:5:245mAbout to execute /usr/lib/kernel/install.d/90-hadalos-limine.install add 6.18.41-gentoo-dist-bin /efi/e4eb0c9e4018ee02826312c86a74ac9f/6.18.41-gentoo-dist-bin /usr/src/linux-6.18.41-gentoo-dist-bin/arch/x86/boot/bzImage[0m
+[0;38:5:245mSuccessfully forked off '(exec-inner)' as PID 9462.[0m
+90-hadalos-limine: installed 6.18.41-gentoo-dist-bin (no initrd)
+hadalos-limine-update: wrote /efi/limine.conf (1 kernel(s))
+[0;38:5:245m'/usr/lib/kernel/install.d/90-hadalos-limine.install' succeeded.[0m
+[0;38:5:245mAbout to execute /usr/lib/kernel/install.d/90-loaderentry.install add 6.18.41-gentoo-dist-bin /efi/e4eb0c9e4018ee02826312c86a74ac9f/6.18.41-gentoo-dist-bin /usr/src/linux-6.18.41-gentoo-dist-bin/arch/x86/boot/bzImage[0m
+[0;38:5:245mSuccessfully forked off '(exec-inner)' as PID 9481.[0m
+KERNEL_INSTALL_LAYOUT=hadalos, quitting.
+[0;38:5:245m'/usr/lib/kernel/install.d/90-loaderentry.install' succeeded.[0m
+[0;38:5:245mAbout to execute /usr/lib/kernel/install.d/90-uki-copy.install add 6.18.41-gentoo-dist-bin /efi/e4eb0c9e4018ee02826312c86a74ac9f/6.18.41-gentoo-dist-bin /usr/src/linux-6.18.41-gentoo-dist-bin/arch/x86/boot/bzImage[0m
+[0;38:5:245mSuccessfully forked off '(exec-inner)' as PID 9482.[0m
+[0;38:5:245m'/usr/lib/kernel/install.d/90-uki-copy.install' succeeded.[0m
+[0;38:5:245mAbout to execute /usr/lib/kernel/install.d/90-zz-update-static.install add 6.18.41-gentoo-dist-bin /efi/e4eb0c9e4018ee02826312c86a74ac9f/6.18.41-gentoo-dist-bin /usr/src/linux-6.18.41-gentoo-dist-bin/arch/x86/boot/bzImage[0m
+[0;38:5:245mSuccessfully forked off '(exec-inner)' as PID 9483.[0m
+[0;38:5:245m'/usr/lib/kernel/install.d/90-zz-update-static.install' succeeded.[0m
+[0;38:5:245mAbout to execute /usr/lib/kernel/install.d/92-tuned.install add 6.18.41-gentoo-dist-bin /efi/e4eb0c9e4018ee02826312c86a74ac9f/6.18.41-gentoo-dist-bin /usr/src/linux-6.18.41-gentoo-dist-bin/arch/x86/boot/bzImage[0m
+[0;38:5:245mSuccessfully forked off '(exec-inner)' as PID 9484.[0m
+[0;38:5:245m'/usr/lib/kernel/install.d/92-tuned.install' succeeded.[0m
+[0;38:5:245mAbout to execute /usr/lib/kernel/install.d/95-efistub-kernel-bootcfg.install add 6.18.41-gentoo-dist-bin /efi/e4eb0c9e4018ee02826312c86a74ac9f/6.18.41-gentoo-dist-bin /usr/src/linux-6.18.41-gentoo-dist-bin/arch/x86/boot/bzImage[0m
+[0;38:5:245mSuccessfully forked off '(exec-inner)' as PID 9485.[0m
+[0;38:5:245m'/usr/lib/kernel/install.d/95-efistub-kernel-bootcfg.install' succeeded.[0m
+[0;38:5:245mAbout to execute /usr/lib/kernel/install.d/99-write-log.install add 6.18.41-gentoo-dist-bin /efi/e4eb0c9e4018ee02826312c86a74ac9f/6.18.41-gentoo-dist-bin /usr/src/linux-6.18.41-gentoo-dist-bin/arch/x86/boot/bzImage[0m
+[0;38:5:245mSuccessfully forked off '(exec-inner)' as PID 9486.[0m
+WARNING: unknown layout, log will be incomplete
+Appending installed kernel to /var/log/installkernel.log...
+[0;38:5:245m'/usr/lib/kernel/install.d/99-write-log.install' succeeded.[0m
+[0;38:5:245m'(plugins)' succeeded.[0m
+[A[228C [34;01m[ [32;01mok[34;01m ][0m
