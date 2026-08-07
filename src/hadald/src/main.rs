@@ -226,7 +226,15 @@ async fn embed(
 
     if !resp.status().is_success() {
         let status = resp.status();
-        tracing::error!("embeddings upstream returned {status}");
+        // Log the reason, not just the code. `generate` already does this and
+        // `embed` did not, which cost a diagnosis: a 400 meaning "Input length
+        // 1984 exceeds maximum allowed token size 512" surfaced to the caller
+        // as a bare 502 with no clue that chunk size was the problem.
+        //
+        // Still not forwarded to the caller — an embeddings error can echo the
+        // input, and the input is the thing being careful about.
+        let detail = resp.text().await.unwrap_or_default();
+        tracing::error!("embeddings upstream returned {status}: {}", detail.trim());
         return Err((StatusCode::BAD_GATEWAY, format!("upstream returned {status}"))
             .into_response());
     }

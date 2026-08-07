@@ -5,11 +5,17 @@ use std::path::{Path, PathBuf};
 
 pub const DEFAULT_LISTEN: &str = "127.0.0.1:11434";
 pub const DEFAULT_UPSTREAM: &str = "https://integrate.api.nvidia.com/v1";
-/// 1024 dimensions, accepts `input_type`, verified against the live endpoint.
-/// Changing this invalidates any existing index — the vectors are not
-/// comparable across models, and `rag/index/manifest.json` records which one
-/// built them.
-pub const DEFAULT_EMBED_MODEL: &str = "nvidia/nv-embedqa-e5-v5";
+/// 2048 dimensions, verified against the live endpoint.
+///
+/// Not `nv-embedqa-e5-v5`, which was the obvious pick and is unusable here: it
+/// caps inputs at 512 tokens, and 79% of the Gentoo corpus chunks exceed that.
+/// Retrieval models are frequently short-context — check the limit against real
+/// chunk sizes before choosing one, not after.
+///
+/// Changing this invalidates any existing index: vectors are not comparable
+/// across models, and the dimension changes too. `manifest.json` records which
+/// model built the current index.
+pub const DEFAULT_EMBED_MODEL: &str = "nvidia/nemotron-3-embed-1b";
 
 #[derive(Debug, Clone)]
 pub struct Config {
