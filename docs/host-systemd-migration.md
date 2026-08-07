@@ -77,48 +77,118 @@ root=UUID=c2463ee6-5148-476b-a3d4-b7b06dab732c rootfstype=btrfs rootflags=subvol
 
 ## Phase 1 — Limine, before anything else
 
-`sys-boot/limine-12.5.2` is in `::gentoo`, matching the architecture's "Limine
-12.x". Installed bare it needs no systemd and no hook — just the bootloader and
-a config file you write by hand.
+`sys-boot/limine-12.5.2` is in `::gentoo`, matching the architecture's
+"Limine 12.x". Installed bare it needs no systemd and no hook.
+
+Preconditions verified on this machine 2026-08-07:
+
+| | |
+|---|---|
+| Secure Boot | **disabled** (`SecureBoot=0`, `SetupMode=0`) — no signing, the ebuild's hash-enrollment warning does not apply |
+| ESP | `/dev/nvme0n1p1` → `/efi`, 923 MB free |
+| LLVM | 22.1.8 with AArch64/ARM/X86/RISCV/LoongArch all enabled — no rebuild |
+| build cost | 16 packages, **15 prebuilt binaries** from the binhost; only limine compiles (677 KiB source), ~55 MB download |
+| initramfs | single image, microcode embedded by dracut — one `module_path` |
+
+### 1.1 Keyword and USE
+
+`sys-boot/limine` is `~amd64`. Narrow the USE flags to this machine's actual
+firmware — the default enables every architecture Limine supports, which builds
+BIOS, PXE, CD and four other UEFI targets for nothing, and drags in `mtools`
+via `uefi-cd`.
 
 ```bash
+echo '=sys-boot/limine-12.5.2 ~amd64' | sudo tee /etc/portage/package.accept_keywords/limine
+echo 'sys-boot/limine -bios -bios-cd -bios-pxe -uefi-cd -uefi-ia32 -uefi-aarch64 -uefi-riscv64 -uefi-loongarch64 uefi-x86-64' | sudo tee /etc/portage/package.use/limine
 sudo emerge -av sys-boot/limine
+ls -l /usr/share/limine/BOOTX64.EFI      # must exist before continuing
 ```
 
-Deploy it to the ESP and enroll a UEFI entry per the [Gentoo
-wiki](https://wiki.gentoo.org/wiki/Limine). Then write `/efi/limine.conf` with
-the entries you need — the current kernel, plus the two escape hatches that
-step 0 below would otherwise put in NVRAM:
+### 1.2 Deploy to the ESP
+
+```bash
+sudo mkdir -p /efi/EFI/limine
+sudo cp -v /usr/share/limine/BOOTX64.EFI /efi/EFI/limine/
+```
+
+### 1.3 Write `/efi/limine.conf`
+
+`boot():` resolves to the partition Limine itself booted from — the ESP — which
+is where the kernels already live.
 
 ```
 timeout: 5
 
-/Gentoo
+/Gentoo Linux 6.18.41
     protocol: linux
     kernel_path: boot():/EFI/Gentoo/vmlinuz-6.18.41-gentoo-dist-bin.efi
     module_path: boot():/EFI/Gentoo/initramfs-6.18.41-gentoo-dist-bin.img
     cmdline: root=UUID=c2463ee6-5148-476b-a3d4-b7b06dab732c rootfstype=btrfs rootflags=subvol=@ rw
 
-/Gentoo (OpenRC fallback)
+/Gentoo Linux 6.18.41 (OpenRC, explicit)
     protocol: linux
     kernel_path: boot():/EFI/Gentoo/vmlinuz-6.18.41-gentoo-dist-bin.efi
     module_path: boot():/EFI/Gentoo/initramfs-6.18.41-gentoo-dist-bin.img
     cmdline: root=UUID=c2463ee6-5148-476b-a3d4-b7b06dab732c rootfstype=btrfs rootflags=subvol=@ rw init=/sbin/openrc-init
+```
 
+The kernel file is named `.efi` because it is an EFI-stub kernel, but a stub
+kernel is still a bzImage with a PE header on the front, so Limine's `linux`
+protocol loads it normally.
+
+The second entry is the one that matters later. Note that it is **not** how the
+machine boots today: today PID 1 is `sys-apps/sysvinit`'s `/usr/bin/init`,
+which then starts OpenRC. `init=/sbin/openrc-init` uses OpenRC's own init
+instead. That distinction is the entire point — installing systemd displaces
+sysvinit, so `/usr/bin/init` will be gone, while `/sbin/openrc-init` from
+`sys-apps/openrc` survives.
+
+**So test that entry now, while OpenRC is still the only init installed.** An
+untested fallback is not a fallback, and this is the one moment where testing
+it costs nothing.
+
+### 1.4 Enroll the UEFI entry, keeping the old one
+
+```bash
+sudo efibootmgr --create --disk /dev/nvme0n1 --part 1 \
+  --label "Limine" \
+  --loader '\EFI\limine\BOOTX64.EFI' --unicode
+
+sudo efibootmgr -v          # note the new entry's number, e.g. 0004
+```
+
+Put Limine first but **leave `01FF` in the order**. The existing EFI-stub entry
+is a completely independent path to a booted system and costs nothing to keep:
+
+```bash
+sudo efibootmgr -o 0004,01FF,0003     # substitute the real number
+sudo efibootmgr --timeout 5
+```
+
+### 1.5 Verify before moving on
+
+Reboot. You should get a Limine menu with two entries.
+
+1. Boot entry 1. Confirm normal desktop, `rc-status` healthy.
+2. Reboot, boot entry 2 (`OpenRC, explicit`). Confirm it also reaches a
+   desktop, and `ps -p 1 -o comm=` shows `openrc-init` rather than `init`.
+3. If Limine itself fails, pick the old `UMC 1 Gentoo Linux 6.18.41` entry
+   from the firmware menu — untouched and still working.
+
+Only once both Limine entries boot is phase 2 safe to start.
+
+Once this works, step 0's `efibootmgr` fallback entries become unnecessary —
+the fallbacks live in `limine.conf`, where a kernel upgrade cannot silently eat
+them. **Do step 0b, the snapshot, regardless**, and add its boot entry to
+`limine.conf` then:
+
+```
 /Gentoo (pre-systemd snapshot)
     protocol: linux
     kernel_path: boot():/EFI/Gentoo/vmlinuz-6.18.41-gentoo-dist-bin.efi
     module_path: boot():/EFI/Gentoo/initramfs-6.18.41-gentoo-dist-bin.img
-    cmdline: root=UUID=c2463ee6-5148-476b-a3d4-b7b06dab732c rootfstype=btrfs rootflags=subvol=@snapshots/pre-systemd rw init=/sbin/openrc-init
+    cmdline: root=UUID=c2463ee6-5148-476b-a3d4-b7b06dab732c rootflags=subvol=@snapshots/pre-systemd rootfstype=btrfs rw init=/sbin/openrc-init
 ```
-
-Verify Limine boots the first entry, then **keep the existing EFI stub entry in
-NVRAM as a backstop** until you trust it. Two independent ways to boot is the
-whole point.
-
-Once this works, step 0's `efibootmgr` gymnastics become optional — the
-fallbacks live in `limine.conf` instead, where a kernel upgrade cannot silently
-eat them. Do the snapshot in step 0b regardless.
 
 ---
 
