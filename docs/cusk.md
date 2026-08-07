@@ -236,8 +236,33 @@ receiving events until the button comes up.
 ### Verified
 
 Two clients map and cascade — `(40, 40)`, `(70, 70)` — and the compositor is
-stable across connect and disconnect. Move and resize need a hand on a mouse
-and are for interactive testing.
+stable across connect and disconnect.
+
+### The host compositor eats the bindings
+
+First interactive test: clicking focused and raised correctly, and Super+drag
+did nothing at all.
+
+Not a grab bug. KDE's default `CommandAllKey` is Meta, bound to **Meta+LMB
+move** and **Meta+RMB resize** — the same two gestures — so KWin consumes them
+before the nested window ever sees the modifier. Any nested compositor
+inherits its host's bindings, and Super is the modifier every desktop claims.
+
+Super remains correct for a real session. `CUSK_MOD=alt` (also `ctrl`,
+`ctrl-alt`) exists so the bindings can be exercised under a host that has
+already taken it:
+
+```bash
+CUSK_MOD=alt cargo run
+```
+
+Button presses now log their modifier state at debug level, because "nothing
+happened" is indistinguishable from a broken grab, and the difference is one
+`RUST_LOG` away:
+
+```bash
+RUST_LOG=cusk=debug CUSK_MOD=alt cargo run
+```
 
 ### Next
 

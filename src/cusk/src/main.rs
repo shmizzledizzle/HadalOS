@@ -70,6 +70,54 @@ use ::winit::platform::pump_events::PumpStatus;
 /// Terminals tried in order when none is named. Every one of these is a
 /// well-behaved Wayland client, which matters for a first run: an XWayland-only
 /// client would fail for reasons that have nothing to do with the compositor.
+/// Which modifier arms the compositor's drag bindings.
+///
+/// Super is correct for a real session and wrong for a nested one: KDE's
+/// default `CommandAllKey` is Meta, bound to Meta+LMB move and Meta+RMB
+/// resize — the same gestures — so KWin consumes them before the nested window
+/// sees anything. `CUSK_MOD=alt` exists so the bindings can be exercised under
+/// a host that has already claimed Super.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ModKey {
+    Super,
+    Alt,
+    Ctrl,
+    CtrlAlt,
+}
+
+impl ModKey {
+    fn from_env() -> Self {
+        match std::env::var("CUSK_MOD").unwrap_or_default().to_ascii_lowercase().as_str() {
+            "alt" => ModKey::Alt,
+            "ctrl" => ModKey::Ctrl,
+            "ctrl-alt" | "ctrlalt" => ModKey::CtrlAlt,
+            "" | "super" | "logo" | "meta" => ModKey::Super,
+            other => {
+                tracing::warn!("CUSK_MOD={other:?} not recognised, using super");
+                ModKey::Super
+            }
+        }
+    }
+
+    fn held(self, m: &ModifiersState) -> bool {
+        match self {
+            ModKey::Super => m.logo,
+            ModKey::Alt => m.alt,
+            ModKey::Ctrl => m.ctrl,
+            ModKey::CtrlAlt => m.ctrl && m.alt,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            ModKey::Super => "super",
+            ModKey::Alt => "alt",
+            ModKey::Ctrl => "ctrl",
+            ModKey::CtrlAlt => "ctrl + alt",
+        }
+    }
+}
+
 const TERMINALS: &[&str] = &["foot", "alacritty", "kitty", "weston-terminal", "konsole"];
 
 struct Cusk {
@@ -87,6 +135,8 @@ struct Cusk {
     pointer_location: Point<f64, smithay::utils::Logical>,
     /// Live modifier state, for compositor-level bindings like Super+drag.
     modifiers: ModifiersState,
+    /// Which modifier arms those bindings.
+    mod_key: ModKey,
 }
 
 // ── protocol handlers ────────────────────────────────────────────────────
@@ -390,6 +440,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let requested: Option<String> =
         args.iter().find(|a| !a.starts_with('-')).cloned();
 
+    let mod_key = ModKey::from_env();
+
     let mut display: Display<Cusk> = Display::new()?;
     let mut dh = display.handle();
 
@@ -408,6 +460,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         space: Space::default(),
         pointer_location: (0.0, 0.0).into(),
         modifiers: ModifiersState::default(),
+        mod_key,
     };
 
     // Let the socket be allocated rather than hardcoded. A fixed name collides
@@ -467,9 +520,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         String::new(),
         format!("      WAYLAND_DISPLAY={socket_name} alacritty"),
         String::new(),
+        format!("  bindings use {}   (set CUSK_MOD=alt if the host eats it)", mod_key.label()),
+        String::new(),
         "      click           focus and raise".into(),
-        "      super + drag    move".into(),
-        "      super + right   resize from the nearest corner".into(),
+        format!("      {} + drag     move", mod_key.label()),
+        format!("      {} + right    resize from the nearest corner", mod_key.label()),
         "      close window    quit".into(),
         String::new(),
     ] {
@@ -540,7 +595,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         // modifier handling, so a Super+drag also focuses.
                         state.focus(&window);
 
-                        if state.modifiers.logo {
+                        // Logged unconditionally at debug: when a host
+                        // compositor eats the modifier, the symptom is that
+                        // nothing happens, and nothing happening is
+                        // indistinguishable from a bug in the grab.
+                        tracing::debug!(
+                            "button {button:#x} mods: super={} alt={} ctrl={} shift={}",
+                            state.modifiers.logo,
+                            state.modifiers.alt,
+                            state.modifiers.ctrl,
+                            state.modifiers.shift,
+                        );
+                        if state.mod_key.held(&state.modifiers) {
                             match button {
                                 floating::BTN_LEFT => {
                                     state.start_move(window, button);
