@@ -109,3 +109,33 @@ error comes from: the retrieved passages describe *what the keys are*, and the
 "all three are required" fact lives in the plugin source, which is not in the
 corpus. `/usr/lib/kernel/install.d/*.install` is 16 short shell scripts and
 would be a cheap addition.
+
+---
+
+## Adding the plugin sources, 2026-08-07
+
+The residual error — reporting `initrd_generator` and `uki_generator` as
+either/or when `05-check-config.install` requires all three keys independently
+— came from a gap in the corpus rather than the model. Documentation says what
+a setting *is*; only the script says what happens when it is *missing*.
+
+`/usr/lib/kernel/install.d/` is 16 shell scripts, 48 KiB. Added along with
+`/etc/portage/bashrc.d/` and `/usr/share/portage/config/` as a distinct corpus
+category: **behaviour that lives in code rather than prose.**
+
+Incremental — `build_index.py` keys files by content hash, so only the 23 new
+files were embedded: 36 chunks, 0.1 minutes, two API calls. 7576 → 7612.
+
+Retrieval on the error text now ranks the plugin source *first*:
+
+```
+0.734  gentoo-scripts/…05-check-config.install:1-37     <- new
+0.653  gentoo-handbook/wiki__Installkernel:169-243
+0.641  gentoo-handbook/wiki__Installkernel:423-503
+```
+
+and `KERNEL_INSTALL_LAYOUT`, `KERNEL_INSTALL_INITRD_GENERATOR` and
+`KERNEL_INSTALL_UKI_GENERATOR` are all present in the retrieved text — the
+three independent checks, visible as source.
+
+Whether the model uses it is the next measurement.
