@@ -639,7 +639,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 if button_state == ButtonState::Pressed {
                     let hit = state.surface_under(state.pointer_location);
-                    tracing::info!(
+                    tracing::debug!(
                         "press {button:#x} at {:?} -> {}, super={} alt={}",
                         state.pointer_location,
                         match &hit {

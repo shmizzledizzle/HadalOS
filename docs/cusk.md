@@ -352,3 +352,41 @@ Alt, then root-versus-subsurface hit-testing. The first two were real and the
 third was a genuine bug, but none of them was *this*, and each was plausible
 enough to spend a round on. The instrumentation took one round and cost less
 than any of them.
+
+### Milestone 2 verified, 2026-08-07
+
+Interactive test, from the log:
+
+```
+press 0x110 at (405, 31) -> surface at (-4, -4), super=true alt=true
+move grab started at (40, 40)
+```
+
+Hit-testing resolves, presses find surfaces, grabs start, and windows move.
+Click-to-focus, raise, and both move paths work.
+
+### Correction: KWin was never eating the modifier
+
+The log shows `super=true` arriving at cusk. Super reached the compositor the
+whole time.
+
+The gestures did nothing because `surface_under` returned `None` for every
+press, so the modifier branch sat inside an `if let` that never ran. The
+diagnosis that KDE's `CommandAllKey` was consuming Meta was plausible, matched
+the documented defaults, and was wrong — and KWin moving the *Smithay* window
+simultaneously made it look confirmed. Two systems reacting to one gesture is
+not the same as one system stealing it.
+
+`CUSK_MOD` stays, because the host acting on cusk's own window at the same time
+is still worth being able to avoid while testing nested. But it was never
+required, and the entry above claiming otherwise is corrected here rather than
+edited away.
+
+### Surfaces can start outside the window
+
+One press resolved to `surface at (-4, -4)` for a window at `(40, 40)`. That is
+alacritty's decoration subsurface, which extends past the window geometry for
+its shadow. Worth knowing before tiling: **a window's surfaces are not confined
+to its geometry**, so a layout that computes rectangles from surface extents
+rather than from `Window::geometry()` will leave gaps the size of every
+client's shadow.
