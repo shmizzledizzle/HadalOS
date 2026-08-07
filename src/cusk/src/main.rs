@@ -38,7 +38,7 @@ use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::renderer::utils::{draw_render_elements, on_commit_buffer_handler};
 use smithay::backend::renderer::{Color32F, Frame, Renderer};
 use smithay::backend::winit::{self, WinitEvent};
-use smithay::desktop::{Space, Window};
+use smithay::desktop::{Space, Window, WindowSurfaceType};
 use smithay::input::keyboard::{FilterResult, ModifiersState};
 use smithay::input::pointer::{ButtonEvent, GrabStartData, MotionEvent};
 use smithay::input::{Seat, SeatHandler, SeatState};
@@ -306,9 +306,24 @@ impl Cusk {
         &self,
         point: Point<f64, smithay::utils::Logical>,
     ) -> Option<(Window, WlSurface, Point<f64, smithay::utils::Logical>)> {
-        let (window, loc) = self.space.element_under(point)?;
-        let surface = window.toplevel()?.wl_surface().clone();
-        Some((window.clone(), surface, loc.to_f64()))
+        let (window, window_loc) = self.space.element_under(point)?;
+        let window = window.clone();
+
+        // Descend to the actual surface, not the toplevel's root.
+        //
+        // A client's decorations are subsurfaces. Focusing the root means the
+        // titlebar never receives a click, so it never sends
+        // `xdg_toplevel.move`, so dragging it does nothing — and the window
+        // still looks focused, because the root surface is getting the events.
+        // Popups are included for the same reason: a menu that cannot be
+        // clicked is worse than one that never opened.
+        let (surface, surface_loc) =
+            window.surface_under(point - window_loc.to_f64(), WindowSurfaceType::ALL)?;
+
+        // Surface positions are relative to the window; the pointer needs them
+        // global, or every client computes its local coordinates from the wrong
+        // origin and hit-testing is subtly off everywhere.
+        Some((window, surface, (surface_loc + window_loc).to_f64()))
     }
 
     /// Synthesise grab start data for a compositor-initiated drag.
