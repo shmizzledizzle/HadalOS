@@ -1,0 +1,19 @@
+# Upstream desktop repo, vendored here for reference only. It has its own
+# history and is not built by this project — see ARCHITECTURE.md §6.
+/HadalOS/
+
+# Rust
+target/
+**/*.rs.bk
+
+# AOSP — never, under any circumstances, in git
+/out/
+/aosp/
+/device/*/vendor/
+*.img
+*.zip
+
+# Editors
+.vscode/
+.idea/
+*.swp

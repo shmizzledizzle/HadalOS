@@ -1,0 +1,24 @@
+[package]
+name = "hadal-brokerd-android"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Capability broker for Hadal as an Android system component"
+license = "GPL-3.0-or-later"
+
+[lib]
+name = "hadal_brokerd"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+# The broker runs as a system service on a phone. Size and predictability
+# matter more than the last few percent of throughput.
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
