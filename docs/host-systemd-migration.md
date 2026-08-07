@@ -1138,7 +1138,9 @@ git of its own. It must be applied to the real HadalOS repo by hand.
 | `files/hadalos-limine-update` | honour `$HADALOS_ETC` |
 | `scripts/test-limine-hook.sh` | **new** — 15 unprivileged regression tests |
 | `README.md` | status table: the boot layer has booted a machine |
-| `src/hadal-brokerd/src/model.rs` | two scanner tests pinning real model output (fence-line JSON) |
+| `src/hadal-brokerd/src/model.rs` | two scanner tests pinning real model output; `ModelClient::retrieve()` |
+| `src/hadal-brokerd/src/session.rs` | `result` + `reference` context keys; retrieval before generate; `salient_lines()` |
+| `src/hadal-cli/src/main.rs` | bounded ask loop feeding execution results back |
 
 Separately, in the **Hadal** repo (`~/Documents/Hadal`):
 
