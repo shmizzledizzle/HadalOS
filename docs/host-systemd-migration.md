@@ -622,17 +622,84 @@ NVRAM into a text file on the ESP.
 
 ## Phase 3 — `hadalos-limine-hook`, and two bugs waiting in it
 
-Only after systemd is verified. `installkernel` will by then have been rebuilt
-with `USE=systemd` by the profile switch, which is what provides
-`kernel-install` — it does not exist on this box today.
+Prerequisites, all verified present after phase 2:
 
-```bash
-sudo emerge -av sys-boot/hadalos-limine-hook   # from the ::hadalos overlay
-echo 'layout=hadalos' | sudo tee -a /etc/kernel/install.conf
+```
+PID 1                systemd          systemctl is-system-running -> running
+kernel-install       /usr/bin/kernel-install
+installkernel USE    dracut efistub systemd
+kernel-install inspect
+  Layout             efistub          (becomes hadalos below)
+  Boot Root          /efi             <- resolves correctly, no override needed
 ```
 
-Two things will bite on this machine specifically, both consequences of the
-boot layer never having run on real hardware.
+### 3.0 Save the fallbacks first — the generator overwrites limine.conf
+
+`hadalos-limine-update` ends with `mv "$tmp" "$CONF"`. It rewrites
+`$BOOT_ROOT/limine.conf` in full, destroying every hand-written entry — which
+on this machine means the OpenRC and snapshot fallbacks that phases 1 and 2
+depend on.
+
+The mechanism to keep them is built in: `/etc/hadalos/limine.d/*.conf` are
+appended verbatim to the generated file. Move them there **before** anything
+regenerates:
+
+```bash
+sudo cp /efi/limine.conf /root/limine.conf.phase2-backup
+sudo mkdir -p /etc/hadalos/limine.d
+sudo tee /etc/hadalos/limine.d/00-fallbacks.conf >/dev/null <<'EOF'
+/Gentoo Linux 6.18.41 (OpenRC, explicit)
+    protocol: linux
+    kernel_path: boot():/EFI/Gentoo/vmlinuz-6.18.41-gentoo-dist-bin.efi
+    module_path: boot():/EFI/Gentoo/initramfs-6.18.41-gentoo-dist-bin.img
+    cmdline: root=UUID=c2463ee6-5148-476b-a3d4-b7b06dab732c rootfstype=btrfs rootflags=subvol=@ rw init=/sbin/openrc-init
+
+/Gentoo Linux 6.18.41 (systemd, EFI-stub path)
+    protocol: linux
+    kernel_path: boot():/EFI/Gentoo/vmlinuz-6.18.41-gentoo-dist-bin.efi
+    module_path: boot():/EFI/Gentoo/initramfs-6.18.41-gentoo-dist-bin.img
+    cmdline: root=UUID=c2463ee6-5148-476b-a3d4-b7b06dab732c rootfstype=btrfs rootflags=subvol=@ rw init=/usr/lib/systemd/systemd
+
+/Gentoo (pre-systemd snapshot)
+    protocol: linux
+    kernel_path: boot():/EFI/Gentoo/vmlinuz-6.18.41-gentoo-dist-bin.efi
+    module_path: boot():/EFI/Gentoo/initramfs-6.18.41-gentoo-dist-bin.img
+    cmdline: root=UUID=c2463ee6-5148-476b-a3d4-b7b06dab732c rootflags=subvol=@snapshots/pre-systemd rootfstype=btrfs rw init=/sbin/openrc-init
+EOF
+```
+
+These keep pointing at `/efi/EFI/Gentoo/`, which the `hadalos` layout does not
+manage. Switching layout stops *future* kernels landing there but does not
+delete what is already present, so the fallbacks stay pinned to 6.18.41 —
+which is exactly what a last-known-good entry should do.
+
+The NVRAM entry `Boot01FF` remains the outer backstop throughout. Leave it.
+
+### 3.1 Overlay, cmdline, layout
+
+The `::hadalos` overlay is not configured on this machine.
+
+```bash
+sudo tee /etc/portage/repos.conf/hadalos.conf >/dev/null <<'EOF'
+[hadalos]
+location = /home/shmizzy/Documents/HadalOS-Mobile/HadalOS/overlay
+auto-sync = no
+EOF
+
+# The generator reads this; without it it scrapes /proc/cmdline instead.
+echo 'root=UUID=c2463ee6-5148-476b-a3d4-b7b06dab732c rootfstype=btrfs rootflags=subvol=@ rw' \
+  | sudo tee /etc/kernel/cmdline
+
+echo 'layout=hadalos' | sudo tee /etc/kernel/install.conf
+echo '=sys-boot/hadalos-limine-hook-0.1.0 ~amd64' | sudo tee /etc/portage/package.accept_keywords/hadalos
+sudo emerge -av sys-boot/hadalos-limine-hook
+```
+
+No `init=` in `/etc/kernel/cmdline` — `/sbin/init` is systemd now, so the
+default is correct and the fallbacks carry their own explicit `init=`.
+
+Two things will then bite, both consequences of the boot layer never having run
+on real hardware.
 
 ### 1. `BOOT_ROOT` is `/efi` here, and the service unit hardcodes `/boot`
 
@@ -657,13 +724,47 @@ plugin writes `/efi/hadalos/<ver>/` while the unit's condition tests
 good pinning would look installed and record nothing, which is the worst
 possible failure mode for a safety net.
 
-Fix upstream by making the unit agree with the plugin rather than patching it
-here — `ConditionPathExists=` and `ReadWritePaths=` both need to follow
-whatever `KERNEL_INSTALL_BOOT_ROOT` resolves to. Until then, verify by hand:
+**Confirmed on hardware**, not merely predicted: `kernel-install inspect`
+reports `Boot Root: /efi`, so the plugin writes `/efi/hadalos/<ver>/` while the
+unit tests `/boot/hadalos`, which does not and will not exist.
+
+Fix upstream by making the unit agree with the plugin — `ConditionPathExists=`
+and `ReadWritePaths=` both need to follow whatever `KERNEL_INSTALL_BOOT_ROOT`
+resolves to. To test here without patching the package, use a drop-in (the
+empty assignment resets the inherited list):
 
 ```bash
-systemctl status hadalos-mark-boot-good.service   # must not say "condition failed"
+sudo mkdir -p /etc/systemd/system/hadalos-mark-boot-good.service.d
+sudo tee /etc/systemd/system/hadalos-mark-boot-good.service.d/boot-root.conf >/dev/null <<'EOF'
+[Unit]
+ConditionPathExists=
+ConditionPathExists=/efi/hadalos
+
+[Service]
+ReadWritePaths=
+ReadWritePaths=/etc/hadalos /efi
+EOF
+sudo systemctl daemon-reload
+sudo systemctl enable hadalos-mark-boot-good.service
+```
+
+Then verify — and note that the failure mode is *silence*, so an inactive
+service is not evidence of success:
+
+```bash
+systemctl status hadalos-mark-boot-good.service   # must NOT say "condition failed"
 cat /etc/hadalos/lastgood                          # must be non-empty after a boot
+```
+
+### 1b. Running the generator by hand does not work here either
+
+`BOOT_ROOT` defaults to `/boot`, which exists but is empty, so a bare
+`hadalos-limine-update` dies with *"no kernels under /boot/hadalos"*. It fails
+safe rather than writing a bad config, but the ebuild's `pkg_postinst` tells
+you to run exactly that. On this machine:
+
+```bash
+sudo KERNEL_INSTALL_BOOT_ROOT=/efi hadalos-limine-update
 ```
 
 ### 2. `installkernel` has no `limine` USE flag
