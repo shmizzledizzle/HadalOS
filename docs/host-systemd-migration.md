@@ -488,6 +488,56 @@ connections NM actually manages.
 
 ---
 
+## Step 4c — you cannot reboot normally after the rebuild
+
+Between the rebuild finishing and the first systemd boot there is a window
+where the machine cannot be rebooted by any usual means.
+`systemd[sysv-utils]` has already replaced the sysv commands, but systemd is
+not PID 1 yet, so all of them refuse:
+
+```
+/sbin/reboot   -> /usr/bin/systemctl   [sys-apps/systemd]
+/sbin/shutdown -> /usr/bin/systemctl
+/sbin/halt     -> /usr/bin/systemctl
+```
+
+`systemctl` answers *"System has not been booted with systemd as init system
+(PID 1). Can't operate."* — which is accurate and looks alarming. The same
+message appears for the step 4b `disable` calls, but those still take effect,
+because enable/disable are file operations on symlinks; only the daemon-reload
+afterwards fails. Verify with `find /etc/systemd/system -name '<unit>'` rather
+than trusting the exit status.
+
+PID 1 at this point is still the *original* sysvinit, resident in memory since
+before its package was unmerged. `/proc/cmdline` also still shows the boot from
+before any Limine entries were added.
+
+Save your work, then:
+
+```bash
+sudo openrc-shutdown -r now      # may refuse: it signals openrc-init, not sysvinit
+```
+
+If that refuses, use the sync-then-reboot sysrq sequence. Check the mask first
+— this machine ships `kernel.sysrq = 16`, which permits *only* sync; `u` needs
+32 and `b` needs 128:
+
+```bash
+sync
+sudo sh -c 'echo 1 > /proc/sys/kernel/sysrq'
+sudo sh -c 'echo s > /proc/sysrq-trigger'   # sync
+sleep 3
+sudo sh -c 'echo u > /proc/sysrq-trigger'   # remount all filesystems read-only
+sleep 3
+sudo sh -c 'echo b > /proc/sysrq-trigger'   # reboot
+```
+
+`s` then `u` is what makes this a clean reboot rather than a power cut — once
+the filesystems are read-only nothing further can be lost. Do **not** use
+`systemctl -ff reboot`, which skips both.
+
+---
+
 ## Step 5 — first boot
 
 Reboot and pick the normal entry (`UMC 1 Gentoo Linux 6.18.41`). systemd
