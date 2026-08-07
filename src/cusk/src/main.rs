@@ -764,7 +764,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // pointer outside the window no motion arrives, and the one moment the
         // geometry most needs checking is when nothing is happening.
         if last_report.elapsed() >= std::time::Duration::from_secs(2) {
-            use smithay::desktop::space::SpaceElement as _;
             let geom: Vec<String> = state
                 .space
                 .elements()
