@@ -22,9 +22,14 @@
 //! never run is not a compositor that works, and finding that out from a TTY
 //! costs a reboot.
 
+mod floating;
+
 use std::sync::Arc;
 
-use smithay::backend::input::{InputEvent, KeyboardKeyEvent};
+use smithay::backend::input::{
+    AbsolutePositionEvent, ButtonState, Event as _, InputEvent, KeyboardKeyEvent,
+    PointerButtonEvent,
+};
 use smithay::backend::renderer::element::surface::{
     render_elements_from_surface_tree, WaylandSurfaceRenderElement,
 };
@@ -34,14 +39,15 @@ use smithay::backend::renderer::utils::{draw_render_elements, on_commit_buffer_h
 use smithay::backend::renderer::{Color32F, Frame, Renderer};
 use smithay::backend::winit::{self, WinitEvent};
 use smithay::desktop::{Space, Window};
-use smithay::input::keyboard::FilterResult;
+use smithay::input::keyboard::{FilterResult, ModifiersState};
+use smithay::input::pointer::{ButtonEvent, GrabStartData, MotionEvent};
 use smithay::input::{Seat, SeatHandler, SeatState};
 use smithay::reexports::wayland_server::protocol::wl_buffer;
 use smithay::reexports::wayland_server::protocol::wl_seat;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::backend::{ClientData, ClientId, DisconnectReason};
 use smithay::reexports::wayland_server::{Client, Display, ListeningSocket};
-use smithay::utils::{Rectangle, Serial, Transform};
+use smithay::utils::{Point, Rectangle, Serial, Transform, SERIAL_COUNTER};
 use smithay::wayland::buffer::BufferHandler;
 use smithay::wayland::compositor::{
     with_surface_tree_downward, CompositorClientState, CompositorHandler, CompositorState,
@@ -75,6 +81,12 @@ struct Cusk {
     seat: Seat<Self>,
     /// Owns window positions. The substrate both layout modes will compute into.
     space: Space<Window>,
+    /// Pointer position in compositor-global coordinates. Kept here rather than
+    /// read back from the seat because grabs need the value from before the
+    /// grab started, and the seat only knows 'now'.
+    pointer_location: Point<f64, smithay::utils::Logical>,
+    /// Live modifier state, for compositor-level bindings like Super+drag.
+    modifiers: ModifiersState,
 }
 
 // ── protocol handlers ────────────────────────────────────────────────────
@@ -134,6 +146,36 @@ impl XdgShellHandler for Cusk {
         }
         tracing::info!("mapped toplevel at {location:?}");
         self.focus(&window);
+    }
+
+    /// A client asking to be dragged — a CSD titlebar. Honoured with the same
+    /// grab a Super+drag uses, so both paths behave identically.
+    fn move_request(&mut self, surface: ToplevelSurface, _seat: wl_seat::WlSeat, _serial: Serial) {
+        let found = self
+            .space
+            .elements()
+            .find(|w| w.toplevel().map(|t| t.wl_surface()) == Some(surface.wl_surface()))
+            .cloned();
+        if let Some(window) = found {
+            self.start_move(window, floating::BTN_LEFT);
+        }
+    }
+
+    fn resize_request(
+        &mut self,
+        surface: ToplevelSurface,
+        _seat: wl_seat::WlSeat,
+        _serial: Serial,
+        edges: smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::ResizeEdge,
+    ) {
+        let found = self
+            .space
+            .elements()
+            .find(|w| w.toplevel().map(|t| t.wl_surface()) == Some(surface.wl_surface()))
+            .cloned();
+        if let Some(window) = found {
+            self.start_resize(window, floating::BTN_LEFT, edges);
+        }
     }
 
     fn new_popup(&mut self, _surface: PopupSurface, _positioner: PositionerState) {}
@@ -207,6 +249,67 @@ impl ShmHandler for Cusk {
 }
 
 impl Cusk {
+
+    /// Window and surface under a compositor-global point, with the surface's
+    /// origin — the three things pointer routing always needs together.
+    fn surface_under(
+        &self,
+        point: Point<f64, smithay::utils::Logical>,
+    ) -> Option<(Window, WlSurface, Point<f64, smithay::utils::Logical>)> {
+        let (window, loc) = self.space.element_under(point)?;
+        let surface = window.toplevel()?.wl_surface().clone();
+        Some((window.clone(), surface, loc.to_f64()))
+    }
+
+    /// Synthesise grab start data for a compositor-initiated drag.
+    ///
+    /// Client-initiated grabs arrive with a serial the client already had;
+    /// these do not, so one is minted. Without a serial the grab is silently
+    /// declined and Super+drag does nothing at all.
+    fn grab_start(&self, button: u32) -> GrabStartData<Cusk> {
+        let focus = self
+            .surface_under(self.pointer_location)
+            .map(|(_, surface, loc)| (surface, loc));
+        GrabStartData { focus, button, location: self.pointer_location }
+    }
+
+    fn start_move(&mut self, window: Window, button: u32) {
+        let Some(pointer) = self.seat.get_pointer() else { return };
+        let initial = self.space.element_location(&window).unwrap_or_default();
+        let grab = floating::MoveGrab {
+            start_data: self.grab_start(button),
+            window,
+            initial_window_location: initial,
+        };
+        pointer.set_grab(self, grab, SERIAL_COUNTER.next_serial(), smithay::input::pointer::Focus::Clear);
+    }
+
+    fn start_resize(
+        &mut self,
+        window: Window,
+        button: u32,
+        edges: smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::ResizeEdge,
+    ) {
+        let Some(pointer) = self.seat.get_pointer() else { return };
+        let rect = floating::window_rect(&self.space, &window);
+        if let Some(toplevel) = window.toplevel() {
+            toplevel.with_pending_state(|state| {
+                state.states.set(
+                    smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State::Resizing,
+                );
+            });
+            toplevel.send_pending_configure();
+        }
+        let grab = floating::ResizeGrab {
+            start_data: self.grab_start(button),
+            window,
+            edges,
+            initial_rect: rect,
+            last_requested: rect.size,
+        };
+        pointer.set_grab(self, grab, SERIAL_COUNTER.next_serial(), smithay::input::pointer::Focus::Clear);
+    }
+
     /// Raise and give keyboard focus in one step.
     ///
     /// Kept together deliberately: a window that is focused but not raised, or
@@ -303,6 +406,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         seat_state,
         seat,
         space: Space::default(),
+        pointer_location: (0.0, 0.0).into(),
+        modifiers: ModifiersState::default(),
     };
 
     // Let the socket be allocated rather than hardcoded. A fixed name collides
@@ -317,6 +422,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("listening on {socket_name}");
 
     let keyboard = state.seat.add_keyboard(Default::default(), 200, 25)?;
+    let pointer = state.seat.add_pointer();
 
     let (mut backend, mut winit_loop) = winit::init::<GlesRenderer>()?;
     let start = std::time::Instant::now();
@@ -353,17 +459,108 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut clients = Vec::new();
 
     loop {
-        let status = winit_loop.dispatch_new_events(|event| {
-            if let WinitEvent::Input(InputEvent::Keyboard { event }) = event {
+        // Read before dispatch: absolute pointer positions arrive normalised
+        // and need the output size to become coordinates.
+        //
+        // The backend reports physical pixels; pointer routing and the Space
+        // both work in logical ones. At scale 1 the numbers are identical,
+        // which is exactly why this conversion has to be explicit — it will be
+        // silently wrong on the first HiDPI output otherwise.
+        let output_size = backend.window_size();
+        let logical_size = output_size.to_f64().to_logical(1.0).to_i32_round();
+
+        let status = winit_loop.dispatch_new_events(|event| match event {
+            WinitEvent::Input(InputEvent::Keyboard { event }) => {
+                let serial = SERIAL_COUNTER.next_serial();
+                let time = event.time_msec();
                 keyboard.input::<(), _>(
                     &mut state,
                     event.key_code(),
                     event.state(),
-                    Serial::from(0),
-                    0,
-                    |_, _, _| FilterResult::Forward,
+                    serial,
+                    time,
+                    |state, modifiers, _keysym| {
+                        // Modifiers are only offered here, and compositor
+                        // bindings need them at button time. Cache rather than
+                        // ask the seat later, which would report the state as
+                        // of now instead of as of the click.
+                        state.modifiers = *modifiers;
+                        FilterResult::Forward
+                    },
                 );
             }
+
+            WinitEvent::Input(InputEvent::PointerMotionAbsolute { event }) => {
+                let location = event.position_transformed(logical_size);
+                state.pointer_location = location;
+                let under = state
+                    .surface_under(location)
+                    .map(|(_, surface, loc)| (surface, loc));
+                pointer.motion(
+                    &mut state,
+                    under,
+                    &MotionEvent {
+                        location,
+                        serial: SERIAL_COUNTER.next_serial(),
+                        time: event.time_msec(),
+                    },
+                );
+                pointer.frame(&mut state);
+            }
+
+            WinitEvent::Input(InputEvent::PointerButton { event }) => {
+                let serial = SERIAL_COUNTER.next_serial();
+                let button = event.button_code();
+                let button_state = event.state();
+                let mut forward = true;
+
+                if button_state == ButtonState::Pressed {
+                    if let Some((window, _, _)) = state.surface_under(state.pointer_location) {
+                        // Click to focus and raise, always — before any
+                        // modifier handling, so a Super+drag also focuses.
+                        state.focus(&window);
+
+                        if state.modifiers.logo {
+                            match button {
+                                floating::BTN_LEFT => {
+                                    state.start_move(window, button);
+                                    forward = false;
+                                }
+                                floating::BTN_RIGHT => {
+                                    let rect = floating::window_rect(&state.space, &window);
+                                    let edges =
+                                        floating::nearest_edge(rect, state.pointer_location);
+                                    state.start_resize(window, button, edges);
+                                    forward = false;
+                                }
+                                _ => {}
+                            }
+                        }
+                    } else {
+                        // Clicking the background clears focus. Otherwise the
+                        // last window keeps the keyboard while looking inert.
+                        keyboard.set_focus(&mut state, None, serial);
+                    }
+                }
+
+                // A binding the compositor consumed must not also reach the
+                // client — Super+drag would otherwise select text in the
+                // terminal it is dragging.
+                if forward {
+                    pointer.button(
+                        &mut state,
+                        &ButtonEvent {
+                            button,
+                            state: button_state,
+                            serial,
+                            time: event.time_msec(),
+                        },
+                    );
+                    pointer.frame(&mut state);
+                }
+            }
+
+            _ => {}
         });
 
         if let PumpStatus::Exit(_) = status {
@@ -371,7 +568,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Ok(());
         }
 
-        let size = backend.window_size();
+        let size = output_size;
         let damage = Rectangle::from_size(size);
         {
             let (renderer, mut framebuffer) = backend.bind()?;

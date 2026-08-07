@@ -192,3 +192,56 @@ allocator from the renderer and delegating the protocol.
 Floating policy proper — pointer focus, click-to-focus, move and resize with
 the pointer, and remembered geometry. That is §3's floating mode, and it is
 also what §3 says tiling must be able to make exceptions to.
+
+---
+
+## Milestone 2: floating mode, 2026-08-07
+
+`src/cusk/src/floating.rs` — pointer focus, click-to-raise, and interactive
+move and resize.
+
+| | |
+|---|---|
+| pointer motion | routed to the surface under it, with enter/leave |
+| click | focus and raise, together |
+| click on background | clears keyboard focus |
+| **Super + left drag** | move |
+| **Super + right drag** | resize, from the nearest corner |
+| client titlebar drag | `move_request` / `resize_request`, same grabs |
+
+Both are `PointerGrab` implementations rather than a mode flag checked in the
+event loop. The difference shows the moment the pointer leaves the window being
+dragged — a flag loses it exactly when the drag matters, whereas a grab keeps
+receiving events until the button comes up.
+
+### Things that are one line and would each be a bug report
+
+- **Focus is forced to `None` during a grab.** Letting the pointer enter
+  whatever it passes over mid-drag sends enter/leave storms to unrelated
+  clients.
+- **The grab ends on *its own* button.** Checking "any button released" would
+  cancel a drag when a second button pressed mid-drag is let go.
+- **Consumed bindings are not forwarded.** Without that, Super+drag also
+  selects text in the terminal being dragged.
+- **Resize clamps the size, then corrects the origin.** Clamping alone lets a
+  left-edge drag keep moving the window after it has stopped shrinking.
+- **Minimum size is 120×60.** A window dragged to zero cannot be grabbed
+  again; the only recovery is killing the client.
+- **Corners are tested before edges.** The diagonal regions overlap the
+  straight ones, and the other order makes corners unreachable.
+- **Physical → logical conversion is explicit.** At scale 1 the numbers are
+  identical, which is precisely why it must be written down: it goes silently
+  wrong on the first HiDPI output otherwise.
+
+### Verified
+
+Two clients map and cascade — `(40, 40)`, `(70, 70)` — and the compositor is
+stable across connect and disconnect. Move and resize need a hand on a mouse
+and are for interactive testing.
+
+### Next
+
+Remembered floating geometry, which §3 lists as a prerequisite for mode
+switching: a window moved to a tiled workspace and back must return to where it
+was, not to the origin. That is the last piece of floating that tiling depends
+on.
