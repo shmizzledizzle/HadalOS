@@ -92,3 +92,35 @@ appended the retry to the same file. That is harder than the case I meant to
 build, and more realistic than a clean failure log. Worth keeping as a fixture
 once the loop is closed: a correct answer has to find the error in the middle
 and not be reassured by the success at the end.
+
+---
+
+## Closed, 2026-08-07
+
+Implemented CLI-driven, as argued above.
+
+**`session.rs`** — `result` added to `build_prompt`'s context allowlist. That
+allowlist is a closed set that drops unknown keys **in silence**, so a CLI-only
+change would have compiled, run, sent the result, and had it discarded with no
+error. Exactly the failure class this project keeps producing: correct-looking
+code, silent discard. Both ends had to change together.
+
+**`hadal-cli`** — `ask` is now a bounded loop. `confirm_and_execute` returns the
+executed output instead of printing it, the caller feeds it back as
+`context["result"]`, and the original question is restated so the model answers
+what was asked rather than commenting on the log.
+
+Three things it deliberately does *not* do:
+
+- **It does not re-ask when nothing was gathered.** Declined, denied or failed
+  all end the loop. Re-asking with identical evidence would just produce the
+  same proposal.
+- **It does not print the result.** The user already saw and authorised the
+  broker's summary of exactly what would run, so dumping 20 KB of build log
+  adds no oversight — it buries the answer underneath it. A byte count is
+  shown; the content goes to the model.
+- **It does not let the session drive.** Every generation still passes through
+  the confirmation point, which is the property §2.4 rests on.
+
+`MAX_GENERATIONS = 3`: enough for propose → read → explain, and the limit
+being hit is reported rather than passing for an answer.
