@@ -26,6 +26,7 @@
 
 pub mod action;
 pub mod capability;
+pub mod plan;
 
 pub use action::{Action, InvalidValue};
 pub use capability::{Capability, Tier};
