@@ -454,15 +454,70 @@ architecture actually intends.
 
 ---
 
+## Step 4b — undo what `preset-all` over-enabled
+
+`systemctl preset-all` applies upstream defaults, which stand up a complete
+parallel networking and timekeeping stack beside the one this machine actually
+uses. Check and disable before rebooting:
+
+| Preset enables | Conflicts with | Effect if left |
+|---|---|---|
+| `systemd-networkd` | NetworkManager | both manage the same interfaces |
+| `systemd-networkd-wait-online` | — | **stalls boot ~90 s** waiting on interfaces networkd does not manage |
+| `systemd-timesyncd` | `chronyd` | two NTP clients |
+| `systemd-resolved` | dhcpcd-written `resolv.conf` | see below |
+
+```bash
+sudo systemctl disable systemd-networkd.service systemd-networkd-wait-online.service \
+                       systemd-networkd.socket systemd-networkd-varlink.socket \
+                       systemd-networkd-resolve-hook.socket systemd-networkd-varlink-metrics.socket
+sudo systemctl disable systemd-timesyncd.service
+sudo systemctl disable systemd-resolved.service systemd-resolved-monitor.socket \
+                       systemd-resolved-varlink.socket
+```
+
+`systemd-resolved` is the subtle one. `/etc/resolv.conf` here is a **static
+file** written by dhcpcd, and NetworkManager has no explicit `dns=` setting, so
+it auto-detects: with resolved running NM delegates DNS to it and stops writing
+`resolv.conf`, leaving whatever stale nameserver was last written in place.
+Disabling resolved keeps DNS behaving exactly as it does today. Adopt it later
+as a deliberate change, with `/etc/resolv.conf` symlinked to the stub.
+
+`NetworkManager-wait-online` is fine to keep — it is the native one and waits on
+connections NM actually manages.
+
+---
+
 ## Step 5 — first boot
 
 Reboot and pick the normal entry (`UMC 1 Gentoo Linux 6.18.41`). systemd
 becomes PID 1 via `/sbin/init`; no cmdline change is needed for the default
 entry.
 
-If it fails: firmware boot menu → **Gentoo (OpenRC fallback)**. If the
-userland is broken badly enough that even that fails → **Gentoo (pre-systemd
-snapshot)**.
+If it fails: Limine menu → **(OpenRC, explicit)**. If the userland is broken
+badly enough that even that fails → **(pre-systemd snapshot)**.
+
+### The snapshot entry is recovery, not rollback
+
+Booting `rootflags=subvol=@snapshots/pre-systemd` gets you a working
+pre-migration userland, but the snapshot carries the *old* `/etc/fstab`, which
+names `/` as `subvol=/@`. systemd's fstab-generator builds `-.mount` from that,
+disagrees with what the kernel actually mounted, and you get a degraded mount
+unit. Good enough to log in and fix things; not a state to stay in.
+
+A permanent rollback means making the snapshot *be* `@`, so fstab matches
+again. From the snapshot (or any live media):
+
+```bash
+sudo mount -o subvolid=5 /dev/nvme0n1p3 /mnt/btrfs-top
+sudo mv /mnt/btrfs-top/@ /mnt/btrfs-top/@broken
+sudo mv /mnt/btrfs-top/@snapshots/pre-systemd /mnt/btrfs-top/@
+sudo umount /mnt/btrfs-top
+```
+
+The normal Limine entry then boots the restored system with a consistent fstab,
+and `@broken` is kept for post-mortem until you delete it. `/home` is a
+separate subvolume and is untouched by any of this.
 
 ### Verify
 
