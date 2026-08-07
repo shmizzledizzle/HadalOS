@@ -984,3 +984,71 @@ PORTAGE_LOGDIR="/var/log/portage"
 
 Do that now — it costs nothing and every build from then on becomes training
 and evaluation material.
+
+---
+
+## Phase 3 result: the boot layer booted a machine
+
+First boot from `/HadalOS 6.18.41-gentoo-dist-bin (current)` — generated
+`limine.conf`, generated initrd, cmdline from `/etc/kernel/cmdline`:
+
+```
+/proc/cmdline: root=UUID=c246... rootfstype=btrfs rootflags=subvol=@ rw
+```
+
+Six bugs found, all by running code that had never run.
+
+### 6. The service can never see a settled system
+
+`hadalos-mark-boot-good` refuses to promote unless
+`systemctl is-system-running` reports `running`. It never can, because the
+shipped unit was:
+
+```ini
+After=multi-user.target
+ExecStartPre=/usr/bin/sleep 60
+[Install]
+WantedBy=multi-user.target
+```
+
+A unit wanted by `multi-user.target` is part of the boot transaction, so
+`is-system-running` returns `starting` for as long as it runs. The system
+cannot finish booting until the unit exits; the unit refuses to act until the
+system has finished booting. From the journal, the refusal was logged **1.2 ms
+before** `Startup finished`:
+
+```
+02:08:18.331764  Reached target Multi-User System.
+02:09:18.450505  hadalos-mark-boot-good: system state is 'starting'; not promoting
+02:09:18.451670  Startup finished in ... 1min 21.041s
+```
+
+The `sleep 60` also charged every boot a minute — userspace took 1min 3.7s —
+while still guaranteeing the check would fail.
+
+**Fix: a timer.** `hadalos-mark-boot-good.timer` with `OnBootSec=90s`,
+`WantedBy=timers.target`, and the service stripped of `[Install]`,
+`After=multi-user.target` and the sleep. Out of the transaction, the delay is
+free, and the state check can succeed.
+
+### The pattern across all six
+
+| # | Bug | Fails how |
+|---|---|---|
+| 1 | missing `inherit systemd` | silent — QA notice, unit absent |
+| 2 | `ConditionPathExists=/boot` | silent — skipped by condition |
+| 3 | `layout=` alone in postinst | **loud** — aborts install |
+| 4 | initrd read from `"$@"` | silent — unbootable default entry |
+| 5 | script defaults `BOOT_ROOT=/boot` | silent — exits 0, records nothing |
+| 6 | wanted by the target it waits on | silent — logs, exits 0 |
+
+Five of six fail silently, and four of those land on last-known-good pinning.
+That is not coincidence: it is a feature that only matters once something else
+has already broken, so nothing exercises it in normal operation, and every
+failure mode is quiet by construction. The one loud failure came from Gentoo's
+tooling, not from HadalOS.
+
+The generalisable lesson for the mobile port: **paths that only run in a crisis
+need tests that run them on purpose.** `KERNEL_INSTALL_STAGING_AREA` appears in
+no test in `scripts/`; neither does any assertion that `lastgood` becomes
+non-empty after a boot.
