@@ -1138,6 +1138,7 @@ git of its own. It must be applied to the real HadalOS repo by hand.
 | `files/hadalos-limine-update` | honour `$HADALOS_ETC` |
 | `scripts/test-limine-hook.sh` | **new** — 15 unprivileged regression tests |
 | `README.md` | status table: the boot layer has booted a machine |
+| `ARCHITECTURE.md` | **§0 reversal** — `X server` and `WM core` rows, and the §1 layer map, describe an X11 plan that Cusk replaces. See `docs/cusk.md` §1 |
 | `src/hadal-brokerd/src/model.rs` | two scanner tests pinning real model output; `ModelClient::retrieve()` |
 | `src/hadal-brokerd/src/session.rs` | `result` + `reference` context keys; retrieval before generate; `salient_lines()`; failure reason carries the cause |
 | `src/hadal-brokerd/src/plan.rs` | **new** — `Plan`, `Effects`, comprehension `Question` (see `docs/ifixit.md`) |
