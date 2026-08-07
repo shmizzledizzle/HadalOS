@@ -1,0 +1,64 @@
+{
+  "name": "kernel-install: install.conf requires three keys",
+  "evidence": "gentoo-kernel-bin-6.18.41-config-failure.log",
+  "question": "The Gentoo package sys-kernel/gentoo-kernel-bin-6.18.41 failed to build during the config phase. Read the build log and tell me what went wrong and how to fix it. Be specific about which USE flags, versions or patches are involved.",
+  "k": 5,
+  "retrieval_must_contain": [
+    "/etc/kernel/install.conf",
+    "KERNEL_INSTALL_UKI_GENERATOR",
+    "05-check-config"
+  ],
+  "checks": [
+    {
+      "id": "names the right config file",
+      "must_contain": [
+        "/etc/kernel/install.conf"
+      ]
+    },
+    {
+      "id": "no invented config path",
+      "must_not_contain": [
+        "/etc/kernel-install.conf",
+        "/etc/portage/make.conf"
+      ]
+    },
+    {
+      "id": "correct key=value syntax",
+      "must_contain": [
+        "initrd_generator=dracut"
+      ],
+      "must_not_contain": [
+        "[options]",
+        "INITRD_GENERATOR=\""
+      ]
+    },
+    {
+      "id": "names uki_generator",
+      "must_contain": [
+        "uki_generator"
+      ]
+    },
+    {
+      "id": "names all three keys",
+      "must_contain": [
+        "initrd_generator",
+        "uki_generator",
+        "layout"
+      ]
+    },
+    {
+      "id": "identifies the failing plugin",
+      "must_contain": [
+        "05-check-config"
+      ]
+    },
+    {
+      "id": "invents no packages",
+      "must_not_contain": [
+        "sys-auth/systemd",
+        "net-misc/rpcbind",
+        "net-rpc/nfs-utils"
+      ]
+    }
+  ]
+}

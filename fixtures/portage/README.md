@@ -249,3 +249,40 @@ model use it* is a distribution and needs several.
 
 This is the same error the rest of the project keeps producing, one level up —
 a check that looked conclusive and was not. It cost four confident comparisons.
+
+---
+
+## Scored, n=5 per configuration (`scripts/eval-answers.py`)
+
+| check | no retrieval | with retrieval |
+|---|---|---|
+| names the right config file | **0/5** | **5/5** |
+| no invented config path | 2/5 | 5/5 |
+| correct `key=value` syntax | 1/5 | **5/5** |
+| names `uki_generator` | **0/5** | **5/5** |
+| names all three keys | **0/5** | **5/5** |
+| identifies the failing plugin | 4/5 | 5/5 |
+| invents no packages | 5/5 | 5/5 |
+| **mean** | **34%** | **100%** |
+
+Retrieval works, and the effect is far outside the noise: four checks go 0% to
+100%. Everything the ad-hoc runs suggested was true; none of it had been
+measured.
+
+**n=5 is still marginal.** An earlier batch of five scored `uki_generator` at
+3/5 in the configuration that scores 5/5 here — two samples of the same
+distribution. Rates in the 60–100% band are not separable at this n, which is
+why the harness flags any metric strictly between 0 and 1. The 0-vs-100
+comparisons are safe; a 3/5-vs-5/5 comparison is not a result.
+
+Retrieval content is reported separately and needs no n, because it is
+deterministic for a fixed query:
+
+```
+PASS  index contains '/etc/kernel/install.conf'
+PASS  index contains 'KERNEL_INSTALL_UKI_GENERATOR'
+PASS  index contains '05-check-config'
+```
+
+That split is the point of the harness. *Was the right passage retrieved* is a
+fact about the index. *Did the model use it* is a distribution.
