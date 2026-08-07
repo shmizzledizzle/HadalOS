@@ -698,7 +698,40 @@ portageq get_repo_path / hadalos        # must print the overlay path
 echo 'root=UUID=c2463ee6-5148-476b-a3d4-b7b06dab732c rootfstype=btrfs rootflags=subvol=@ rw' \
   | sudo tee /etc/kernel/cmdline
 
-echo 'layout=hadalos' | sudo tee /etc/kernel/install.conf
+**`layout=` alone is not enough on Gentoo.** Once `installkernel` is built with
+`USE=systemd`, kernel-install drives the install and Gentoo's
+`05-check-config.install` requires *three* keys, aborting the whole kernel
+deployment if any is unset:
+
+```
+No initrd_generator= configured by install.conf
+'/usr/lib/kernel/install.d/05-check-config.install' failed with exit status 1.
+```
+
+This is not a HadalOS bug, but the package's `pkg_postinst` step 1 only
+mentions `layout=`, which is incomplete on this distribution — worth fixing in
+that elog text. Write all three:
+
+```
+layout=hadalos
+initrd_generator=dracut
+uki_generator=none
+```
+
+`52-dracut.install` acts only on the literal value `dracut`. `uki_generator`
+must be non-empty to satisfy the check but must **not** be `dracut` — that
+branch makes dracut emit a UKI rather than a plain initrd, and the HadalOS
+plugin expects an initrd it can concatenate.
+
+Before this migration the check never ran: `installkernel` was
+`USE="dracut efistub"` without `systemd`, so the *traditional* installkernel
+did the work and none of these plugins executed. `/etc/kernel/install.conf`
+did not even exist.
+
+With `layout=hadalos` the competing boot-config plugins all stand down —
+`90-loaderentry` wants `bls`, `90-uki-copy` and `95-efistub-kernel-bootcfg`
+want `uki` — so the HadalOS plugin solely owns `limine.conf`, and nothing
+rewrites the NVRAM entries.
 echo '=sys-boot/hadalos-limine-hook-0.1.0 ~amd64' | sudo tee /etc/portage/package.accept_keywords/hadalos
 sudo emerge -av sys-boot/hadalos-limine-hook
 ```
