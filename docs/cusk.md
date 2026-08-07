@@ -256,13 +256,36 @@ already taken it:
 CUSK_MOD=alt cargo run
 ```
 
-Button presses now log their modifier state at debug level, because "nothing
-happened" is indistinguishable from a broken grab, and the difference is one
-`RUST_LOG` away:
+`CUSK_MOD=alt` was not enough either: KDE's defaults claim Alt as well, and the
+symptom was unmistakable once described — *the Smithay window* moved and
+resized, the alacritty window inside it did not. KWin was acting on cusk's own
+window the whole time.
 
-```bash
-RUST_LOG=cusk=debug CUSK_MOD=alt cargo run
+**Every modifier+drag a nested compositor binds, the host gets first.** There
+is no modifier that is reliably free, and chasing one is the wrong fix.
+
+### Test the grabs without a modifier at all
+
+Client-side decorations sidestep the problem completely. Dragging a client's
+own titlebar sends `xdg_toplevel.move`, which arrives at
+`XdgShellHandler::move_request` and runs the *same* `MoveGrab`. The host cannot
+intercept it: the click lands on a surface inside cusk's window, and the client
+asks cusk to move itself.
+
+Alacritty draws CSD by default on Wayland, so dragging its titlebar is a
+complete test of the move path with no modifier involved. That is the
+authoritative check; modifier bindings are a separate concern that only becomes
+testable on the tty backend, where there is no host to lose to.
+
+`start_move` and `start_resize` log at info, so the terminal running cusk says
+whether a gesture was recognised:
+
 ```
+INFO cusk: move grab started at (40, 40)
+```
+
+No line means the gesture never arrived. A line with no movement means the grab
+is wrong. Those are unrelated problems and were previously indistinguishable.
 
 ### Next
 
