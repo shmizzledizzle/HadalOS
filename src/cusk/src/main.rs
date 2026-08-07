@@ -326,6 +326,10 @@ impl Cusk {
     fn start_move(&mut self, window: Window, button: u32) {
         let Some(pointer) = self.seat.get_pointer() else { return };
         let initial = self.space.element_location(&window).unwrap_or_default();
+        // Info, not debug. Whether a gesture was *recognised* is the first
+        // question when nothing visibly happens, and requiring RUST_LOG to
+        // answer it means the answer arrives one run too late.
+        tracing::info!("move grab started at {initial:?}");
         let grab = floating::MoveGrab {
             start_data: self.grab_start(button),
             window,
@@ -342,6 +346,7 @@ impl Cusk {
     ) {
         let Some(pointer) = self.seat.get_pointer() else { return };
         let rect = floating::window_rect(&self.space, &window);
+        tracing::info!("resize grab started, edge {edges:?}, from {:?}", rect.size);
         if let Some(toplevel) = window.toplevel() {
             toplevel.with_pending_state(|state| {
                 state.states.set(
