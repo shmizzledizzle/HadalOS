@@ -195,3 +195,57 @@ Two things left to try, and they are different experiments:
 
 Run the prompt experiment first: if it succeeds, the corpus and the model are
 both fine and the persona is the gap.
+
+---
+
+## Correction: most of the table above is n=1
+
+Running the *unchanged* prompt five times against the identical retrieved
+context:
+
+| metric | rate |
+|---|---|
+| correct `/etc/kernel/install.conf` path | **5/5** |
+| `uki_generator` mentioned | **3/5** |
+| all three keys named | **3/5** |
+| drifts to `make.conf` somewhere in the answer | 3/5 |
+
+Temperature is 0.2, not 0. Every row in the comparison table above is a single
+sample of a stochastic process, and the completeness metric has roughly a 40%
+failure rate on its own.
+
+### What that retracts
+
+**"Adding the plugin source made it worse" is withdrawn.** That run omitted
+`uki_generator`; so do two runs in five of the identical configuration. It was
+a sample from the same distribution, not a regression. The plugin source was
+demonstrably retrieved and in the prompt — that part stands, and it means the
+corpus is adequate.
+
+**"Retrieval on the question alone made it worse" is weaker than stated.** The
+single output naming `make.conf` was one sample. What survives is the
+deterministic part: that query retrieved **0/3** of the key terms while
+question-plus-evidence retrieved **3/3**. Retrieval content is measurable
+without sampling, and that measurement is sound; the downstream answer was
+n=1 and should not have been reported as a clean regression.
+
+### What survives, and is now actually measured
+
+**Retrieval fixed the fabricated path, reliably.** Before retrieval the model
+invented the config file in every run observed. With evidence-derived
+retrieval it is correct 5/5. That is the result the whole exercise was for and
+it holds.
+
+**Completeness is not a corpus problem and not a prompt problem.** It is
+unstable at ~60% with the fact present in the prompt twice over. No single-run
+comparison between configurations can resolve a difference smaller than that.
+
+### Method, going forward
+
+Any claim comparing configurations needs n≥5 and a rate, not an anecdote. The
+cheap parts are deterministic and should be measured directly instead: *was the
+right passage retrieved* is a fact about the index and needs one run; *did the
+model use it* is a distribution and needs several.
+
+This is the same error the rest of the project keeps producing, one level up —
+a check that looked conclusive and was not. It cost four confident comparisons.
