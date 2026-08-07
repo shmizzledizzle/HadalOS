@@ -60,3 +60,52 @@ plus correct references beats more parameters.
 A useful acceptance test for the RAG work: re-run this fixture and require the
 answer to name `/etc/kernel/install.conf`, omit any section header, and list
 all three keys.
+
+---
+
+## With retrieval, 2026-08-07
+
+Same fixture, same model, same prompt. The only change is that the broker now
+retrieves reference passages and puts them in the prompt.
+
+| | no retrieval | retrieval on the question | retrieval on question + evidence |
+|---|---|---|---|
+| config file | `/etc/kernel-install.conf` ✗ | `/etc/portage/make.conf` ✗✗ | **`/etc/kernel/install.conf`** ✓ |
+| syntax | INI `[options]` ✗ | `INITRD_GENERATOR="dracut"` ✗ | **`initrd_generator=dracut`** ✓ |
+| `uki_generator` | absent | absent | **named** ✓ |
+| invented packages | 2 | 1 | **none** ✓ |
+| notices the retry | yes | — | yes |
+
+### The middle column is the interesting one
+
+Retrieval made the answer **worse before it made it better**. Querying on the
+question alone returned Kernel Configuration and USE-flag pages, because the
+`explain` prompt says *"be specific about which USE flags, versions or
+patches"* and contains no other technical content — the error text is in the
+log, which arrives after retrieval has run. Handed make.conf documentation, the
+model recommended a make.conf setting that does not exist.
+
+Retrieval that fetches the wrong reference does not degrade gracefully. It
+replaces a vague wrong answer with a confident wrong answer, and the confidence
+comes from the citation. **A retrieval step that cannot be shown to fetch the
+right passage is a liability, not a neutral addition.**
+
+### What is still wrong
+
+> *"This plugin enforces that either `initrd_generator` or `uki_generator` is
+> defined"*
+
+It does not. `05-check-config.install` has three independent checks —
+`layout=`, `initrd_generator=`, `uki_generator=` — each exiting 1 on its own.
+Following this answer and setting only `initrd_generator` fails on the very
+next run, which is precisely what happened on this machine.
+
+So against the acceptance test: names the right file ✓, drops the invented
+section header ✓, lists all three keys ✗ — it names two and gets the
+relationship between them wrong.
+
+That is a large improvement and not a pass. Worth noting where the remaining
+error comes from: the retrieved passages describe *what the keys are*, and the
+"all three are required" fact lives in the plugin source, which is not in the
+corpus. `/usr/lib/kernel/install.d/*.install` is 16 short shell scripts and
+would be a cheap addition.
