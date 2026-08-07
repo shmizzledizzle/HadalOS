@@ -46,6 +46,13 @@ install)
         systemctl reload dbus 2>/dev/null || busctl call org.freedesktop.DBus \
             /org/freedesktop/DBus org.freedesktop.DBus ReloadConfig 2>/dev/null || true
     fi
+    # A symlink, not a copy: the binary is rebuilt constantly during
+    # development and a copy would silently go stale — you would be running
+    # last week's CLI against this week's broker and have no way to tell.
+    say "linking hadal onto PATH"
+    ln -sfn "$BIN/hadal" /usr/local/bin/hadal
+    echo "    /usr/local/bin/hadal -> $BIN/hadal"
+
     say "done — now: sudo $0 run"
     ;;
 
@@ -104,6 +111,8 @@ run)
     ;;
 
 status)
+    printf '  %-34s %s\n' "hadal on PATH" \
+        "$(command -v hadal >/dev/null && echo "$(command -v hadal)" || echo 'MISSING — run: sudo '"$0"' install')"
     printf '  %-34s %s\n' "dbus policy" \
         "$([ -f /etc/dbus-1/system.d/org.hadal.Broker1.conf ] && echo installed || echo MISSING)"
     printf '  %-34s %s\n' "polkit actions" \
