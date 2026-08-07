@@ -320,3 +320,35 @@ could not have changed however correct pointer delivery was. That made it a
 useless diagnostic, and it was offered as one. Cursor rendering needs theme
 loading and a render element and is deferred — until it exists, cursor shape
 says nothing about whether pointer routing works.
+
+### The actual bug: `Window::on_commit` was never called
+
+Instrumenting rather than guessing gave it immediately:
+
+```
+291 motions, 0 hit a surface, windows=1
+loc=(40, 40)  bbox=0x0  geom=0x0
+```
+
+Pointer events were arriving fine. `Space::element_under` consults the
+element's cached bounding box, that box was **0×0 for the window's entire
+life**, and no point is inside a zero-size rectangle. So nothing ever focused,
+nothing raised, and a client's own decorations never got the press that would
+have sent `xdg_toplevel.move`.
+
+`Window::on_commit()` recomputes that box from the surface tree, and it has to
+be called from `CompositorHandler::commit`. It never was.
+
+**Rendering concealed it completely.** `render_elements_from_surface_tree`
+walks the surface tree directly and never consults the cached geometry, so the
+window drew perfectly at the right size while being, as far as input was
+concerned, zero pixels wide. Every visible signal said the compositor was
+working.
+
+After the fix the same report reads `bbox 888×723`.
+
+Three wrong guesses preceded it — the host eating Super, then the host eating
+Alt, then root-versus-subsurface hit-testing. The first two were real and the
+third was a genuine bug, but none of them was *this*, and each was plausible
+enough to spend a round on. The instrumentation took one round and cost less
+than any of them.

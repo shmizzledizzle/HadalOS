@@ -169,6 +169,19 @@ impl CompositorHandler for Cusk {
             .find(|w| w.toplevel().is_some_and(|t| t.wl_surface() == surface))
             .cloned();
         if let Some(window) = mapped {
+            // Recomputes the window's cached bounding box from the surface
+            // tree. Without it the bbox stays 0x0 for the window's whole life,
+            // and every hit test fails: `Space::element_under` asks the bbox,
+            // so no click ever lands, nothing focuses, and a client's own
+            // decorations never receive the press that would send
+            // `xdg_toplevel.move`.
+            //
+            // Rendering hides this completely. `render_elements_from_surface_tree`
+            // walks the surface tree directly and never consults the cached
+            // geometry, so the window draws perfectly while being, as far as
+            // input is concerned, zero pixels wide.
+            window.on_commit();
+
             if let Some(toplevel) = window.toplevel() {
                 toplevel.send_configure();
             }
@@ -552,6 +565,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let mut clients = Vec::new();
+    // Diagnostics for the input path. Two independent questions -- does winit
+    // deliver pointer events, and does hit-testing find a surface -- that look
+    // identical from the outside when either is false.
+    let mut motions: u64 = 0;
+    let mut motions_with_surface: u64 = 0;
+    let mut last_report = std::time::Instant::now();
 
     loop {
         // Read before dispatch: absolute pointer positions arrive normalised
@@ -588,9 +607,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             WinitEvent::Input(InputEvent::PointerMotionAbsolute { event }) => {
                 let location = event.position_transformed(logical_size);
                 state.pointer_location = location;
-                let under = state
-                    .surface_under(location)
-                    .map(|(_, surface, loc)| (surface, loc));
+                let hit = state.surface_under(location);
+                motions += 1;
+                if hit.is_some() {
+                    motions_with_surface += 1;
+                }
+                if last_report.elapsed() >= std::time::Duration::from_secs(2) {
+                    tracing::debug!(
+                        "pointer: {motions} motions, {motions_with_surface} hit a surface"
+                    );
+                    last_report = std::time::Instant::now();
+                }
+                let under = hit.map(|(_, surface, loc)| (surface, loc));
                 pointer.motion(
                     &mut state,
                     under,
@@ -610,7 +638,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let mut forward = true;
 
                 if button_state == ButtonState::Pressed {
-                    if let Some((window, _, _)) = state.surface_under(state.pointer_location) {
+                    let hit = state.surface_under(state.pointer_location);
+                    tracing::info!(
+                        "press {button:#x} at {:?} -> {}, super={} alt={}",
+                        state.pointer_location,
+                        match &hit {
+                            Some((_, _, loc)) => format!("surface at {loc:?}"),
+                            None => "NO SURFACE".to_string(),
+                        },
+                        state.modifiers.logo,
+                        state.modifiers.alt,
+                    );
+                    if let Some((window, _, _)) = hit {
                         // Click to focus and raise, always — before any
                         // modifier handling, so a Super+drag also focuses.
                         state.focus(&window);
@@ -719,6 +758,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             display.dispatch_clients(&mut state)?;
             display.flush_clients()?;
+        }
+
+        // Reported from the frame loop, not the motion handler: with the
+        // pointer outside the window no motion arrives, and the one moment the
+        // geometry most needs checking is when nothing is happening.
+        if last_report.elapsed() >= std::time::Duration::from_secs(2) {
+            use smithay::desktop::space::SpaceElement as _;
+            let geom: Vec<String> = state
+                .space
+                .elements()
+                .map(|w| format!("{:?}", w.bbox().size))
+                .collect();
+            tracing::debug!("windows={} bboxes={geom:?} motions={motions} hits={motions_with_surface}",
+                            state.space.elements().count());
+            last_report = std::time::Instant::now();
         }
 
         // After flushing: submit can block, and a client waiting on a message
