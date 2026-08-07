@@ -23,3 +23,6 @@ target/
 
 # hadald build output
 /src/hadald/target/
+
+# Cusk build output
+/src/cusk/target/

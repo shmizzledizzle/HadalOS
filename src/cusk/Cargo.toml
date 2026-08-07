@@ -1,0 +1,31 @@
+[package]
+name = "cusk"
+version = "0.1.0"
+edition = "2021"
+description = "The HadalOS window manager — Wayland, floating and dynamic tiling"
+license = "GPL-2.0-only"
+
+[[bin]]
+name = "cusk"
+path = "src/main.rs"
+
+[dependencies]
+# Feature set for milestone 1 only: a compositor nested in the running session.
+# No DRM, no libseat, no libinput — those arrive with the tty backend, and
+# pulling them in now would mean debugging seat management before anything has
+# ever appeared on screen.
+smithay = { version = "0.7", default-features = false, features = [
+    "backend_winit",
+    "backend_egl",
+    "renderer_gl",
+    "wayland_frontend",
+    "desktop",
+    "use_system_lib",
+] }
+winit = "0.30"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+lto = true
+codegen-units = 1

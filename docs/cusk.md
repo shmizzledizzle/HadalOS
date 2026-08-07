@@ -144,3 +144,51 @@ currently marks both `hadalwm` and `HadalOS Shell` as *not started*.
 That is not an argument against it. It is an argument for the milestone in §5
 being the next thing, rather than a schema, a mode-switching design, or a
 GUI — none of which can be validated until something is on screen.
+
+---
+
+## Milestone 1: done, 2026-08-07
+
+`src/cusk` — ~380 lines against smithay 0.7.0, run nested in the KDE session.
+
+```
+INFO cusk: listening on cusk-1
+INFO cusk: spawning alacritty
+INFO cusk: mapped toplevel at (40, 40)
+```
+
+The client connected, its toplevel entered the `Space`, and the render loop ran
+without a single error propagating — which covers `bind`, `render`, `clear`,
+`draw_render_elements`, `finish` and `submit`. Closing the window exits cleanly.
+
+What is real: socket allocation, display, seat and keyboard, xdg-shell mapping
+and configure, cascade placement, focus-with-raise, frame callbacks, unmapping
+with focus handover, and rendering positioned from `Space::element_location`.
+
+Positions come from the `Space`, not from the toplevel list. That is the line
+that makes tiling a change of policy rather than a rewrite.
+
+### Understood limitation: clients get no GPU buffers
+
+Running a client inside cusk produces:
+
+```
+libEGL warning: failed to get driver name for fd -1
+libEGL warning: egl: failed to create dri2 screen
+```
+
+Attributed rather than assumed: cusk alone emits none, and the same client on
+the host session emits none. They appear only *inside* cusk, because cusk does
+not advertise `zwp_linux_dmabuf`. Clients therefore fall back to shared memory,
+which works and is slow.
+
+Not a bug, and not urgent — a nested development compositor rendering a
+terminal has cycles to spare. It becomes urgent the moment anything is
+benchmarked or runs on the tty backend, and the fix is exposing a DMABUF
+allocator from the renderer and delegating the protocol.
+
+### Next
+
+Floating policy proper — pointer focus, click-to-focus, move and resize with
+the pointer, and remembered geometry. That is §3's floating mode, and it is
+also what §3 says tiling must be able to make exceptions to.
