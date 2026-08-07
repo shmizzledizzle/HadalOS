@@ -8,6 +8,37 @@ Measured 2026-08-07. Re-verify anything that looks stale before trusting it.
 
 ---
 
+## Do this in three phases, not one
+
+Limine belongs in this plan twice, and the two halves land on opposite sides
+of the migration:
+
+| Phase | What | Needs systemd? |
+|---|---|---|
+| **1** | `sys-boot/limine`, hand-written `limine.conf` | no |
+| **2** | OpenRC → systemd | — |
+| **3** | `hadalos-limine-hook`, `layout=hadalos`, lastgood pinning | **yes** |
+
+Phase 1 is pure risk reduction and must come first: it replaces "one EFI stub
+entry, no menu, rescue USB if it fails" with a boot menu you can pick from.
+Everything after it is recoverable in one keypress.
+
+Phase 3 cannot come first, because `hadalos-limine-hook`'s RDEPEND is
+`sys-boot/limine`, `sys-kernel/installkernel[systemd]`, `app-shells/bash`,
+`sys-apps/systemd`, and `hadalos-mark-boot-good.service` is a systemd unit
+leaning on `ProtectSystem=strict`, `PrivateNetwork=yes` and
+`SystemCallFilter=@system-service` — the exact directives ARCHITECTURE.md §0
+cites as the reason systemd was chosen.
+
+**Phase 3 is also the point of the whole exercise.** The desktop README marks
+both `Limine kernel-install integration` and `Last-known-good pinning` as
+*written, untested on hardware*, and says outright that the boot layer *"has
+been functionally tested against synthetic kernel trees but has never booted a
+machine."* This laptop would be that machine — proving the boot layer on
+hardware whose loss is survivable, before the 9800X3D exists to depend on it.
+
+---
+
 ## Read this first: there is no way back from a failed boot
 
 This machine has **no bootloader**. The kernel is loaded directly by UEFI as an
@@ -44,7 +75,57 @@ root=UUID=c2463ee6-5148-476b-a3d4-b7b06dab732c rootfstype=btrfs rootflags=subvol
 
 ---
 
+## Phase 1 — Limine, before anything else
+
+`sys-boot/limine-12.5.2` is in `::gentoo`, matching the architecture's "Limine
+12.x". Installed bare it needs no systemd and no hook — just the bootloader and
+a config file you write by hand.
+
+```bash
+sudo emerge -av sys-boot/limine
+```
+
+Deploy it to the ESP and enroll a UEFI entry per the [Gentoo
+wiki](https://wiki.gentoo.org/wiki/Limine). Then write `/efi/limine.conf` with
+the entries you need — the current kernel, plus the two escape hatches that
+step 0 below would otherwise put in NVRAM:
+
+```
+timeout: 5
+
+/Gentoo
+    protocol: linux
+    kernel_path: boot():/EFI/Gentoo/vmlinuz-6.18.41-gentoo-dist-bin.efi
+    module_path: boot():/EFI/Gentoo/initramfs-6.18.41-gentoo-dist-bin.img
+    cmdline: root=UUID=c2463ee6-5148-476b-a3d4-b7b06dab732c rootfstype=btrfs rootflags=subvol=@ rw
+
+/Gentoo (OpenRC fallback)
+    protocol: linux
+    kernel_path: boot():/EFI/Gentoo/vmlinuz-6.18.41-gentoo-dist-bin.efi
+    module_path: boot():/EFI/Gentoo/initramfs-6.18.41-gentoo-dist-bin.img
+    cmdline: root=UUID=c2463ee6-5148-476b-a3d4-b7b06dab732c rootfstype=btrfs rootflags=subvol=@ rw init=/sbin/openrc-init
+
+/Gentoo (pre-systemd snapshot)
+    protocol: linux
+    kernel_path: boot():/EFI/Gentoo/vmlinuz-6.18.41-gentoo-dist-bin.efi
+    module_path: boot():/EFI/Gentoo/initramfs-6.18.41-gentoo-dist-bin.img
+    cmdline: root=UUID=c2463ee6-5148-476b-a3d4-b7b06dab732c rootfstype=btrfs rootflags=subvol=@snapshots/pre-systemd rw init=/sbin/openrc-init
+```
+
+Verify Limine boots the first entry, then **keep the existing EFI stub entry in
+NVRAM as a backstop** until you trust it. Two independent ways to boot is the
+whole point.
+
+Once this works, step 0's `efibootmgr` gymnastics become optional — the
+fallbacks live in `limine.conf` instead, where a kernel upgrade cannot silently
+eat them. Do the snapshot in step 0b regardless.
+
+---
+
 ## Step 0 — build the escape hatches
+
+Skip the `efibootmgr` entries here if phase 1 is done — `limine.conf` already
+carries them. **Do not skip step 0b.**
 
 Two fallback boot entries and a visible menu. Do this **before** touching
 anything else, and reboot once into the OpenRC fallback to prove it works
@@ -225,16 +306,94 @@ sudo btrfs subvolume delete /mnt/btrfs-top/@snapshots/pre-systemd
 
 ## Known hazard: kernel reinstalls rewrite boot entries
 
-`installkernel-68-r1` with EFI-stub support regenerates the boot entry when the
-kernel is reinstalled or upgraded, taking its command line from the running
-system. A `gentoo-kernel-bin` upgrade can therefore silently drop your fallback
-entries or rewrite the cmdline.
+`installkernel-68-r1` is built here with `USE="dracut efistub"`, and the efistub
+logic regenerates the UEFI boot entry when the kernel is reinstalled or
+upgraded, taking its command line from the running system. A
+`gentoo-kernel-bin` upgrade can therefore silently drop the fallback entries
+from step 0 or rewrite the cmdline.
 
-**After any kernel upgrade, re-run `efibootmgr -v` and confirm the entries are
-still what you expect.** This is worth a checklist entry for as long as this
-machine has no bootloader — and installing one (`sys-boot/limine`, matching the
-desktop architecture) would remove the whole class of problem. That is arguably
-worth doing *before* the migration rather than after.
+**Until phase 1 is done, re-run `efibootmgr -v` after every kernel upgrade.**
+Phase 1 removes the entire class of problem, because entries move from UEFI
+NVRAM into a text file on the ESP.
+
+---
+
+## Phase 3 — `hadalos-limine-hook`, and two bugs waiting in it
+
+Only after systemd is verified. `installkernel` will by then have been rebuilt
+with `USE=systemd` by the profile switch, which is what provides
+`kernel-install` — it does not exist on this box today.
+
+```bash
+sudo emerge -av sys-boot/hadalos-limine-hook   # from the ::hadalos overlay
+echo 'layout=hadalos' | sudo tee -a /etc/kernel/install.conf
+```
+
+Two things will bite on this machine specifically, both consequences of the
+boot layer never having run on real hardware.
+
+### 1. `BOOT_ROOT` is `/efi` here, and the service unit hardcodes `/boot`
+
+`90-hadalos-limine.install` correctly honours the environment:
+
+```bash
+BOOT_ROOT="${KERNEL_INSTALL_BOOT_ROOT:-/boot}"
+DEST="$BOOT_ROOT/hadalos/$VERSION"
+```
+
+but `hadalos-mark-boot-good.service` does not:
+
+```ini
+ConditionPathExists=/boot/hadalos
+ReadWritePaths=/etc/hadalos /boot
+```
+
+On this box the ESP is mounted at `/efi` and **`/boot` is empty**. So the
+plugin writes `/efi/hadalos/<ver>/` while the unit's condition tests
+`/boot/hadalos`, never matches, and the service is skipped **silently** —
+`systemctl status` reports it as inactive-by-condition, not failed. Last-known-
+good pinning would look installed and record nothing, which is the worst
+possible failure mode for a safety net.
+
+Fix upstream by making the unit agree with the plugin rather than patching it
+here — `ConditionPathExists=` and `ReadWritePaths=` both need to follow
+whatever `KERNEL_INSTALL_BOOT_ROOT` resolves to. Until then, verify by hand:
+
+```bash
+systemctl status hadalos-mark-boot-good.service   # must not say "condition failed"
+cat /etc/hadalos/lastgood                          # must be non-empty after a boot
+```
+
+### 2. `installkernel` has no `limine` USE flag
+
+Confirmed on 68-r1: `IUSE="dracut efistub grub refind systemd systemd-boot ugrd
+uki ukify"`. ARCHITECTURE.md §3's justification for shipping a custom plugin at
+all — *"sys-boot/limine has no installkernel integration (unlike GRUB and
+systemd-boot)"* — is therefore still accurate, and the plugin is still needed.
+Worth re-checking on each `installkernel` bump, since the day that flag appears
+is the day this package can be retired.
+
+### What to actually verify once it is running
+
+The point of doing this here is to exercise the untested path, so exercise it:
+
+```bash
+sudo emerge --config sys-kernel/gentoo-kernel-bin   # populate /efi/hadalos
+hadalos-limine-update
+cat /efi/limine.conf                                 # two entries: newest + lastgood
+```
+
+Then the test that matters — install a second kernel, confirm `limine.conf`
+still carries a last-known-good entry pointing at the *old* one, and confirm
+the plugin refuses to remove it:
+
+```bash
+sudo emerge -av =sys-kernel/gentoo-kernel-bin-<older>
+# 'remove' on the pinned version must exit 1 with the refusal message
+```
+
+That refusal path is the single most important line of the boot layer and has
+never run on hardware.
 
 ---
 
