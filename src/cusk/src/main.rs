@@ -1875,6 +1875,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    // Renders with the GPU and scans that buffer out — the two halves joined.
+    if args.iter().any(|a| a == "--probe-scanout") {
+        let seconds = args
+            .iter()
+            .find_map(|a| a.strip_prefix("--seconds="))
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(5);
+        match tty::probe_scanout(seconds) {
+            Ok(()) => println!("\n  the GPU drew it and the display scanned it out.\n"),
+            Err(e) => {
+                println!("\n  {e}\n");
+                std::process::exit(1);
+            }
+        }
+        return Ok(());
+    }
+
     // Sets a real mode and takes DRM master, so it cannot run beside another
     // compositor. Bounded by a watchdog that restores the display and exits
     // whatever the main thread is doing.

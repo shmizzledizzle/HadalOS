@@ -631,3 +631,178 @@ pub fn probe_render() -> Result<String, String> {
         path.display()
     ))
 }
+
+// ── phase four groundwork: scanning out a GL-rendered buffer ─────────────
+
+/// Render with the GPU and put *that* on the screen.
+///
+/// The last unproven link. `--modeset-test` scans out a **dumb buffer** — CPU
+/// memory — and `--probe-render` renders with the GPU into an offscreen
+/// texture nobody displays. Neither says the two halves join up, and joining
+/// them is the whole of the DRM driver:
+///
+/// ```text
+///   GbmAllocator -> GbmBuffer -> Dmabuf -> renderer.bind() -> draw
+///                             -> add_planar_framebuffer -> set_crtc
+/// ```
+///
+/// The same buffer is seen by the GPU as a render target and by the display
+/// controller as a scanout source. If the format, the modifier or the flags
+/// are wrong, one of those two rejects it — and finding out here costs a
+/// bounded test rather than a stalled driver.
+///
+/// Single-buffered on purpose: this draws once and holds it. Double buffering
+/// and page flips are the driver's problem, and adding them here would be
+/// testing something this does not yet claim.
+pub fn probe_scanout(seconds: u64) -> Result<(), String> {
+    use smithay::backend::allocator::gbm::{GbmAllocator, GbmBufferFlags, GbmDevice};
+    use smithay::backend::allocator::{Allocator, Modifier};
+    use smithay::backend::egl::{EGLContext, EGLDisplay};
+    use smithay::backend::renderer::gles::GlesRenderer;
+    use smithay::backend::renderer::{Bind, Color32F, Frame, Renderer};
+    use smithay::reexports::drm::control::FbCmd2Flags;
+    use smithay::utils::{Physical, Rectangle, Size, Transform};
+
+    let (mut session, _notifier) = LibSeatSession::new().map_err(|e| {
+        format!("could not join a session: {e}\n  This needs its own VT — see --probe-drm.")
+    })?;
+
+    let path = drm_devices().into_iter().next().ok_or("no DRM device")?;
+    let fd = session
+        .open(
+            &path,
+            rustix::fs::OFlags::RDWR | rustix::fs::OFlags::CLOEXEC | rustix::fs::OFlags::NONBLOCK,
+        )
+        .map_err(|e| format!("session refused {}: {e}", path.display()))?;
+    let card = Arc::new(Opened { file: std::fs::File::from(fd) });
+
+    let resources = card
+        .resource_handles()
+        .map_err(|e| format!("could not read resources: {e}"))?;
+    let (connector_handle, mode) = resources
+        .connectors()
+        .iter()
+        .filter_map(|handle| card.get_connector(*handle, true).ok())
+        .filter(|info| info.state() == connector::State::Connected)
+        .find_map(|info| info.modes().first().copied().map(|m| (info.handle(), m)))
+        .ok_or("no connected output with a mode")?;
+    let connector_info = card
+        .get_connector(connector_handle, false)
+        .map_err(|e| format!("could not re-read the connector: {e}"))?;
+    let crtc_handle = connector_info
+        .current_encoder()
+        .and_then(|handle| card.get_encoder(handle).ok())
+        .and_then(|encoder| encoder.crtc())
+        .or_else(|| resources.crtcs().first().copied())
+        .ok_or("no CRTC for that connector")?;
+
+    let info = card
+        .get_crtc(crtc_handle)
+        .map_err(|e| format!("could not read the CRTC: {e}"))?;
+    let previous = Previous {
+        crtc: crtc_handle,
+        mode: info.mode(),
+        framebuffer: info.framebuffer(),
+        position: info.position(),
+        connector: connector_handle,
+    };
+
+    // The GPU side, on the card node rather than the render node: the buffer
+    // has to be scannable by *this* display controller, and a buffer allocated
+    // against a different device may be neither shareable nor scanout-capable.
+    // Two GBM devices on two dups of the same card fd, because `EGLDisplay`
+    // consumes one and the allocator needs the other. They address the same
+    // hardware, which is what matters: a buffer from one is scannable by the
+    // other.
+    let dup = |what: &str| {
+        card.file
+            .try_clone()
+            .map_err(|e| format!("could not dup the card for {what}: {e}"))
+    };
+    let gbm_for_egl = GbmDevice::new(dup("EGL")?).map_err(|e| format!("no GBM device: {e}"))?;
+    let gbm_for_alloc =
+        GbmDevice::new(dup("allocation")?).map_err(|e| format!("no GBM device: {e}"))?;
+    let display = unsafe { EGLDisplay::new(gbm_for_egl) }
+        .map_err(|e| format!("no EGL display: {e}"))?;
+    let context = EGLContext::new(&display).map_err(|e| format!("no EGL context: {e}"))?;
+    let mut renderer =
+        unsafe { GlesRenderer::new(context) }.map_err(|e| format!("no GL renderer: {e}"))?;
+
+    // SCANOUT is the flag that matters. Without it the allocation can succeed
+    // and `add_planar_framebuffer` then refuses the buffer, which reads as a
+    // mode-setting failure rather than an allocation one.
+    let mut allocator = GbmAllocator::new(gbm_for_alloc, GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT);
+
+    let (width, height) = mode.size();
+    let buffer = allocator
+        .create_buffer(
+            width as u32,
+            height as u32,
+            DrmFourcc::Xrgb8888,
+            &[Modifier::Linear],
+        )
+        .map_err(|e| format!("could not allocate a scanout buffer: {e}"))?;
+
+    let mut dmabuf = {
+        use smithay::backend::allocator::dmabuf::AsDmabuf;
+        buffer
+            .export()
+            .map_err(|e| format!("could not export the buffer as a dmabuf: {e}"))?
+    };
+
+    println!();
+    println!(
+        "  {:?}-{}  {width}x{height}@{}",
+        connector_info.interface(),
+        connector_info.interface_id(),
+        mode.vrefresh()
+    );
+    println!("  rendering with the GPU into a scanout buffer for {seconds}s");
+    println!();
+
+    let watchdog_card = Arc::clone(&card);
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(seconds + 2));
+        eprintln!("  watchdog fired — restoring and exiting");
+        previous.restore(&watchdog_card);
+        let _ = watchdog_card.release_master_lock();
+        std::process::exit(2);
+    });
+
+    card.acquire_master_lock()
+        .map_err(|e| format!("could not become DRM master: {e}\n  This needs its own VT."))?;
+
+    let outcome = (|| -> Result<(), String> {
+        // The GPU writes here...
+        {
+            let mut framebuffer = renderer
+                .bind(&mut dmabuf)
+                .map_err(|e| format!("the renderer would not bind the dmabuf: {e}"))?;
+            let size = Size::<i32, Physical>::from((width as i32, height as i32));
+            let mut frame = renderer
+                .render(&mut framebuffer, size, Transform::Normal)
+                .map_err(|e| format!("could not start a frame: {e}"))?;
+            // Distinct from the mode-set test's blue, so the two are
+            // distinguishable on screen without reading the log.
+            frame
+                .clear(Color32F::new(0.07, 0.55, 0.52, 1.0), &[Rectangle::from_size(size)])
+                .map_err(|e| format!("could not clear: {e}"))?;
+            let _ = frame.finish();
+        }
+
+        // ...and the display controller reads from the same memory.
+        let fb = card
+            .add_planar_framebuffer(&buffer, FbCmd2Flags::empty())
+            .map_err(|e| format!("the display controller refused the buffer: {e}"))?;
+        card.set_crtc(crtc_handle, Some(fb), (0, 0), &[connector_handle], Some(mode))
+            .map_err(|e| format!("could not set the mode: {e}"))?;
+
+        std::thread::sleep(std::time::Duration::from_secs(seconds));
+        let _ = card.destroy_framebuffer(fb);
+        Ok(())
+    })();
+
+    previous.restore(&card);
+    let _ = card.release_master_lock();
+    outcome
+}

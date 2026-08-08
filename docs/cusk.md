@@ -1686,11 +1686,57 @@ wallpaper, blur, window blur, opacity, corners, panel, title and three windows:
 the missing-wallpaper warning appeared exactly once rather than 1020 times, so
 the refused-key fix from milestone 12 survived the move.
 
+### The DRM driver cannot use `DrmCompositor`
+
+Found while planning the next step. `DrmCompositor::render_frame` takes a slice
+of `RenderElement`s, but `draw_frame` draws **into a framebuffer** — solid
+rectangles, texture blits, two custom shaders. Expressing that as render
+elements would mean wrapping every one of those in an element type, which is a
+rewrite of the drawing code and defeats the seam this milestone just cut.
+
+So the driver takes the manual path: allocate through GBM, export as a dmabuf,
+`renderer.bind` it, call `draw_frame`, and hand the same buffer to the display
+controller. More code than `DrmCompositor`, and the only version that lets both
+backends share one drawing routine.
+
+---
+
+## Milestone 22: the two halves join up, 2026-08-08
+
+`--probe-scanout`. The last unproven link before the driver.
+
+`--modeset-test` scans out a **dumb buffer** — CPU memory. `--probe-render`
+renders with the **GPU** into an offscreen texture nobody displays. Neither says
+the two join, and joining them is the whole of the DRM driver:
+
+```text
+  GbmAllocator -> GbmBuffer -> Dmabuf -> renderer.bind() -> draw
+                            -> add_planar_framebuffer -> set_crtc
+```
+
+One buffer, seen by the GPU as a render target and by the display controller as
+a scanout source. If the format, modifier or flags are wrong, one of the two
+rejects it.
+
+- **`GbmBufferFlags::SCANOUT` is the flag that matters.** Without it allocation
+  still succeeds and `add_planar_framebuffer` refuses the buffer later, which
+  reads as a mode-setting failure rather than an allocation one.
+- **Allocated on the card node, not the render node.** The buffer has to be
+  scannable by *this* display controller, and one allocated against another
+  device may be neither shareable nor scanout-capable.
+- **Two GBM devices on two dups of the same fd**, because `EGLDisplay` consumes
+  one and the allocator needs the other. Same hardware either way, which is
+  what makes the buffer usable by both.
+- **Single-buffered on purpose.** Double buffering and page flips are the
+  driver's problem; adding them here would test something this does not claim.
+- Teal rather than blue, so it is distinguishable from the mode-set test on
+  screen without reading the log.
+
 ### Next
 
-The DRM driver, which is now additive: obtain a framebuffer from a
-`DrmCompositor`, call `draw_frame` with `Transform::Normal`, and present. Then
-udev hotplug and VT switching. on eDP-1, rendering a single colour, with a hard timeout that
+The DRM driver itself: the loop that owns a session, allocates a pair of
+buffers, calls `draw_frame`, and page-flips — with the Wayland setup shared
+between it and the winit driver. Then VT switching and hotplug. on eDP-1, rendering a single colour, with a hard timeout that
    restores the VT — the first thing that can strand a screen, so it should be
    unable to strand it for more than a few seconds.
 2. libinput, so there is a keyboard.
