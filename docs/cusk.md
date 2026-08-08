@@ -1652,9 +1652,45 @@ returned Ok" and "the picture is right" are different claims and only the
 second is worth making. The colour has three distinct channels, so a channel
 swap shows up as a wrong answer rather than as the same number twice.
 
-### Next, in order
+---
 
-1. ~~Mode-setting~~, ~~libinput~~ and ~~the GPU path~~ — done. on eDP-1, rendering a single colour, with a hard timeout that
+## Milestone 21: the render loop comes out of `main`, 2026-08-08
+
+Phase four, step one. `draw_frame` and `FrameContext`, with **winit still the
+only driver**.
+
+A second backend cannot be added while drawing a frame is 500 lines welded into
+`main`'s loop, threading ten separate locals through it. So the seam is cut
+first, with nothing on the other side of it yet — the riskiest part of adding
+DRM, done where any breakage shows up immediately in the nested compositor
+rather than on a tty with no way to read a log.
+
+### The seam
+
+`draw_frame` is about *what* is on screen. Obtaining a framebuffer, presenting
+it and pumping input stay in the driver, and those are precisely the parts that
+differ between nested and tty. `FrameContext` gathers the state that outlives a
+frame — shader programs, uploaded textures, the backdrop cache, the font —
+because a second driver would otherwise have to thread the same ten locals.
+
+`transform` is now a parameter rather than a constant. It is the **driver's**:
+winit hands back a framebuffer that is already flipped and DRM does not, and
+`Transform::Flipped180` was hardcoded in the middle of the drawing code where
+the second backend could not reach it.
+
+### Verified as a no-op
+
+The point of a refactor with one driver is that nothing should change. With
+wallpaper, blur, window blur, opacity, corners, panel, title and three windows:
+**no errors, no warnings**, and 139 tests pass. One incidental confirmation —
+the missing-wallpaper warning appeared exactly once rather than 1020 times, so
+the refused-key fix from milestone 12 survived the move.
+
+### Next
+
+The DRM driver, which is now additive: obtain a framebuffer from a
+`DrmCompositor`, call `draw_frame` with `Transform::Normal`, and present. Then
+udev hotplug and VT switching. on eDP-1, rendering a single colour, with a hard timeout that
    restores the VT — the first thing that can strand a screen, so it should be
    unable to strand it for more than a few seconds.
 2. libinput, so there is a keyboard.

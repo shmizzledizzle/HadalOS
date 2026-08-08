@@ -50,7 +50,7 @@ use smithay::backend::renderer::element::Kind;
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
 use smithay::backend::renderer::utils::{draw_render_elements, on_commit_buffer_handler};
-use smithay::backend::renderer::{Bind, Color32F, Frame, ImportMem, Renderer};
+use smithay::backend::renderer::{Bind, Color32F, Frame, ImportMem, Renderer, RendererSuper};
 use smithay::backend::winit::{self, WinitEvent};
 use smithay::desktop::{Space, Window, WindowSurfaceType};
 use smithay::backend::input::KeyState;
@@ -1206,6 +1206,564 @@ fn texture_src(rect: Rectangle<i32, Logical>) -> Rectangle<f64, smithay::utils::
     )
 }
 
+/// Everything the render loop needs that outlives a single frame.
+///
+/// Gathered into one place because the loop used to thread ten separate
+/// locals through the render block, and a second driver would have to thread
+/// the same ten. Shader programs, uploaded textures and the backdrop cache all
+/// belong to the renderer's lifetime rather than to a frame.
+struct FrameContext {
+    chrome: Option<chrome::Chrome>,
+    blur: Option<gpublur::GpuBlur>,
+    backdrop: Option<Backdrop>,
+    /// A key that failed to build, so it is not retried every frame.
+    refused: Option<BackdropKey>,
+    face: Option<text::Face>,
+    title_texture: Option<(String, GlesTexture)>,
+    pointer_image: cursor::Cursor,
+    pointer_texture: Option<GlesTexture>,
+    warned_square_corners: bool,
+}
+
+/// Draw one frame into `framebuffer`.
+///
+/// Split out of the loop so a second backend can call it. Everything here is
+/// about *what* is on screen; obtaining a framebuffer, presenting it and
+/// pumping input are the driver's job, and those are the only parts that
+/// differ between running nested and running on a tty.
+///
+/// `transform` is the driver's, not the compositor's: winit hands back a
+/// framebuffer that is already flipped, and DRM does not.
+#[allow(clippy::too_many_arguments)]
+fn draw_frame(
+    renderer: &mut GlesRenderer,
+    framebuffer: &mut <GlesRenderer as RendererSuper>::Framebuffer<'_>,
+    state: &mut Cusk,
+    ctx: &mut FrameContext,
+    current: &config::Config,
+    size: Size<i32, Physical>,
+    logical_size: Size<i32, Logical>,
+    transform: Transform,
+    start: std::time::Instant,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let damage = Rectangle::from_size(size);
+        // Compiled on the first frame rather than at startup, because it
+        // needs a current GL context and the renderer only has one here.
+        let chrome = ctx.chrome.get_or_insert_with(|| chrome::Chrome::new(renderer));
+        let blur = match &mut ctx.blur {
+            Some(blur) => blur,
+            slot => slot.insert(gpublur::GpuBlur::new(renderer)),
+        };
+
+        // Rebuild the backdrop only when something it depends on changes.
+        // Preparing costs a decode, two resizes and six blur passes, which
+        // is fine once and unacceptable per frame.
+        // Two levels, because decoding and scaling cost an order of
+        // magnitude more than blurring. Dragging the blur radius must not
+        // re-read the file.
+        match backdrop_key(&current, logical_size) {
+            None => ctx.backdrop = None,
+            // A key that has already failed is not retried. The comment
+            // here used to claim a failure was "reported once per change,
+            // because the key is stored either way" — it was not: a failed
+            // build leaves `backdrop` as `None`, so the next frame tried
+            // again, and a missing wallpaper produced 1020 identical
+            // warnings in a seventeen-second run.
+            Some(key) if ctx.refused.as_ref() == Some(&key) => {}
+            Some(key) => match &mut ctx.backdrop {
+                Some(existing) if existing.source == (key.path.clone(), key.size) => {
+                    if existing.blur != (key.radius, key.passes) {
+                        existing.reblur(renderer, &key);
+                    }
+                }
+                _ => {
+                    ctx.backdrop = Backdrop::build(renderer, &key);
+                    ctx.refused = ctx.backdrop.is_none().then_some(key);
+                }
+            },
+        }
+
+        // Built before the frame, because constructing elements and
+        // uploading textures both need the renderer mutably and the frame
+        // borrows it for its whole life.
+        //
+        // Grouped per window rather than flattened, so each window's blur
+        // patch can be drawn immediately beneath it. A single flat list
+        // would force every patch to be drawn before every window, and the
+        // patch of an upper window would then sit on top of a lower one.
+        let mut layers: Vec<(
+            Rectangle<i32, Logical>,
+            bool,
+            Vec<WaylandSurfaceRenderElement<GlesRenderer>>,
+        )> = Vec::new();
+        for window in state.space.elements() {
+            let Some(loc) = state.space.element_location(window) else { continue };
+            let Some(surface) = window.toplevel().map(|t| t.wl_surface().clone()) else {
+                continue;
+            };
+            // The fifth argument is alpha, and it has been 1.0 since
+            // milestone 1. Setting it here rather than drawing the window
+            // through a shader is what keeps subsurfaces and popups
+            // working: they are separate elements in this tree, and each
+            // one carries the same alpha.
+            //
+            // It also switches off occlusion culling for the window, which
+            // is required rather than incidental: `opaque_regions` returns
+            // empty below 1.0, so whatever is behind a translucent window
+            // still gets drawn instead of being skipped as hidden.
+            let elements = render_elements_from_surface_tree(
+                renderer,
+                &surface,
+                (loc.x, loc.y),
+                1.0,
+                current.window_opacity as f32,
+                Kind::Unspecified,
+            );
+            let focused = state.focused().as_ref() == Some(window);
+            layers.push((Rectangle::new(loc, window.geometry().size), focused, elements));
+        }
+
+        // Answered here because this is where the renderer is reachable.
+        // A notifier dropped without a verdict leaves the client waiting
+        // for a reply that never comes — it does not fall back, it hangs,
+        // which looks like the client froze rather than like the compositor
+        // failed to answer.
+        for (dmabuf, notifier) in state.pending_dmabufs.drain(..) {
+            use smithay::backend::renderer::ImportDma;
+            match renderer.import_dmabuf(&dmabuf, None) {
+                Ok(_) => {
+                    let _ = notifier.successful::<Cusk>();
+                }
+                Err(e) => {
+                    tracing::warn!("rejected a dmabuf: {e}");
+                    notifier.failed();
+                }
+            }
+        }
+
+        // Built before the frame for the same reason the window layers are:
+        // constructing elements needs the renderer mutably, and the frame
+        // borrows it for its whole life.
+        let cursor_elements: Option<Vec<WaylandSurfaceRenderElement<GlesRenderer>>> =
+            match &state.cursor {
+                smithay::input::pointer::CursorImageStatus::Surface(surface) => {
+                    // The hotspot comes from the surface's own role data.
+                    // Assuming (0,0) puts a text I-beam's tip at its
+                    // top-left corner, so text lands a glyph off from where
+                    // it was aimed.
+                    let hotspot =
+                        smithay::wayland::compositor::with_states(surface, |states| {
+                            states
+                                .data_map
+                                .get::<smithay::input::pointer::CursorImageSurfaceData>()
+                                .and_then(|d| d.lock().ok().map(|d| d.hotspot))
+                                .unwrap_or_default()
+                        });
+                    let at = state.pointer_location.to_i32_round() - hotspot;
+                    Some(render_elements_from_surface_tree(
+                        renderer,
+                        surface,
+                        (at.x, at.y),
+                        1.0,
+                        1.0,
+                        Kind::Cursor,
+                    ))
+                }
+                _ => None,
+            };
+
+        // The focused window's title, prepared here because rasterising
+        // and uploading both need the renderer and the frame borrows it.
+        let title: Option<(Rectangle<i32, Logical>, (u32, u32), GlesTexture)> = (|| {
+            if state.panel_height <= 0 {
+                return None;
+            }
+            let face = ctx.face.as_mut()?;
+            let output = Size::from((logical_size.w, logical_size.h));
+            let pills_end = panel::pills(
+                output,
+                state.panel_height,
+                state.workspaces.len(),
+                state.workspaces.active_index(),
+            )
+            .last()
+            .map(|p| p.loc.x + p.size.w)
+            .unwrap_or(0);
+
+            let size = (state.panel_height as f32 * 0.5).clamp(9.0, 20.0);
+            // Kept clear of the pills on *both* sides, so a centred title
+            // cannot slide under them on a narrow screen.
+            let budget = logical_size.w - (pills_end + 16) * 2;
+            let text = face.truncate(&state.focused_title()?, size, budget);
+            if text.is_empty() {
+                return None;
+            }
+            let width = face.measure(&text, size);
+            let image = face.render(&text, size, cusk::theme::TEXT)?;
+            let dimensions = (image.width, image.height);
+
+            // Re-uploaded only when the string changes. A title is drawn
+            // every frame and changes rarely; uploading per frame would be
+            // the launcher icon's mistake a third time.
+            let stale = ctx.title_texture
+                .as_ref()
+                .map(|(cached, _)| cached != &text)
+                .unwrap_or(true);
+            if stale {
+                ctx.title_texture = upload(renderer, image).map(|t| (text.clone(), t));
+            }
+            let (_, texture) = ctx.title_texture.as_ref()?;
+            let rect = Rectangle::<i32, Logical>::new(
+                Point::from((
+                    (logical_size.w - width) / 2,
+                    (state.panel_height - dimensions.1 as i32) / 2,
+                )),
+                Size::from((width, dimensions.1 as i32)),
+            );
+            Some((rect, dimensions, texture.clone()))
+        })();
+
+        // Uploaded once. The arrow never changes, so rebuilding it per
+        // frame would be a texture upload per frame for a 24x24 image.
+        if ctx.pointer_texture.is_none() {
+            ctx.pointer_texture = upload(renderer, &ctx.pointer_image.image);
+        }
+
+        // Window blur assembles the scene in an offscreen texture so each
+        // window can blur what is behind it *before* it is drawn. Off by
+        // default: it is a blur chain per window per frame, where the
+        // wallpaper blur it replaces costs nothing.
+        let live_blur = current.window_blur
+            && ctx.backdrop.is_some()
+            && blur.begin(renderer, (size.w, size.h));
+
+        if live_blur {
+            // Held in an `Option` and handed back and forth with `blur`,
+            // because blurring needs the texture inside the struct while
+            // drawing needs it outside. Anything else is two mutable
+            // borrows of one struct.
+            let mut held = blur.take_scene();
+            if let Some(scene) = held.as_mut() {
+                // The wallpaper, into the scene rather than the screen.
+                {
+                    let mut target = renderer.bind(scene)?;
+                    let mut f = renderer.render(&mut target, size, Transform::Normal)?;
+                    f.clear(Color32F::new(0.03, 0.07, 0.10, 1.0), &[damage])?;
+                    if let Some(backdrop) = &ctx.backdrop {
+                        let whole = Rectangle::from_size(logical_size);
+                        Frame::render_texture_from_to(
+                            &mut f,
+                            &backdrop.sharp,
+                            texture_src(whole),
+                            Rectangle::from_size(size),
+                            &[damage],
+                            &[],
+                            Transform::Normal,
+                            1.0,
+                        )?;
+                    }
+                    let _ = f.finish();
+                }
+
+                for (rect, focused, elements) in &layers {
+                    let dst = to_physical(*rect);
+
+                    // Blur the scene as it stands — which is everything
+                    // behind this window and nothing in front, because the
+                    // scene is being built back to front.
+                    if let Some(scene) = held.take() {
+                        blur.put_scene(scene);
+                    }
+                    let has_blur = blur
+                        .blur_scene(renderer, current.blur_radius, current.blur_passes as u32)
+                        .is_some();
+                    held = blur.take_scene();
+                    let Some(scene) = held.as_mut() else { break };
+
+                    if has_blur {
+                        if let Some(blurred) = blur.blurred() {
+                            let mut target = renderer.bind(scene)?;
+                            let mut f =
+                                renderer.render(&mut target, size, Transform::Normal)?;
+                            let _ = Frame::render_texture_from_to(
+                                &mut f,
+                                blurred,
+                                gpublur::GpuBlur::half_src(dst),
+                                dst,
+                                &[damage],
+                                &[],
+                                Transform::Normal,
+                                1.0,
+                            );
+                            let _ = f.finish();
+                        }
+                    }
+
+                    let mut target = renderer.bind(scene)?;
+                    let mut f = renderer.render(&mut target, size, Transform::Normal)?;
+                    draw_render_elements(&mut f, 1.0, elements, &[damage])?;
+
+                    let radius = current
+                        .corner_radius
+                        .min(rect.size.w / 2)
+                        .min(rect.size.h / 2)
+                        .max(0);
+                    if let Some(backdrop) = &ctx.backdrop {
+                        chrome.round_corners(&mut f, &backdrop.sharp, *rect, radius, logical_size);
+                    }
+                    if *focused {
+                        chrome.focus_ring(
+                            &mut f,
+                            *rect,
+                            radius,
+                            current.ring_width,
+                            cusk::theme::ACCENT,
+                        );
+                    }
+                    let _ = f.finish();
+                }
+
+            }
+            if let Some(scene) = held {
+                blur.put_scene(scene);
+            }
+        }
+
+        let mut frame = renderer.render(framebuffer, size, transform)?;
+        frame.clear(Color32F::new(0.05, 0.06, 0.09, 1.0), &[damage])?;
+
+        if live_blur {
+            // Everything was composited offscreen; one blit brings it to
+            // the screen. The output transform is applied here and only
+            // here — the offscreen passes all render `Normal`, so applying
+            // it twice would put the desktop back upside down.
+            if let Some(scene) = blur.scene_ref() {
+                Frame::render_texture_from_to(
+                    &mut frame,
+                    scene,
+                    Rectangle::<f64, smithay::utils::Buffer>::from_size(Size::from((
+                        size.w as f64,
+                        size.h as f64,
+                    ))),
+                    Rectangle::from_size(size),
+                    &[damage],
+                    &[],
+                    Transform::Normal,
+                    1.0,
+                )?;
+            }
+        }
+
+        if !live_blur {
+        if let Some(backdrop) = &ctx.backdrop {
+            let whole = Rectangle::from_size(logical_size);
+            // Called through the trait explicitly: `GlesFrame` has an
+            // inherent method of the same name taking two extra shader
+            // arguments, and it shadows the trait one.
+            Frame::render_texture_from_to(
+                &mut frame,
+                &backdrop.sharp,
+                texture_src(whole),
+                Rectangle::from_size(size),
+                &[damage],
+                &[],
+                Transform::Normal,
+                1.0,
+            )?;
+        }
+
+        // Back to front. `Space::elements` yields bottom-first, which is
+        // the order to *draw* in — the opposite of what
+        // `draw_render_elements` expects for a combined list, and the
+        // reason the previous flattened version stacked windows upside
+        // down whenever two of them overlapped.
+        for (rect, focused, elements) in &layers {
+            if let Some(backdrop) = &ctx.backdrop {
+                if current.blur {
+                    // Both textures are output-sized, so a window's
+                    // rectangle is its own source crop with no conversion.
+                    if let Some(clipped) = rect.intersection(Rectangle::from_size(logical_size)) {
+                        Frame::render_texture_from_to(
+                            &mut frame,
+                            &backdrop.blurred,
+                            texture_src(clipped),
+                            to_physical(clipped),
+                            &[damage],
+                            &[],
+                            Transform::Normal,
+                            1.0,
+                        )?;
+                    }
+                }
+            }
+            draw_render_elements(&mut frame, 1.0, elements, &[damage])?;
+
+            // Corners are painted back over the window that was just
+            // drawn, so they must come after it and before the next one —
+            // another reason the per-window loop replaced a flat list.
+            //
+            // Clamped to half the shorter side: at any more than that,
+            // opposite corner patches overlap and erase the middle of the
+            // window.
+            let radius = current
+                .corner_radius
+                .min(rect.size.w / 2)
+                .min(rect.size.h / 2)
+                .max(0);
+            match &ctx.backdrop {
+                Some(backdrop) => {
+                    chrome.round_corners(&mut frame, &backdrop.sharp, *rect, radius, logical_size)
+                }
+                // Rounding works by painting the wallpaper back over the
+                // square corner, so with no wallpaper there is nothing to
+                // paint and corners stay square. Said once, because
+                // "I set corner-radius and nothing happened" is otherwise
+                // a mystery with no evidence anywhere.
+                None if radius > 0 && !ctx.warned_square_corners => {
+                    ctx.warned_square_corners = true;
+                    tracing::info!(
+                        "corner-radius needs appearance.wallpaper: corners are rounded by \
+                         painting the wallpaper back over them"
+                    );
+                }
+                None => {}
+            }
+            if *focused {
+                chrome.focus_ring(
+                    &mut frame,
+                    *rect,
+                    radius,
+                    current.ring_width,
+                    cusk::theme::ACCENT,
+                );
+            }
+        }
+
+
+        }
+
+
+        // Drawn after the windows and before the cursor. A floating window
+        // can still be dragged over the reserved strip — only tiling is
+        // obliged to respect it — so the bar has to be painted over the
+        // top or it disappears under the first window someone moves up.
+        if state.panel_height > 0 {
+            let output = Size::from((logical_size.w, logical_size.h));
+            let bar = to_physical(panel::panel_area(output, state.panel_height));
+            let bg = cusk::theme::premultiplied([
+                cusk::theme::BG[0],
+                cusk::theme::BG[1],
+                cusk::theme::BG[2],
+                0.85,
+            ]);
+            frame.draw_solid(bar, &[damage], Color32F::new(bg[0], bg[1], bg[2], bg[3]))?;
+
+            let active = state.workspaces.active_index();
+            let occupied = state.workspaces.occupied();
+            for (index, pill) in
+                panel::pills(output, state.panel_height, state.workspaces.len(), active)
+                    .into_iter()
+                    .enumerate()
+            {
+                // Three states, and the empty one is the point: a
+                // workspace with nothing on it has to look different from
+                // one that does, or switching to it still looks like a
+                // hang.
+                let colour = if index == active {
+                    cusk::theme::ACCENT
+                } else if occupied.get(index).copied().unwrap_or(false) {
+                    [
+                        cusk::theme::TEXT_DIM[0],
+                        cusk::theme::TEXT_DIM[1],
+                        cusk::theme::TEXT_DIM[2],
+                        0.75,
+                    ]
+                } else {
+                    [
+                        cusk::theme::SURFACE_HI[0],
+                        cusk::theme::SURFACE_HI[1],
+                        cusk::theme::SURFACE_HI[2],
+                        0.55,
+                    ]
+                };
+                let c = cusk::theme::premultiplied(colour);
+                frame.draw_solid(
+                    to_physical(pill),
+                    &[damage],
+                    Color32F::new(c[0], c[1], c[2], c[3]),
+                )?;
+            }
+
+            // The title, prepared before the frame — see `title` above.
+            if let Some((rect, image_size, texture)) = &title {
+                Frame::render_texture_from_to(
+                    &mut frame,
+                    texture,
+                    Rectangle::<f64, smithay::utils::Buffer>::from_size(Size::from((
+                        image_size.0 as f64,
+                        image_size.1 as f64,
+                    ))),
+                    to_physical(*rect),
+                    &[damage],
+                    &[],
+                    Transform::Normal,
+                    1.0,
+                )?;
+            }
+        }
+
+        // The pointer is drawn last, over everything including the focus
+        // ring. A cursor that can be covered by a window is a cursor you
+        // lose exactly when you are trying to click something.
+        match &state.cursor {
+            smithay::input::pointer::CursorImageStatus::Hidden => {}
+
+            // A client's own cursor, from the elements built above.
+            smithay::input::pointer::CursorImageStatus::Surface(_) => {
+                if let Some(elements) = &cursor_elements {
+                    draw_render_elements(&mut frame, 1.0, elements, &[damage])?;
+                }
+            }
+
+            // Nothing has an opinion, or it asked for a named shape cusk
+            // does not have artwork for. Every named shape gets the arrow
+            // rather than nothing: the wrong pointer is usable, no pointer
+            // is not.
+            smithay::input::pointer::CursorImageStatus::Named(_) => {
+                if let Some(texture) = &ctx.pointer_texture {
+                    let at: Point<i32, Logical> = state.pointer_location.to_i32_round();
+                    let size = ctx.pointer_image.image.width as i32;
+                    let dst = Rectangle::<i32, Physical>::new(
+                        Point::from((
+                            at.x - ctx.pointer_image.hotspot.0,
+                            at.y - ctx.pointer_image.hotspot.1,
+                        )),
+                        Size::from((size, size)),
+                    );
+                    Frame::render_texture_from_to(
+                        &mut frame,
+                        texture,
+                        Rectangle::from_size(Size::from((size as f64, size as f64))),
+                        dst,
+                        &[damage],
+                        &[],
+                        Transform::Normal,
+                        1.0,
+                    )?;
+                }
+            }
+        }
+
+        let _sync = frame.finish()?;
+
+        let now = start.elapsed().as_millis() as u32;
+        for window in state.space.elements() {
+            if let Some(toplevel) = window.toplevel() {
+                send_frames(toplevel.wl_surface(), now);
+            }
+    }
+    Ok(())
+}
 fn send_frames(surface: &WlSurface, time: u32) {
     with_surface_tree_downward(
         surface,
@@ -1422,12 +1980,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let keyboard = state.seat.add_keyboard(Default::default(), 200, 25)?;
     let pointer = state.seat.add_pointer();
 
-    let mut backdrop: Option<Backdrop> = None;
-    // The last backdrop key that failed to build, so it is not retried every frame.
-    let mut refused: Option<BackdropKey> = None;
-    let mut chrome: Option<chrome::Chrome> = None;
-    let mut blur: Option<gpublur::GpuBlur> = None;
-    let mut face = text::find_font(&cfg.font).and_then(|path| {
+    let face = text::find_font(&cfg.font).and_then(|path| {
         let loaded = text::Face::load(&path);
         match &loaded {
             Some(_) => tracing::info!("font {}", path.display()),
@@ -1438,10 +1991,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if face.is_none() {
         tracing::warn!("no usable font; the panel will show no title");
     }
-    let mut title_texture: Option<(String, GlesTexture)> = None;
-    let pointer_image = cursor::arrow(24);
-    let mut pointer_texture: Option<GlesTexture> = None;
-    let mut warned_square_corners = false;
+    let mut ctx = FrameContext {
+        chrome: None,
+        blur: None,
+        backdrop: None,
+        refused: None,
+        face,
+        title_texture: None,
+        pointer_image: cursor::arrow(24),
+        pointer_texture: None,
+        warned_square_corners: false,
+    };
+
     let mut watcher = config::Watcher::new(config_path.clone());
     let mut current = cfg.clone();
 
@@ -1883,521 +2444,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         {
             let (renderer, mut framebuffer) = backend.bind()?;
 
-            // Compiled on the first frame rather than at startup, because it
-            // needs a current GL context and the renderer only has one here.
-            let chrome = chrome.get_or_insert_with(|| chrome::Chrome::new(renderer));
-            let blur = match &mut blur {
-                Some(blur) => blur,
-                slot => slot.insert(gpublur::GpuBlur::new(renderer)),
-            };
-
-            // Rebuild the backdrop only when something it depends on changes.
-            // Preparing costs a decode, two resizes and six blur passes, which
-            // is fine once and unacceptable per frame.
-            // Two levels, because decoding and scaling cost an order of
-            // magnitude more than blurring. Dragging the blur radius must not
-            // re-read the file.
-            match backdrop_key(&current, logical_size) {
-                None => backdrop = None,
-                // A key that has already failed is not retried. The comment
-                // here used to claim a failure was "reported once per change,
-                // because the key is stored either way" — it was not: a failed
-                // build leaves `backdrop` as `None`, so the next frame tried
-                // again, and a missing wallpaper produced 1020 identical
-                // warnings in a seventeen-second run.
-                Some(key) if refused.as_ref() == Some(&key) => {}
-                Some(key) => match &mut backdrop {
-                    Some(existing) if existing.source == (key.path.clone(), key.size) => {
-                        if existing.blur != (key.radius, key.passes) {
-                            existing.reblur(renderer, &key);
-                        }
-                    }
-                    _ => {
-                        backdrop = Backdrop::build(renderer, &key);
-                        refused = backdrop.is_none().then_some(key);
-                    }
-                },
-            }
-
-            // Built before the frame, because constructing elements and
-            // uploading textures both need the renderer mutably and the frame
-            // borrows it for its whole life.
-            //
-            // Grouped per window rather than flattened, so each window's blur
-            // patch can be drawn immediately beneath it. A single flat list
-            // would force every patch to be drawn before every window, and the
-            // patch of an upper window would then sit on top of a lower one.
-            let mut layers: Vec<(
-                Rectangle<i32, Logical>,
-                bool,
-                Vec<WaylandSurfaceRenderElement<GlesRenderer>>,
-            )> = Vec::new();
-            for window in state.space.elements() {
-                let Some(loc) = state.space.element_location(window) else { continue };
-                let Some(surface) = window.toplevel().map(|t| t.wl_surface().clone()) else {
-                    continue;
-                };
-                // The fifth argument is alpha, and it has been 1.0 since
-                // milestone 1. Setting it here rather than drawing the window
-                // through a shader is what keeps subsurfaces and popups
-                // working: they are separate elements in this tree, and each
-                // one carries the same alpha.
-                //
-                // It also switches off occlusion culling for the window, which
-                // is required rather than incidental: `opaque_regions` returns
-                // empty below 1.0, so whatever is behind a translucent window
-                // still gets drawn instead of being skipped as hidden.
-                let elements = render_elements_from_surface_tree(
-                    renderer,
-                    &surface,
-                    (loc.x, loc.y),
-                    1.0,
-                    current.window_opacity as f32,
-                    Kind::Unspecified,
-                );
-                let focused = state.focused().as_ref() == Some(window);
-                layers.push((Rectangle::new(loc, window.geometry().size), focused, elements));
-            }
-
-            // Answered here because this is where the renderer is reachable.
-            // A notifier dropped without a verdict leaves the client waiting
-            // for a reply that never comes — it does not fall back, it hangs,
-            // which looks like the client froze rather than like the compositor
-            // failed to answer.
-            for (dmabuf, notifier) in state.pending_dmabufs.drain(..) {
-                use smithay::backend::renderer::ImportDma;
-                match renderer.import_dmabuf(&dmabuf, None) {
-                    Ok(_) => {
-                        let _ = notifier.successful::<Cusk>();
-                    }
-                    Err(e) => {
-                        tracing::warn!("rejected a dmabuf: {e}");
-                        notifier.failed();
-                    }
-                }
-            }
-
-            // Built before the frame for the same reason the window layers are:
-            // constructing elements needs the renderer mutably, and the frame
-            // borrows it for its whole life.
-            let cursor_elements: Option<Vec<WaylandSurfaceRenderElement<GlesRenderer>>> =
-                match &state.cursor {
-                    smithay::input::pointer::CursorImageStatus::Surface(surface) => {
-                        // The hotspot comes from the surface's own role data.
-                        // Assuming (0,0) puts a text I-beam's tip at its
-                        // top-left corner, so text lands a glyph off from where
-                        // it was aimed.
-                        let hotspot =
-                            smithay::wayland::compositor::with_states(surface, |states| {
-                                states
-                                    .data_map
-                                    .get::<smithay::input::pointer::CursorImageSurfaceData>()
-                                    .and_then(|d| d.lock().ok().map(|d| d.hotspot))
-                                    .unwrap_or_default()
-                            });
-                        let at = state.pointer_location.to_i32_round() - hotspot;
-                        Some(render_elements_from_surface_tree(
-                            renderer,
-                            surface,
-                            (at.x, at.y),
-                            1.0,
-                            1.0,
-                            Kind::Cursor,
-                        ))
-                    }
-                    _ => None,
-                };
-
-            // The focused window's title, prepared here because rasterising
-            // and uploading both need the renderer and the frame borrows it.
-            let title: Option<(Rectangle<i32, Logical>, (u32, u32), GlesTexture)> = (|| {
-                if state.panel_height <= 0 {
-                    return None;
-                }
-                let face = face.as_mut()?;
-                let output = Size::from((logical_size.w, logical_size.h));
-                let pills_end = panel::pills(
-                    output,
-                    state.panel_height,
-                    state.workspaces.len(),
-                    state.workspaces.active_index(),
-                )
-                .last()
-                .map(|p| p.loc.x + p.size.w)
-                .unwrap_or(0);
-
-                let size = (state.panel_height as f32 * 0.5).clamp(9.0, 20.0);
-                // Kept clear of the pills on *both* sides, so a centred title
-                // cannot slide under them on a narrow screen.
-                let budget = logical_size.w - (pills_end + 16) * 2;
-                let text = face.truncate(&state.focused_title()?, size, budget);
-                if text.is_empty() {
-                    return None;
-                }
-                let width = face.measure(&text, size);
-                let image = face.render(&text, size, cusk::theme::TEXT)?;
-                let dimensions = (image.width, image.height);
-
-                // Re-uploaded only when the string changes. A title is drawn
-                // every frame and changes rarely; uploading per frame would be
-                // the launcher icon's mistake a third time.
-                let stale = title_texture
-                    .as_ref()
-                    .map(|(cached, _)| cached != &text)
-                    .unwrap_or(true);
-                if stale {
-                    title_texture = upload(renderer, image).map(|t| (text.clone(), t));
-                }
-                let (_, texture) = title_texture.as_ref()?;
-                let rect = Rectangle::<i32, Logical>::new(
-                    Point::from((
-                        (logical_size.w - width) / 2,
-                        (state.panel_height - dimensions.1 as i32) / 2,
-                    )),
-                    Size::from((width, dimensions.1 as i32)),
-                );
-                Some((rect, dimensions, texture.clone()))
-            })();
-
-            // Uploaded once. The arrow never changes, so rebuilding it per
-            // frame would be a texture upload per frame for a 24x24 image.
-            if pointer_texture.is_none() {
-                pointer_texture = upload(renderer, &pointer_image.image);
-            }
-
-            // Window blur assembles the scene in an offscreen texture so each
-            // window can blur what is behind it *before* it is drawn. Off by
-            // default: it is a blur chain per window per frame, where the
-            // wallpaper blur it replaces costs nothing.
-            let live_blur = current.window_blur
-                && backdrop.is_some()
-                && blur.begin(renderer, (size.w, size.h));
-
-            if live_blur {
-                // Held in an `Option` and handed back and forth with `blur`,
-                // because blurring needs the texture inside the struct while
-                // drawing needs it outside. Anything else is two mutable
-                // borrows of one struct.
-                let mut held = blur.take_scene();
-                if let Some(scene) = held.as_mut() {
-                    // The wallpaper, into the scene rather than the screen.
-                    {
-                        let mut target = renderer.bind(scene)?;
-                        let mut f = renderer.render(&mut target, size, Transform::Normal)?;
-                        f.clear(Color32F::new(0.03, 0.07, 0.10, 1.0), &[damage])?;
-                        if let Some(backdrop) = &backdrop {
-                            let whole = Rectangle::from_size(logical_size);
-                            Frame::render_texture_from_to(
-                                &mut f,
-                                &backdrop.sharp,
-                                texture_src(whole),
-                                Rectangle::from_size(size),
-                                &[damage],
-                                &[],
-                                Transform::Normal,
-                                1.0,
-                            )?;
-                        }
-                        let _ = f.finish();
-                    }
-
-                    for (rect, focused, elements) in &layers {
-                        let dst = to_physical(*rect);
-
-                        // Blur the scene as it stands — which is everything
-                        // behind this window and nothing in front, because the
-                        // scene is being built back to front.
-                        if let Some(scene) = held.take() {
-                            blur.put_scene(scene);
-                        }
-                        let has_blur = blur
-                            .blur_scene(renderer, current.blur_radius, current.blur_passes as u32)
-                            .is_some();
-                        held = blur.take_scene();
-                        let Some(scene) = held.as_mut() else { break };
-
-                        if has_blur {
-                            if let Some(blurred) = blur.blurred() {
-                                let mut target = renderer.bind(scene)?;
-                                let mut f =
-                                    renderer.render(&mut target, size, Transform::Normal)?;
-                                let _ = Frame::render_texture_from_to(
-                                    &mut f,
-                                    blurred,
-                                    gpublur::GpuBlur::half_src(dst),
-                                    dst,
-                                    &[damage],
-                                    &[],
-                                    Transform::Normal,
-                                    1.0,
-                                );
-                                let _ = f.finish();
-                            }
-                        }
-
-                        let mut target = renderer.bind(scene)?;
-                        let mut f = renderer.render(&mut target, size, Transform::Normal)?;
-                        draw_render_elements(&mut f, 1.0, elements, &[damage])?;
-
-                        let radius = current
-                            .corner_radius
-                            .min(rect.size.w / 2)
-                            .min(rect.size.h / 2)
-                            .max(0);
-                        if let Some(backdrop) = &backdrop {
-                            chrome.round_corners(&mut f, &backdrop.sharp, *rect, radius, logical_size);
-                        }
-                        if *focused {
-                            chrome.focus_ring(
-                                &mut f,
-                                *rect,
-                                radius,
-                                current.ring_width,
-                                cusk::theme::ACCENT,
-                            );
-                        }
-                        let _ = f.finish();
-                    }
-
-                }
-                if let Some(scene) = held {
-                    blur.put_scene(scene);
-                }
-            }
-
-            let mut frame = renderer.render(&mut framebuffer, size, Transform::Flipped180)?;
-            frame.clear(Color32F::new(0.05, 0.06, 0.09, 1.0), &[damage])?;
-
-            if live_blur {
-                // Everything was composited offscreen; one blit brings it to
-                // the screen. The output transform is applied here and only
-                // here — the offscreen passes all render `Normal`, so applying
-                // it twice would put the desktop back upside down.
-                if let Some(scene) = blur.scene_ref() {
-                    Frame::render_texture_from_to(
-                        &mut frame,
-                        scene,
-                        Rectangle::<f64, smithay::utils::Buffer>::from_size(Size::from((
-                            size.w as f64,
-                            size.h as f64,
-                        ))),
-                        Rectangle::from_size(size),
-                        &[damage],
-                        &[],
-                        Transform::Normal,
-                        1.0,
-                    )?;
-                }
-            }
-
-            if !live_blur {
-            if let Some(backdrop) = &backdrop {
-                let whole = Rectangle::from_size(logical_size);
-                // Called through the trait explicitly: `GlesFrame` has an
-                // inherent method of the same name taking two extra shader
-                // arguments, and it shadows the trait one.
-                Frame::render_texture_from_to(
-                    &mut frame,
-                    &backdrop.sharp,
-                    texture_src(whole),
-                    Rectangle::from_size(size),
-                    &[damage],
-                    &[],
-                    Transform::Normal,
-                    1.0,
-                )?;
-            }
-
-            // Back to front. `Space::elements` yields bottom-first, which is
-            // the order to *draw* in — the opposite of what
-            // `draw_render_elements` expects for a combined list, and the
-            // reason the previous flattened version stacked windows upside
-            // down whenever two of them overlapped.
-            for (rect, focused, elements) in &layers {
-                if let Some(backdrop) = &backdrop {
-                    if current.blur {
-                        // Both textures are output-sized, so a window's
-                        // rectangle is its own source crop with no conversion.
-                        if let Some(clipped) = rect.intersection(Rectangle::from_size(logical_size)) {
-                            Frame::render_texture_from_to(
-                                &mut frame,
-                                &backdrop.blurred,
-                                texture_src(clipped),
-                                to_physical(clipped),
-                                &[damage],
-                                &[],
-                                Transform::Normal,
-                                1.0,
-                            )?;
-                        }
-                    }
-                }
-                draw_render_elements(&mut frame, 1.0, elements, &[damage])?;
-
-                // Corners are painted back over the window that was just
-                // drawn, so they must come after it and before the next one —
-                // another reason the per-window loop replaced a flat list.
-                //
-                // Clamped to half the shorter side: at any more than that,
-                // opposite corner patches overlap and erase the middle of the
-                // window.
-                let radius = current
-                    .corner_radius
-                    .min(rect.size.w / 2)
-                    .min(rect.size.h / 2)
-                    .max(0);
-                match &backdrop {
-                    Some(backdrop) => {
-                        chrome.round_corners(&mut frame, &backdrop.sharp, *rect, radius, logical_size)
-                    }
-                    // Rounding works by painting the wallpaper back over the
-                    // square corner, so with no wallpaper there is nothing to
-                    // paint and corners stay square. Said once, because
-                    // "I set corner-radius and nothing happened" is otherwise
-                    // a mystery with no evidence anywhere.
-                    None if radius > 0 && !warned_square_corners => {
-                        warned_square_corners = true;
-                        tracing::info!(
-                            "corner-radius needs appearance.wallpaper: corners are rounded by \
-                             painting the wallpaper back over them"
-                        );
-                    }
-                    None => {}
-                }
-                if *focused {
-                    chrome.focus_ring(
-                        &mut frame,
-                        *rect,
-                        radius,
-                        current.ring_width,
-                        cusk::theme::ACCENT,
-                    );
-                }
-            }
-
-
-            }
-
-
-            // Drawn after the windows and before the cursor. A floating window
-            // can still be dragged over the reserved strip — only tiling is
-            // obliged to respect it — so the bar has to be painted over the
-            // top or it disappears under the first window someone moves up.
-            if state.panel_height > 0 {
-                let output = Size::from((logical_size.w, logical_size.h));
-                let bar = to_physical(panel::panel_area(output, state.panel_height));
-                let bg = cusk::theme::premultiplied([
-                    cusk::theme::BG[0],
-                    cusk::theme::BG[1],
-                    cusk::theme::BG[2],
-                    0.85,
-                ]);
-                frame.draw_solid(bar, &[damage], Color32F::new(bg[0], bg[1], bg[2], bg[3]))?;
-
-                let active = state.workspaces.active_index();
-                let occupied = state.workspaces.occupied();
-                for (index, pill) in
-                    panel::pills(output, state.panel_height, state.workspaces.len(), active)
-                        .into_iter()
-                        .enumerate()
-                {
-                    // Three states, and the empty one is the point: a
-                    // workspace with nothing on it has to look different from
-                    // one that does, or switching to it still looks like a
-                    // hang.
-                    let colour = if index == active {
-                        cusk::theme::ACCENT
-                    } else if occupied.get(index).copied().unwrap_or(false) {
-                        [
-                            cusk::theme::TEXT_DIM[0],
-                            cusk::theme::TEXT_DIM[1],
-                            cusk::theme::TEXT_DIM[2],
-                            0.75,
-                        ]
-                    } else {
-                        [
-                            cusk::theme::SURFACE_HI[0],
-                            cusk::theme::SURFACE_HI[1],
-                            cusk::theme::SURFACE_HI[2],
-                            0.55,
-                        ]
-                    };
-                    let c = cusk::theme::premultiplied(colour);
-                    frame.draw_solid(
-                        to_physical(pill),
-                        &[damage],
-                        Color32F::new(c[0], c[1], c[2], c[3]),
-                    )?;
-                }
-
-                // The title, prepared before the frame — see `title` above.
-                if let Some((rect, image_size, texture)) = &title {
-                    Frame::render_texture_from_to(
-                        &mut frame,
-                        texture,
-                        Rectangle::<f64, smithay::utils::Buffer>::from_size(Size::from((
-                            image_size.0 as f64,
-                            image_size.1 as f64,
-                        ))),
-                        to_physical(*rect),
-                        &[damage],
-                        &[],
-                        Transform::Normal,
-                        1.0,
-                    )?;
-                }
-            }
-
-            // The pointer is drawn last, over everything including the focus
-            // ring. A cursor that can be covered by a window is a cursor you
-            // lose exactly when you are trying to click something.
-            match &state.cursor {
-                smithay::input::pointer::CursorImageStatus::Hidden => {}
-
-                // A client's own cursor, from the elements built above.
-                smithay::input::pointer::CursorImageStatus::Surface(_) => {
-                    if let Some(elements) = &cursor_elements {
-                        draw_render_elements(&mut frame, 1.0, elements, &[damage])?;
-                    }
-                }
-
-                // Nothing has an opinion, or it asked for a named shape cusk
-                // does not have artwork for. Every named shape gets the arrow
-                // rather than nothing: the wrong pointer is usable, no pointer
-                // is not.
-                smithay::input::pointer::CursorImageStatus::Named(_) => {
-                    if let Some(texture) = &pointer_texture {
-                        let at: Point<i32, Logical> = state.pointer_location.to_i32_round();
-                        let size = pointer_image.image.width as i32;
-                        let dst = Rectangle::<i32, Physical>::new(
-                            Point::from((
-                                at.x - pointer_image.hotspot.0,
-                                at.y - pointer_image.hotspot.1,
-                            )),
-                            Size::from((size, size)),
-                        );
-                        Frame::render_texture_from_to(
-                            &mut frame,
-                            texture,
-                            Rectangle::from_size(Size::from((size as f64, size as f64))),
-                            dst,
-                            &[damage],
-                            &[],
-                            Transform::Normal,
-                            1.0,
-                        )?;
-                    }
-                }
-            }
-
-            let _sync = frame.finish()?;
-
-            let now = start.elapsed().as_millis() as u32;
-            for window in state.space.elements() {
-                if let Some(toplevel) = window.toplevel() {
-                    send_frames(toplevel.wl_surface(), now);
-                }
-            }
+            draw_frame(
+                renderer,
+                &mut framebuffer,
+                &mut state,
+                &mut ctx,
+                &current,
+                size,
+                logical_size,
+                Transform::Flipped180,
+                start,
+            )?;
 
             if let Some(stream) = listener.accept()? {
                 let client = dh.insert_client(stream, Arc::new(ClientState::default()))?;
