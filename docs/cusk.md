@@ -1295,13 +1295,47 @@ blur, like the chrome shaders before it.
 ### Verified, and what is not
 
 Runs clean both ways: 0 GL errors, 0 shader failures, windows mapping normally,
-with blur off and on. **Correctness of the image is not verified** — the
-transform in particular. Offscreen passes render `Transform::Normal` and the
-output transform is applied once, at the final blit; applying it twice would
-put the desktop upside down, and applying it zero times would too. That is
-reasoned, not seen.
+with blur off and on. The transform was reasoned rather than seen when this was
+written — offscreen passes render `Transform::Normal` and the output transform
+is applied once, at the final blit, where applying it twice or not at all would
+both invert the desktop. **Confirmed correct on screen, 2026-08-08.**
 
 ### Next
 
-A panel for the workspace indicator, and translucent-client handling — blur of
-either kind is only visible through a window that is not opaque.
+A panel for the workspace indicator.
+
+---
+
+## Milestone 14: window opacity, 2026-08-08
+
+`appearance.window-opacity`, default 1.0, live.
+
+Both kinds of blur are only visible through a window that is not opaque, and
+until now that meant every client had to be configured for transparency itself
+— `window.opacity` in alacritty's own config, and for most applications no such
+setting exists at all. That made blur a property of the terminal rather than of
+the desktop.
+
+The hook was already there. `render_elements_from_surface_tree` takes an alpha
+as its fifth argument, and cusk had been passing `1.0` since milestone 1.
+
+Setting it there rather than drawing windows through a shader is what keeps
+subsurfaces and popups working: they are separate elements in the same tree,
+and each one carries the same alpha. A client's own decorations fade with it
+instead of floating opaque over a translucent window.
+
+It also switches off occlusion culling for that window, which is required
+rather than incidental. `WaylandSurfaceRenderElement::opaque_regions` returns
+empty below 1.0, so `draw_render_elements` stops treating the window as
+something that hides what is behind it — without that, the blur and wallpaper
+underneath would be skipped as invisible and there would be nothing to show
+through.
+
+Verified with three windows at 0.82 and a live change back to 1.0: no errors,
+and the reload reached the render path.
+
+### Next
+
+A panel for the workspace indicator, which is the last thing `Super+1..9` is
+missing — switching to an empty workspace is still indistinguishable from a
+hang except in the log.

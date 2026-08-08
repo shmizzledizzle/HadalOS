@@ -1815,12 +1815,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let Some(surface) = window.toplevel().map(|t| t.wl_surface().clone()) else {
                     continue;
                 };
+                // The fifth argument is alpha, and it has been 1.0 since
+                // milestone 1. Setting it here rather than drawing the window
+                // through a shader is what keeps subsurfaces and popups
+                // working: they are separate elements in this tree, and each
+                // one carries the same alpha.
+                //
+                // It also switches off occlusion culling for the window, which
+                // is required rather than incidental: `opaque_regions` returns
+                // empty below 1.0, so whatever is behind a translucent window
+                // still gets drawn instead of being skipped as hidden.
                 let elements = render_elements_from_surface_tree(
                     renderer,
                     &surface,
                     (loc.x, loc.y),
                     1.0,
-                    1.0,
+                    current.window_opacity as f32,
                     Kind::Unspecified,
                 );
                 let focused = state.focused().as_ref() == Some(window);

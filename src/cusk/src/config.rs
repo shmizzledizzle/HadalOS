@@ -373,6 +373,12 @@ settings! {
         apply: Live,
         default: 24, min: 0, max: 120
     },
+    window_opacity: Float {
+        key: "appearance.window-opacity",
+        doc: "How opaque windows are. Below 1.0 the blur behind them becomes visible.",
+        apply: Live,
+        default: 1.0, min: 0.2, max: 1.0
+    },
     window_blur: Bool {
         key: "appearance.window-blur",
         doc: "Blur what is actually behind a window, not just the wallpaper. Costs a blur per window per frame.",
