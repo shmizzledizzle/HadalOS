@@ -22,6 +22,10 @@
 //! never run is not a compositor that works, and finding that out from a TTY
 //! costs a reboot.
 
+#[allow(dead_code)] // `get` and `set_in_document` are the GUI and broker
+// surfaces from §4: covered by tests, with no in-compositor caller until the
+// settings editor and the SetSetting action land.
+mod config;
 mod floating;
 mod geometry;
 mod layout;
@@ -106,14 +110,24 @@ enum ModKey {
 }
 
 impl ModKey {
-    fn from_env() -> Self {
-        match std::env::var("CUSK_MOD").unwrap_or_default().to_ascii_lowercase().as_str() {
+    /// Resolve from the config, with `CUSK_MOD` overriding it.
+    ///
+    /// The env var stays because it is a testing affordance for nested runs
+    /// under a host that claims the same modifier, and editing a config file
+    /// to try the other one is friction in exactly the wrong place.
+    fn resolve(configured: &str) -> Self {
+        let chosen = std::env::var("CUSK_MOD").unwrap_or_else(|_| configured.to_string());
+        Self::parse(&chosen)
+    }
+
+    fn parse(name: &str) -> Self {
+        match name.to_ascii_lowercase().as_str() {
             "alt" => ModKey::Alt,
             "ctrl" => ModKey::Ctrl,
             "ctrl-alt" | "ctrlalt" => ModKey::CtrlAlt,
             "" | "super" | "logo" | "meta" => ModKey::Super,
             other => {
-                tracing::warn!("CUSK_MOD={other:?} not recognised, using super");
+                tracing::warn!("mod key {other:?} not recognised, using super");
                 ModKey::Super
             }
         }
@@ -137,8 +151,6 @@ impl ModKey {
         }
     }
 }
-
-const TERMINALS: &[&str] = &["foot", "alacritty", "kitty", "weston-terminal", "konsole"];
 
 struct Cusk {
     compositor_state: CompositorState,
@@ -165,6 +177,8 @@ struct Cusk {
     /// clicking a window reshuffles the whole layout under the pointer — the
     /// window you clicked jumps somewhere else as you click it.
     order: Vec<Window>,
+    /// Whether hovering a window focuses it.
+    focus_follows_mouse: bool,
     /// The window that has keyboard focus.
     ///
     /// Tracked explicitly rather than read back as topmost-in-stacking-order.
@@ -694,6 +708,24 @@ impl Cusk {
         }
     }
 
+    /// Focus whatever the pointer is over, if it is not already focused.
+    ///
+    /// Two guards, both of which are the difference between this being usable
+    /// and being unbearable:
+    ///
+    /// - **Nothing under the pointer changes nothing.** Crossing a gap between
+    ///   tiles would otherwise drop focus, so typing would stop mid-sentence
+    ///   whenever the pointer sat in a gap.
+    /// - **Already-focused windows are skipped.** `focus` raises, and raising
+    ///   on every motion event re-stacks the space hundreds of times a second.
+    fn focus_under_pointer(&mut self, location: Point<f64, smithay::utils::Logical>) {
+        let Some((window, _, _)) = self.surface_under(location) else { return };
+        if self.focused.as_ref() == Some(&window) {
+            return;
+        }
+        self.focus(&window);
+    }
+
     /// Raise and give keyboard focus in one step.
     ///
     /// Kept together deliberately: a window that is focused but not raised, or
@@ -778,7 +810,7 @@ fn spawn_terminal(term: &str, socket_name: &str) {
 }
 
 fn pick_terminal() -> Option<&'static str> {
-    TERMINALS.iter().copied().find(|t| {
+    config::known_terminals().find(|t| {
         std::process::Command::new("sh")
             .args(["-c", &format!("command -v {t} >/dev/null")])
             .status()
@@ -800,7 +832,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let requested: Option<String> =
         args.iter().find(|a| !a.starts_with('-')).cloned();
 
-    let mod_key = ModKey::from_env();
+    // Loaded before anything else is built, because it decides how things get
+    // built. A missing file is written with the schema's own documentation
+    // rather than left absent: a config nobody can find is a config nobody
+    // edits, and the generated file is the discoverability half of §4 until
+    // the GUI exists.
+    let config_path = config::default_path();
+    if !config_path.exists() {
+        if let Some(dir) = config_path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        match std::fs::write(&config_path, config::Config::default_file()) {
+            Ok(()) => tracing::info!("wrote default config to {}", config_path.display()),
+            Err(e) => tracing::warn!("could not write {}: {e}", config_path.display()),
+        }
+    }
+    let cfg = match config::Config::load(&config_path) {
+        Ok((cfg, complaints)) => {
+            // Surfaced, not swallowed. §4 asks for validation errors to be
+            // reported rather than silently reverted, and a setting that did
+            // nothing with no explanation is the complaint this prevents.
+            for complaint in &complaints {
+                tracing::warn!("{}: {}", config_path.display(), complaint);
+            }
+            cfg
+        }
+        Err(e) => {
+            tracing::warn!("{}: {e} — using defaults", config_path.display());
+            config::Config::default()
+        }
+    };
+
+    let mod_key = ModKey::resolve(&cfg.mod_key);
 
     let mut display: Display<Cusk> = Display::new()?;
     let mut dh = display.handle();
@@ -823,9 +886,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         mod_key,
         order: Vec::new(),
         focused: None,
-        tiling: false,
-        layout: layout::Layout::default(),
-        gaps: layout::Gaps::default(),
+        tiling: cfg.tiling_on_start,
+        layout: match cfg.default_layout.as_str() {
+            "columns" => layout::Layout::Columns,
+            _ => layout::Layout::MasterStack { ratio: cfg.master_ratio },
+        },
+        gaps: layout::Gaps { inner: cfg.inner_gap, outer: cfg.outer_gap },
+        focus_follows_mouse: cfg.focus_follows_mouse,
         output_size: (1280, 800),
     };
 
@@ -851,14 +918,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // rather than borrowed: `pick_terminal` yields &'static str and `requested`
     // a local String, and unifying the two by reference makes the local's
     // lifetime the binding constraint for no gain.
-    let terminal: Option<String> =
-        requested.clone().or_else(|| pick_terminal().map(str::to_owned));
+    let terminal: Option<String> = requested
+        .clone()
+        .or_else(|| match cfg.terminal.as_str() {
+            // "auto" is a strategy, not a program: probe the schema's list in
+            // preference order. A named terminal is taken at its word even if
+            // absent, so a typo'd or uninstalled choice fails loudly at spawn
+            // rather than silently starting something else.
+            "auto" => pick_terminal().map(str::to_owned),
+            named => Some(named.to_string()),
+        });
 
     if !no_spawn {
         match terminal.as_deref() {
             Some(term) => spawn_terminal(term, &socket_name),
             None => tracing::warn!(
-                "no terminal found (tried {TERMINALS:?}) — start one by hand with \
+                "no terminal found — start one by hand with \
                  WAYLAND_DISPLAY={socket_name}"
             ),
         }
@@ -877,7 +952,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         String::new(),
         format!("      WAYLAND_DISPLAY={socket_name} alacritty"),
         String::new(),
-        format!("  bindings use {}   (set CUSK_MOD=alt if the host eats it)", mod_key.label()),
+        format!(
+            "  bindings use {}   (set CUSK_MOD={} if the host eats it)",
+            mod_key.label(),
+            // Suggesting the modifier already in use is advice that cannot
+            // help, and reads as the hint being boilerplate.
+            if matches!(mod_key, ModKey::Alt) { "ctrl-alt" } else { "alt" },
+        ),
         String::new(),
         "      click           focus and raise".into(),
         format!("      {} + drag     move", mod_key.label()),
@@ -1021,6 +1102,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     );
                     last_report = std::time::Instant::now();
                 }
+                if state.focus_follows_mouse {
+                    state.focus_under_pointer(location);
+                }
+
                 let under = hit.map(|(_, surface, loc)| (surface, loc));
                 pointer.motion(
                     &mut state,
