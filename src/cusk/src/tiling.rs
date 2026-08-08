@@ -50,7 +50,7 @@ impl SwapGrab {
             Point::from((0, 0)),
             Size::from((data.output_size.0, data.output_size.1)),
         );
-        let tiles = data.layout.arrange(area, windows.len(), data.gaps);
+        let tiles = data.layout().arrange(area, windows.len(), data.gaps);
 
         let Some(target) = layout::index_at(&tiles, at.to_i32_round()) else {
             return;
@@ -66,12 +66,12 @@ impl SwapGrab {
         // filtered `tiled()` list would discard the result, since that list is
         // a copy rebuilt on every call.
         let (Some(a), Some(b)) = (
-            data.order.iter().position(|w| w == &windows[source]),
-            data.order.iter().position(|w| w == &windows[target]),
+            data.order().iter().position(|w| w == &windows[source]),
+            data.order().iter().position(|w| w == &windows[target]),
         ) else {
             return;
         };
-        data.order.swap(a, b);
+        data.order_mut().swap(a, b);
         tracing::info!("swapped tiles {source} and {target}");
         data.relayout();
     }
@@ -159,8 +159,8 @@ impl PointerGrab<Cusk> for RatioGrab {
             Size::from((data.output_size.0, data.output_size.1)),
         );
         let ratio = layout::ratio_at(area, event.location.to_i32_round().x, data.gaps);
-        if let layout::Layout::MasterStack { .. } = data.layout {
-            data.layout = layout::Layout::MasterStack { ratio };
+        if let layout::Layout::MasterStack { .. } = data.layout() {
+            data.workspaces.active_mut().layout = layout::Layout::MasterStack { ratio };
             data.relayout();
         }
     }

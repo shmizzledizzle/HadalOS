@@ -30,6 +30,7 @@ mod geometry;
 mod layout;
 mod tiling;
 mod wallpaper;
+mod workspace;
 
 use std::sync::Arc;
 
@@ -64,6 +65,8 @@ enum Binding {
     FocusStep(isize),
     MoveInOrder(isize),
     Promote,
+    Workspace(usize),
+    SendToWorkspace(usize),
 }
 use smithay::input::pointer::{ButtonEvent, GrabStartData, MotionEvent};
 use smithay::input::{Seat, SeatHandler, SeatState};
@@ -171,26 +174,13 @@ struct Cusk {
     /// Which modifier arms those bindings.
     mod_key: ModKey,
 
-    /// Tile order, oldest first.
-    ///
-    /// Deliberately *not* `space.elements()`, which is stacking order and
-    /// changes every time a window is raised. Tiling off stacking order means
-    /// clicking a window reshuffles the whole layout under the pointer — the
-    /// window you clicked jumps somewhere else as you click it.
-    order: Vec<Window>,
     /// Whether hovering a window focuses it.
     focus_follows_mouse: bool,
-    /// The window that has keyboard focus.
+    /// Every workspace, and which one is on screen.
     ///
-    /// Tracked explicitly rather than read back as topmost-in-stacking-order.
-    /// That equivalence holds only because focusing raises, and it silently
-    /// stops holding the moment anything else raises a window — at which point
-    /// every keyboard binding starts acting on the wrong window.
-    focused: Option<Window>,
-    /// Whether the workspace tiles. §3's "two policies over the same window
-    /// set": the set is `order`, and this picks the policy applied to it.
-    tiling: bool,
-    layout: layout::Layout,
+    /// Order, tiling mode, layout and focus all live per-workspace: switching
+    /// to a tiled workspace and back must not leave the other one tiled.
+    workspaces: workspace::Workspaces<Window>,
     gaps: layout::Gaps,
     /// Current output size in logical coordinates, kept so relayout does not
     /// need the render loop to hand it over.
@@ -282,7 +272,7 @@ impl XdgShellHandler for Cusk {
             tracing::info!("dialog exempted from tiling");
         }
 
-        self.order.push(window.clone());
+        self.workspaces.insert(window.clone());
         self.focus(&window);
         self.relayout();
     }
@@ -340,7 +330,7 @@ impl XdgShellHandler for Cusk {
             // Drop it from the tile order too, or the layout keeps reserving a
             // column for a window that no longer exists — a gap that looks
             // like a rendering fault rather than stale bookkeeping.
-            self.order.retain(|w| w != &window);
+            self.workspaces.remove(&window);
             tracing::info!("toplevel destroyed");
         }
         self.relayout();
@@ -350,7 +340,7 @@ impl XdgShellHandler for Cusk {
         match next {
             Some(w) => self.focus(&w),
             None => {
-                self.focused = None;
+                self.workspaces.active_mut().focused = None;
                 if let Some(kb) = self.seat.get_keyboard() {
                     kb.set_focus(self, None, Serial::from(0));
                 }
@@ -503,12 +493,12 @@ impl Cusk {
     /// used list, so cycling it walks back and forth between the same two
     /// windows instead of touring them all.
     fn focus_step(&mut self, delta: isize) {
-        let windows = self.order.clone();
+        let windows = self.order().clone();
         if windows.is_empty() {
             return;
         }
-        let current = self
-            .focused
+        let focused = self.focused();
+        let current = focused
             .as_ref()
             .and_then(|f| windows.iter().position(|w| w == f))
             .unwrap_or(0);
@@ -519,13 +509,13 @@ impl Cusk {
 
     /// Move the focused window earlier or later in the tile order.
     fn move_in_order(&mut self, delta: isize) {
-        let Some(focused) = self.focused.clone() else { return };
-        let Some(from) = self.order.iter().position(|w| w == &focused) else { return };
-        if self.order.len() < 2 {
+        let Some(focused) = self.focused() else { return };
+        let Some(from) = self.order().iter().position(|w| w == &focused) else { return };
+        if self.order().len() < 2 {
             return;
         }
-        let to = layout::step(self.order.len(), from, delta);
-        self.order.swap(from, to);
+        let to = layout::step(self.order().len(), from, delta);
+        self.order_mut().swap(from, to);
         tracing::info!("moved window from {from} to {to}");
         self.relayout();
     }
@@ -537,14 +527,101 @@ impl Cusk {
     /// arrangement you started from. Shifting everything down instead makes
     /// the gesture irreversible, and there is no undo in a window manager.
     fn promote(&mut self) {
-        let Some(focused) = self.focused.clone() else { return };
-        let Some(from) = self.order.iter().position(|w| w == &focused) else { return };
+        let Some(focused) = self.focused() else { return };
+        let Some(from) = self.order().iter().position(|w| w == &focused) else { return };
         if from == 0 {
             return;
         }
-        self.order.swap(0, from);
+        self.order_mut().swap(0, from);
         tracing::info!("promoted window {from} to master");
         self.relayout();
+    }
+
+    pub fn order(&self) -> &Vec<Window> {
+        &self.workspaces.active().order
+    }
+
+    pub fn order_mut(&mut self) -> &mut Vec<Window> {
+        &mut self.workspaces.active_mut().order
+    }
+
+    pub fn tiling(&self) -> bool {
+        self.workspaces.active().tiling
+    }
+
+    pub fn layout(&self) -> layout::Layout {
+        self.workspaces.active().layout
+    }
+
+    pub fn focused(&self) -> Option<Window> {
+        self.workspaces.active().focused.clone()
+    }
+
+    /// Show a different workspace.
+    fn switch_workspace(&mut self, index: usize) {
+        let Some(switch) = self.workspaces.switch_to(index) else { return };
+
+        // Unmapped, not moved off-screen. A window parked at a huge coordinate
+        // is still in the Space: it takes part in hit testing, in layout and in
+        // "topmost window" queries, so the compositor keeps acting on windows
+        // nobody can see.
+        for window in &switch.hide {
+            self.space.unmap_elem(window);
+        }
+        for window in &switch.show {
+            // Remembered geometry travels with the window, so a floating
+            // window returns to where it was rather than to the origin. The
+            // fallback only applies to a window that never had a rectangle.
+            let location = geometry::recall(window)
+                .map(|rect| rect.loc)
+                .unwrap_or_else(|| Point::from((40, 40)));
+            self.space.map_element(window.clone(), location, false);
+        }
+
+        match switch.focus {
+            Some(window) => self.focus(&window),
+            None => {
+                // An empty workspace must actually drop focus, or keystrokes
+                // keep going to a window on a workspace that is no longer
+                // shown.
+                if let Some(kb) = self.seat.get_keyboard() {
+                    kb.set_focus(self, None, Serial::from(0));
+                }
+            }
+        }
+        self.relayout();
+        let occupied: Vec<String> = self
+            .workspaces
+            .occupied()
+            .iter()
+            .enumerate()
+            .filter(|(_, has)| **has)
+            .map(|(i, _)| (i + 1).to_string())
+            .collect();
+        // Until there is a panel, this line is the only workspace indicator
+        // cusk has — and switching to an empty workspace looks identical to
+        // the compositor having hung.
+        tracing::info!(
+            "workspace {} of {} (windows on: {})",
+            self.workspaces.active_index() + 1,
+            self.workspaces.len(),
+            if occupied.is_empty() { "none".into() } else { occupied.join(", ") }
+        );
+    }
+
+    /// Send the focused window to another workspace.
+    fn send_to_workspace(&mut self, index: usize) {
+        let Some(window) = self.focused() else { return };
+        let Some(focus) = self.workspaces.move_to(&window, index) else { return };
+
+        self.space.unmap_elem(&window);
+        if let Some(next) = focus {
+            self.focus(&next);
+        } else if let Some(kb) = self.seat.get_keyboard() {
+            kb.set_focus(self, None, Serial::from(0));
+        }
+        self.relayout();
+        tracing::info!("sent window to workspace {}", index + 1);
     }
 
     /// Whether the layout currently owns this window's geometry.
@@ -552,12 +629,12 @@ impl Cusk {
     /// Both halves matter: tiling can be off, and an individual window can be
     /// exempt from it while it is on.
     fn is_tiled(&self, window: &Window) -> bool {
-        self.tiling && !geometry::is_exempt(window)
+        self.tiling() && !geometry::is_exempt(window)
     }
 
     /// The windows the layout is entitled to place, in stable order.
     pub fn tiled(&self) -> Vec<Window> {
-        self.order
+        self.order()
             .iter()
             .filter(|w| !geometry::is_exempt(w))
             .cloned()
@@ -571,7 +648,7 @@ impl Cusk {
     /// invalidation shows up as a window that silently stops participating in
     /// the layout, which is far harder to see than a redundant recompute.
     pub fn relayout(&mut self) {
-        if !self.tiling {
+        if !self.tiling() {
             return;
         }
         let windows = self.tiled();
@@ -579,7 +656,7 @@ impl Cusk {
             Point::from((0, 0)),
             Size::from((self.output_size.0, self.output_size.1)),
         );
-        let tiles = self.layout.arrange(area, windows.len(), self.gaps);
+        let tiles = self.layout().arrange(area, windows.len(), self.gaps);
 
         for (window, tile) in windows.iter().zip(tiles) {
             // Record the floating rectangle before displacing, so leaving
@@ -608,8 +685,9 @@ impl Cusk {
 
     /// Switch the workspace between tiled and floating.
     fn toggle_tiling(&mut self) {
-        self.tiling = !self.tiling;
-        if self.tiling {
+        let now = !self.tiling();
+        self.workspaces.active_mut().tiling = now;
+        if now {
             self.relayout();
         } else {
             // §3: "Switching a workspace from tiled to floating — tiled
@@ -634,8 +712,8 @@ impl Cusk {
         }
         tracing::info!(
             "tiling {} ({})",
-            if self.tiling { "on" } else { "off" },
-            self.layout.name()
+            if self.tiling() { "on" } else { "off" },
+            self.layout().name()
         );
     }
 
@@ -716,13 +794,39 @@ impl Cusk {
     /// made since — reloading the file must not undo a layout picked with
     /// Super+E.
     fn apply_config(&mut self, cfg: &config::Config) {
+        // Safe to call whenever: shrinking rehomes windows onto the last
+        // surviving workspace rather than dropping them, because losing a
+        // window because a number in a config file got smaller would be
+        // unrecoverable from inside the session.
+        if cfg.workspace_count.max(1) as usize != self.workspaces.len() {
+            self.workspaces
+                .resize(cfg.workspace_count.max(1) as usize, cfg.tiling_on_start, self.layout());
+            // The rehomed windows belong to whatever workspace is now active;
+            // anything mapped that no longer does has to go.
+            let visible = self.workspaces.active().order.clone();
+            let mapped: Vec<Window> = self.space.elements().cloned().collect();
+            for window in mapped {
+                if !visible.contains(&window) {
+                    self.space.unmap_elem(&window);
+                }
+            }
+            for window in &visible {
+                if self.space.element_location(window).is_none() {
+                    let at = geometry::recall(window)
+                        .map(|r| r.loc)
+                        .unwrap_or_else(|| Point::from((40, 40)));
+                    self.space.map_element(window.clone(), at, false);
+                }
+            }
+            tracing::info!("now {} workspaces", self.workspaces.len());
+        }
         self.gaps = layout::Gaps { inner: cfg.inner_gap, outer: cfg.outer_gap };
         self.focus_follows_mouse = cfg.focus_follows_mouse;
         self.mod_key = ModKey::resolve(&cfg.mod_key);
         // The ratio lives inside the master-stack variant, so it can only be
         // applied while that is the layout. Columns has no divider to move.
-        if let layout::Layout::MasterStack { .. } = self.layout {
-            self.layout = layout::Layout::MasterStack { ratio: cfg.master_ratio };
+        if let layout::Layout::MasterStack { .. } = self.layout() {
+            self.workspaces.active_mut().layout = layout::Layout::MasterStack { ratio: cfg.master_ratio };
         }
         self.relayout();
     }
@@ -739,7 +843,7 @@ impl Cusk {
     ///   on every motion event re-stacks the space hundreds of times a second.
     fn focus_under_pointer(&mut self, location: Point<f64, smithay::utils::Logical>) {
         let Some((window, _, _)) = self.surface_under(location) else { return };
-        if self.focused.as_ref() == Some(&window) {
+        if self.focused().as_ref() == Some(&window) {
             return;
         }
         self.focus(&window);
@@ -751,7 +855,7 @@ impl Cusk {
     /// raised but not focused, is the classic window-manager bug where typing
     /// goes to something you cannot see.
     fn focus(&mut self, window: &Window) {
-        self.focused = Some(window.clone());
+        self.workspaces.active_mut().focused = Some(window.clone());
         let location = self.space.element_location(window).unwrap_or_default();
         self.space.map_element(window.clone(), location, true);
         if let Some(kb) = self.seat.get_keyboard() {
@@ -1037,13 +1141,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         pointer_location: (0.0, 0.0).into(),
         modifiers: ModifiersState::default(),
         mod_key,
-        order: Vec::new(),
-        focused: None,
-        tiling: cfg.tiling_on_start,
-        layout: match cfg.default_layout.as_str() {
-            "columns" => layout::Layout::Columns,
-            _ => layout::Layout::MasterStack { ratio: cfg.master_ratio },
-        },
+        workspaces: workspace::Workspaces::new(
+            cfg.workspace_count.max(1) as usize,
+            cfg.tiling_on_start,
+            match cfg.default_layout.as_str() {
+                "columns" => layout::Layout::Columns,
+                _ => layout::Layout::MasterStack { ratio: cfg.master_ratio },
+            },
+        ),
         gaps: layout::Gaps { inner: cfg.inner_gap, outer: cfg.outer_gap },
         focus_follows_mouse: cfg.focus_follows_mouse,
         output_size: (1280, 800),
@@ -1132,6 +1237,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         format!("      {} + shift + j / k", mod_key.label()),
         "                      move it earlier / later in the layout".into(),
         format!("      {} + shift + p    promote it to master", mod_key.label()),
+        format!("      {} + 1..9      switch workspace", mod_key.label()),
+        format!("      {} + shift + 1..9", mod_key.label()),
+        "                      send this window to that workspace".into(),
         "      close window    quit".into(),
         String::new(),
     ] {
@@ -1203,7 +1311,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 Keysym::J => Some(Binding::MoveInOrder(1)),
                                 Keysym::K => Some(Binding::MoveInOrder(-1)),
                                 Keysym::P => Some(Binding::Promote),
-                                _ => None,
+                                // Digits pick a workspace; shifted digits send
+                                // the focused window to one. Shift produces a
+                                // different keysym per layout (! " # on some,
+                                // symbols on others), so the unshifted keysym
+                                // is read and the modifier checked separately —
+                                // matching on the shifted symbol works on one
+                                // keyboard layout and silently fails on the
+                                // rest.
+                                sym => match sym.raw() {
+                                    0x0031..=0x0039 => {
+                                        let index = (sym.raw() - 0x0031) as usize;
+                                        Some(if modifiers.shift {
+                                            Binding::SendToWorkspace(index)
+                                        } else {
+                                            Binding::Workspace(index)
+                                        })
+                                    }
+                                    _ => None,
+                                },
                             };
                             if let Some(binding) = bound {
                                 return FilterResult::Intercept(Some(binding));
@@ -1214,7 +1340,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
 
                 if let Some(Some(binding)) = binding {
-                    let focused = state.focused.clone();
+                    let focused = state.focused();
                     match binding {
                         Binding::ToggleMaximize => {
                             if let Some(w) = focused {
@@ -1228,19 +1354,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
                         Binding::CycleLayout => {
-                            state.layout = state.layout.next();
-                            tracing::info!("layout: {}", state.layout.name());
+                            let next = state.layout().next();
+                            state.workspaces.active_mut().layout = next;
+                            tracing::info!("layout: {}", next.name());
                             state.relayout();
                         }
                         Binding::FocusStep(d) => state.focus_step(d),
                         Binding::MoveInOrder(d) => state.move_in_order(d),
                         Binding::Promote => state.promote(),
+                        Binding::Workspace(i) => state.switch_workspace(i),
+                        Binding::SendToWorkspace(i) => state.send_to_workspace(i),
                         Binding::Spawn => match terminal.as_deref() {
                             Some(term) => spawn_terminal(term, &socket_name),
                             None => tracing::warn!("no terminal to spawn"),
                         },
                         Binding::Widen(dir) => {
-                            state.layout = state.layout.widen(0.05 * dir as f64);
+                            let wider = state.layout().widen(0.05 * dir as f64);
+                            state.workspaces.active_mut().layout = wider;
                             state.relayout();
                         }
                     }
@@ -1441,7 +1571,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     1.0,
                     Kind::Unspecified,
                 );
-                let focused = state.focused.as_ref() == Some(window);
+                let focused = state.focused().as_ref() == Some(window);
                 layers.push((Rectangle::new(loc, window.geometry().size), focused, elements));
             }
 

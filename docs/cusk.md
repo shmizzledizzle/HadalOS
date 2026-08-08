@@ -29,6 +29,9 @@ configured with KDE's discoverability and Hyprland's reach.
 | Rounded corners | painted back with the wallpaper, not clipped from the window | 2026-08-07 |
 | Chrome shaders | degrade to square corners rather than refusing to start | 2026-08-07 |
 | Palette | `cusk::theme`, shared by compositor and editor — never copied | 2026-08-07 |
+| Workspaces | generic over the element type, so the logic is testable without Wayland | 2026-08-07 |
+| Hidden windows | unmapped from the `Space`, never parked off-screen | 2026-08-07 |
+| Palette source | HadalOS's own launcher icon: deep blue, cyan accent | 2026-08-07 |
 
 ## 1. This reverses ARCHITECTURE.md §0
 
@@ -915,3 +918,87 @@ Translucent client support is what ties it together — blur only shows through 
 window that is not opaque, so a terminal with `opacity = 0.8` is currently the
 only way to see any of it. Beyond that: the workspace model, and per-frame blur
 of actual window content rather than of the wallpaper.
+
+---
+
+## Milestone 9: workspaces, and the brand palette, 2026-08-07
+
+`src/cusk/src/workspace.rs`. `Super+1..9` switches; `Super+Shift+1..9` sends the
+focused window.
+
+**Generic over the element type on purpose.** A `Window` cannot be constructed
+without a live Wayland surface, so a `Workspaces<Window>` would be untestable —
+every bug in switching, moving and removal would have to be found by clicking.
+`Workspaces<u32>` in the tests runs exactly the code the compositor runs, which
+is where 18 of the module's tests come from.
+
+### What is per-workspace, and what is not
+
+Order, tiling mode, layout and focus all belong to a workspace: switching to a
+tiled workspace and back must not leave the other one tiled, and returning
+should put the keyboard where you left it. The layout *engine* stays shared,
+because it is a pure function — only the choice of policy is per-workspace.
+
+Window geometry is deliberately **not** stored here. It already lives in the
+window's own `UserDataMap` from milestone 3, so a window carries its floating
+rectangle across a workspace move for free and there is no second place for
+that rectangle to be wrong.
+
+### Decisions worth naming
+
+- **Hidden windows are unmapped, not parked off-screen.** A window at a huge
+  coordinate is still in the `Space`: it takes part in hit testing, in layout
+  and in "topmost window" queries, so the compositor keeps acting on windows
+  nobody can see.
+- **Switching to the active workspace returns `None`** — not as an
+  optimisation, but because acting on it would unmap and remap everything on
+  screen, flickering and dropping focus for nothing.
+- **Arriving somewhere populated always focuses something**, falling back to
+  the last window. Arriving with no focus makes the keyboard look broken.
+- **A moved window is focused where it lands**, so switching after it puts the
+  keyboard on the thing you just sent.
+- **Removal searches every workspace.** A client can close a window on a
+  workspace nobody is looking at, and a leftover entry would reserve a tile for
+  a window that no longer exists.
+- **Shrinking rehomes windows onto the last surviving workspace.** Losing a
+  window because a number in a config file got smaller would be unrecoverable
+  from inside the session — which is also why `workspaces.count` is `Live`.
+
+### Digits are read unshifted
+
+`Super+Shift+1` produces a different keysym depending on keyboard layout — `!`
+on one, something else on the next. The binding reads the unshifted keysym and
+checks the modifier separately. Matching on the shifted symbol works on one
+layout and silently fails on every other, which is the kind of bug that only
+shows up in someone else's bug report.
+
+### Until there is a panel, the log is the indicator
+
+```
+workspace 3 of 4 (windows on: 1, 3)
+```
+
+Switching to an empty workspace looks exactly like the compositor having hung,
+so it says which ones hold windows.
+
+### The palette is now HadalOS's own
+
+Structure stays niri's — no borders, large radii, low contrast, one accent.
+Colour comes from the launcher icon in `HadalOS_Graphics/Icons/menu_icon.png`:
+a deep-ocean gradient over trench rock with a single cyan glow at the base.
+
+| | |
+|---|---|
+| background | `#08111A` |
+| surface | `#0F1C2B` |
+| accent | `#11C1C6` — the glow |
+
+A desktop whose accent disagrees with its own icon looks like two projects. The
+change was one file, `cusk::theme`, and both binaries picked it up — which is
+the whole reason the palette was moved there in milestone 8.
+
+### Next
+
+The launcher, which is what the icon is for. After that: per-frame blur of real
+window content, and the carried gaps — cursor rendering, `zwp_linux_dmabuf`,
+translucent-client handling.

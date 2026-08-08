@@ -337,6 +337,12 @@ settings! {
         apply: Restart,
         default: false
     },
+    workspace_count: Int {
+        key: "workspaces.count",
+        doc: "How many workspaces exist.",
+        apply: Live,
+        default: 4, min: 1, max: 9
+    },
     mod_key: Choice {
         key: "input.mod-key",
         doc: "The modifier that arms compositor bindings.",
@@ -1109,7 +1115,7 @@ mod-key = \"alt\"
     #[test]
     fn sections_are_in_schema_order_and_unique() {
         let sections = sections();
-        assert_eq!(sections, vec!["layout", "input", "appearance", "commands"]);
+        assert_eq!(sections, vec!["layout", "workspaces", "input", "appearance", "commands"]);
         let unique: std::collections::HashSet<_> = sections.iter().collect();
         assert_eq!(unique.len(), sections.len());
     }
