@@ -1585,9 +1585,43 @@ reaching DRM master:
   This needs its own VT — see --probe-drm.
 ```
 
+### Confirmed from a VT, 2026-08-08
+
+The screen turned HadalOS blue and returned to the console cleanly. The
+riskiest step in the whole backend, and it behaved.
+
+---
+
+## Milestone 19: the tty backend, phase three — a keyboard, 2026-08-08
+
+`--modeset-test` now opens libinput on the session's seat, and **Escape ends it
+early**.
+
+That is two things at once. It proves input reaches the compositor from a VT,
+and it replaces "wait for the watchdog" with a way out that a person can
+choose. The watchdog is still the guarantee; this is the door beside it.
+
+### Decisions
+
+- **libinput is opened through the session**, like the DRM device. It needs
+  `/dev/input/event*`, and logind hands those to whoever holds session control.
+  Opening them directly works as root and nowhere else, and a compositor that
+  needs root to read a keyboard is not one anyone will run.
+- **Opened before master is taken.** A keyboard that cannot be reached then
+  fails while the console is still readable, rather than behind a blue screen.
+- **A missing keyboard is not fatal**, it is reported — `the watchdog is the
+  only way out` — and the test still runs.
+- **Polled at 16ms rather than slept.** A single sleep cannot be interrupted,
+  so Escape would have had nothing to interrupt.
+- **The key report is printed after the mode is restored.** Anything written
+  while the blue screen is up goes to a console nobody can read, which is the
+  same reasoning as restoring before destroying the buffer.
+- **The keys seen are reported, not just "input works".** Those are different
+  claims and only the second is worth making.
+
 ### Next, in order
 
-1. Mode-setting on eDP-1, rendering a single colour, with a hard timeout that
+1. ~~Mode-setting~~ and ~~libinput~~ — done. on eDP-1, rendering a single colour, with a hard timeout that
    restores the VT — the first thing that can strand a screen, so it should be
    unable to strand it for more than a few seconds.
 2. libinput, so there is a keyboard.

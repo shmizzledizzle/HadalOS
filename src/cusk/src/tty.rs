@@ -45,11 +45,13 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use smithay::backend::libinput::LibinputSessionInterface;
 use smithay::backend::session::libseat::LibSeatSession;
 use smithay::backend::session::Session;
 use smithay::reexports::drm::buffer::DrmFourcc;
 use smithay::reexports::drm::control::{connector, crtc, framebuffer, Device as ControlDevice};
 use smithay::reexports::drm::{self, Device as DrmDevice};
+use smithay::reexports::input;
 use smithay::reexports::rustix;
 
 /// A DRM device as found, with whatever could be read from it.
@@ -294,6 +296,7 @@ pub fn modeset(seconds: u64) -> Result<(), String> {
     let (mut session, _notifier) =
         LibSeatSession::new().map_err(|e| format!("could not join a session: {e}\n  \
              This needs its own VT — see --probe-drm."))?;
+    let seat = session.seat();
 
     let path = drm_devices()
         .into_iter()
@@ -366,13 +369,52 @@ pub fn modeset(seconds: u64) -> Result<(), String> {
         std::process::exit(2);
     });
 
-    let result = show_colour(&card, &previous, connector_handle, crtc_handle, mode, seconds);
+    // Opened before master is taken, so a keyboard that cannot be reached
+    // fails while the console is still readable rather than behind a blue
+    // screen.
+    let mut libinput = match open_libinput(&session, &seat) {
+        Ok(libinput) => Some(libinput),
+        Err(e) => {
+            println!("  no keyboard ({e}); the watchdog is the only way out");
+            None
+        }
+    };
+
+    let result = show_colour(
+        &card,
+        &previous,
+        connector_handle,
+        crtc_handle,
+        mode,
+        seconds,
+        libinput.as_mut(),
+    );
 
     // The ordinary path out. The watchdog will also do this if it gets there
     // first; `set_crtc` twice with the same arguments is harmless.
     previous.restore(&card);
     let _ = card.release_master_lock();
+
+    KEYS.with(|slot| {
+        if let Some((keys, escaped)) = slot.borrow_mut().take() {
+            if escaped {
+                println!("  escape pressed — ended early");
+            }
+            match keys.len() {
+                0 => println!("  no key events arrived (was anything typed?)"),
+                n => println!("  {n} key press(es) seen, codes: {keys:?}"),
+            }
+        }
+    });
     result
+}
+
+thread_local! {
+    /// Carries what the input loop saw out to where it can be printed, which
+    /// is after the mode is restored — anything written while the blue screen
+    /// is up is written to a console nobody can read.
+    static KEYS: std::cell::RefCell<Option<(Vec<u32>, bool)>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 fn show_colour(
@@ -382,6 +424,7 @@ fn show_colour(
     crtc: crtc::Handle,
     mode: drm::control::Mode,
     seconds: u64,
+    mut libinput: Option<&mut input::Libinput>,
 ) -> Result<(), String> {
     card.acquire_master_lock()
         .map_err(|e| format!("could not become DRM master: {e}\n  \
@@ -416,7 +459,24 @@ fn show_colour(
         .map_err(|e| format!("could not set the mode: {e}"));
 
     if outcome.is_ok() {
-        std::thread::sleep(std::time::Duration::from_secs(seconds));
+        // Polled rather than slept, so Escape can end it early. The watchdog
+        // is still the guarantee; this is the way out that does not require
+        // waiting for one.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(seconds);
+        let mut keys = Vec::new();
+        let mut escaped = false;
+        while std::time::Instant::now() < deadline {
+            if let Some(libinput) = libinput.as_deref_mut() {
+                if pump(libinput, &mut keys) {
+                    escaped = true;
+                    break;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(16));
+        }
+        // Printed after the mode is restored, further down, so it lands on a
+        // console that can be read.
+        KEYS.with(|slot| *slot.borrow_mut() = Some((keys, escaped)));
     }
 
     // Put the old mode back before tearing down the buffer it might otherwise
@@ -425,4 +485,51 @@ fn show_colour(
     let _ = card.destroy_framebuffer(fb);
     let _ = card.destroy_dumb_buffer(buffer);
     outcome
+}
+
+// ── phase three: a keyboard ──────────────────────────────────────────────
+
+/// Escape, in evdev codes. `KEY_ESC` is 1 and has been since Linux 1.0.
+const KEY_ESC: u32 = 1;
+
+/// Open libinput on this session's seat.
+///
+/// Through the session, like the DRM device: libinput needs `/dev/input/event*`
+/// open, and logind hands those out to the session that holds control. Opening
+/// them directly works as root and nowhere else, and a compositor that needs
+/// root to read a keyboard is not a compositor anyone will run.
+fn open_libinput(session: &LibSeatSession, seat: &str) -> Result<input::Libinput, String> {
+    let mut libinput = input::Libinput::new_with_udev(LibinputSessionInterface::from(
+        session.clone(),
+    ));
+    libinput
+        .udev_assign_seat(seat)
+        .map_err(|_| format!("libinput could not take seat {seat}"))?;
+    Ok(libinput)
+}
+
+/// Drain libinput, reporting whether Escape was pressed.
+///
+/// Returns the keys seen as well, because "input works" and "input works *and
+/// the right key arrived*" are different claims and only the second is worth
+/// making.
+fn pump(libinput: &mut input::Libinput, keys: &mut Vec<u32>) -> bool {
+    use input::event::keyboard::KeyboardEventTrait;
+    use input::event::{Event, KeyboardEvent};
+
+    if libinput.dispatch().is_err() {
+        return false;
+    }
+    let mut escape = false;
+    for event in &mut *libinput {
+        if let Event::Keyboard(KeyboardEvent::Key(key)) = event {
+            if key.key_state() == input::event::keyboard::KeyState::Pressed {
+                keys.push(key.key());
+                if key.key() == KEY_ESC {
+                    escape = true;
+                }
+            }
+        }
+    }
+    escape
 }
