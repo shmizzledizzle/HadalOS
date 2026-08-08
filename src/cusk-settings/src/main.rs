@@ -28,7 +28,8 @@ use std::time::Duration;
 use cusk::config::{self, Complaint, Config, Kind, Setting, Value};
 use cusk::toml_edit::DocumentMut;
 use iced::widget::{
-    button, column, container, pick_list, row, scrollable, slider, space, text, toggler,
+    button, column, container, pick_list, row, scrollable, slider, space, text, text_input,
+    toggler,
 };
 use iced::{Element, Fill, Length, Subscription, Task};
 
@@ -329,6 +330,26 @@ impl App {
                     .on_toggle(move |v| Message::SetNow(key, Value::Bool(v)))
                     .style(style::toggler_style)
                     .into()
+            }
+            Kind::Text { .. } => {
+                let current = match value {
+                    Value::Text(v) => v.clone(),
+                    _ => String::new(),
+                };
+                column![
+                    text_input("", &current)
+                        .on_input(move |v| Message::Dragged(key, Value::Text(v)))
+                        // Committed on Enter, not per keystroke. Writing the
+                        // file on every character would have the compositor
+                        // trying to load "/home/u", "/home/us", "/home/use"
+                        // and warning about each one.
+                        .on_submit(Message::Commit(key))
+                        .padding([8, 12])
+                        .style(style::input_style),
+                    text("Press Enter to apply").size(11).color(style::TEXT_DIM),
+                ]
+                .spacing(5)
+                .into()
             }
             Kind::Choice { options, .. } => {
                 let choices: Vec<String> = options.iter().map(|o| o.to_string()).collect();

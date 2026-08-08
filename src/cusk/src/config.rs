@@ -367,6 +367,18 @@ settings! {
         apply: Live,
         default: 24, min: 0, max: 120
     },
+    corner_radius: Int {
+        key: "appearance.corner-radius",
+        doc: "Rounding of window corners, in pixels.",
+        apply: Live,
+        default: 12, min: 0, max: 32
+    },
+    ring_width: Int {
+        key: "appearance.focus-ring",
+        doc: "Thickness of the ring around the focused window. Zero hides it.",
+        apply: Live,
+        default: 2, min: 0, max: 8
+    },
     blur_passes: Int {
         key: "appearance.blur-passes",
         doc: "Box-blur passes. Three approximates a Gaussian closely.",

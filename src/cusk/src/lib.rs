@@ -10,6 +10,7 @@
 //! binary. They are about running a session, and nothing outside one needs them.
 
 pub mod config;
+pub mod theme;
 
 /// Re-exported so the settings editor edits documents with *this* version of
 /// `toml_edit`. Two crates each depending on it separately can drift onto

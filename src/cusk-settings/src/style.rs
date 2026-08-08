@@ -18,6 +18,7 @@
 //! anything. Retuning the aesthetic should be editing this file, not hunting
 //! literals through a UI tree.
 
+use cusk::theme as tokens;
 use iced::border;
 use iced::widget::{button, container, pick_list, scrollable, slider, toggler};
 use iced::{Background, Border, Color, Shadow, Theme, Vector};
@@ -26,32 +27,30 @@ use iced::{Background, Border, Color, Shadow, Theme, Vector};
 
 /// Window background. Near-black with a purple cast — flat black reads as a
 /// terminal, and neutral grey reads as a stock toolkit.
-pub const BG: Color = rgb(0x17, 0x17, 0x1F);
+pub const BG: Color = token(tokens::BG);
 /// Cards and controls sitting on the background.
-pub const SURFACE: Color = rgb(0x23, 0x23, 0x31);
+pub const SURFACE: Color = token(tokens::SURFACE);
 /// Hover and selected states.
-pub const SURFACE_HI: Color = rgb(0x2E, 0x2E, 0x40);
+pub const SURFACE_HI: Color = token(tokens::SURFACE_HI);
 /// Recessed fills — pickers, menus, anything that should read as *into* the
 /// surface rather than on top of it. Darker than the card, which is how both
 /// references indicate an input.
-pub const INSET: Color = rgb(0x1E, 0x1E, 0x2A);
-pub const TEXT: Color = rgb(0xE6, 0xE5, 0xF2);
+pub const INSET: Color = token(tokens::INSET);
+pub const TEXT: Color = token(tokens::TEXT);
 /// Descriptions and units. Muted enough to recede, light enough to read.
-pub const TEXT_DIM: Color = rgb(0x9B, 0x9A, 0xB8);
+pub const TEXT_DIM: Color = token(tokens::TEXT_DIM);
 /// Periwinkle, between niri's `#A3C9FD` and KaOS's `#8189B9`. One accent
 /// carries every piece of emphasis in both references; a second colour would
 /// immediately read as a different design.
-pub const ACCENT: Color = rgb(0xA3, 0xB4, 0xE8);
-pub const DANGER: Color = rgb(0xE8, 0x89, 0x9B);
-pub const WARNING: Color = rgb(0xE8, 0xC0, 0x8A);
+pub const ACCENT: Color = token(tokens::ACCENT);
+pub const DANGER: Color = token(tokens::DANGER);
+pub const WARNING: Color = token(tokens::WARNING);
 
-const fn rgb(r: u8, g: u8, b: u8) -> Color {
-    Color {
-        r: r as f32 / 255.0,
-        g: g as f32 / 255.0,
-        b: b as f32 / 255.0,
-        a: 1.0,
-    }
+/// Shared with the compositor, which draws window chrome from the same
+/// numbers. A private copy here would drift, and the drift would show as a
+/// focus ring that does not match the accent in the window that sets it.
+const fn token(c: tokens::Rgba) -> Color {
+    Color { r: c[0], g: c[1], b: c[2], a: c[3] }
 }
 
 fn alpha(color: Color, a: f32) -> Color {
@@ -249,6 +248,22 @@ pub fn pick_style(_theme: &Theme, status: pick_list::Status) -> pick_list::Style
             width: 0.0,
             radius: border::Radius::new(RADIUS_CONTROL),
         },
+    }
+}
+
+pub fn input_style(_theme: &Theme, status: iced::widget::text_input::Status) -> iced::widget::text_input::Style {
+    let active = !matches!(status, iced::widget::text_input::Status::Active);
+    iced::widget::text_input::Style {
+        background: Background::Color(INSET),
+        border: Border {
+            color: if active { alpha(ACCENT, 0.5) } else { Color::TRANSPARENT },
+            width: if active { 1.0 } else { 0.0 },
+            radius: border::Radius::new(RADIUS_CONTROL),
+        },
+        icon: TEXT_DIM,
+        placeholder: TEXT_DIM,
+        value: TEXT,
+        selection: alpha(ACCENT, 0.35),
     }
 }
 

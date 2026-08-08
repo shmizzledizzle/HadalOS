@@ -26,6 +26,9 @@ configured with KDE's discoverability and Hyprland's reach.
 | Visual language | sampled from niri/KaOS: purple slate, periwinkle, no borders | 2026-08-07 |
 | Blur | CPU, on a static wallpaper, computed once — not a per-frame shader | 2026-08-07 |
 | Backdrop cache | split: decode+scale keyed apart from blur radius | 2026-08-07 |
+| Rounded corners | painted back with the wallpaper, not clipped from the window | 2026-08-07 |
+| Chrome shaders | degrade to square corners rather than refusing to start | 2026-08-07 |
+| Palette | `cusk::theme`, shared by compositor and editor — never copied | 2026-08-07 |
 
 ## 1. This reverses ARCHITECTURE.md §0
 
@@ -829,3 +832,86 @@ putting an upper window's patch on top of a lower window.
 Window chrome — rounded corners and focus rings, adopting the settings app's
 `style.rs` tokens. That plus translucent clients is what makes the reference
 look land; blur only shows through a window that is not opaque.
+
+---
+
+## Milestone 8: window chrome, 2026-08-07
+
+`src/cusk/src/chrome.rs`, and `src/cusk/src/theme.rs` — the palette, now shared.
+
+Two visual moves, drawn by different mechanisms because they are different
+problems.
+
+### Rounded corners are subtractive
+
+A client draws a rectangle and the compositor cannot ask it not to. Clipping
+the window's own texture would mean routing every surface through a custom
+shader, which means reimplementing what `render_elements_from_surface_tree`
+already does for subsurfaces and popups.
+
+So the corners are **painted back over**: after a window is drawn, four small
+quads of the sharp wallpaper go on top of its square corners, through a texture
+shader that keeps only the sliver lying outside the corner arc. The window
+appears rounded and what shows through is the desktop behind it — which is what
+a rounded corner *is*.
+
+This only works because `wallpaper::load_scaled` produces a texture at exactly
+the output size: a screen rectangle is its own source crop, so the shader
+recovers a pixel's screen position from its texture coordinate and there is no
+second coordinate space to get wrong. The decision in milestone 7 to keep both
+backdrop textures output-sized paid for itself here.
+
+Four small patches rather than one window-sized quad. The shader is cheap, but
+on a software rasteriser a full-window fragment pass per window per frame is a
+real cost where four 12x12 patches is not.
+
+### Focus rings are additive
+
+Nothing needs removing, so the ring is one quad in the band *outside* the
+window, with a signed-distance field picking out the area between two rounded
+rectangles. It never covers window content — a focus ring that dims the edge of
+the thing it is highlighting is worse than no ring. Its radius is the window's
+plus the width it sits outside of, or the ring and the corner visibly drift
+apart.
+
+### Both degrade rather than fail
+
+Shader compilation can fail on an old driver or a strict ES parser. Neither
+program is load-bearing: a failure is reported once, left as `None`, and cusk
+runs with square corners and no ring. A compositor that refuses to start
+because it could not round a corner is a worse outcome than one that looks
+plainer than intended. Both compile on llvmpipe.
+
+### The stated limitation, stated out loud
+
+Rounding paints the wallpaper back, so **with no wallpaper set the corners stay
+square**. That is a surprising thing to discover in silence, so cusk says it
+once:
+
+```
+INFO corner-radius needs appearance.wallpaper: corners are rounded by
+     painting the wallpaper back over them
+```
+
+### The palette is now shared, not copied
+
+`cusk::theme` holds the sampled tokens and both binaries read them: the editor
+styles its widgets from them, the compositor draws its focus ring from them. A
+private copy in each would drift, and the drift would show up as a focus ring
+that does not match the accent in the settings window that sets it.
+
+### The schema caught its own gap
+
+Adding `Kind::Text` for the wallpaper path made the settings editor stop
+compiling: `non-exhaustive patterns: Kind::Text { .. } not covered`. That is
+the design working — a new setting type cannot be added to the compositor and
+silently go unrendered in the GUI. Text fields commit on Enter rather than per
+keystroke, or the compositor would try to load `/home/u`, `/home/us`,
+`/home/use` and warn about each.
+
+### Next
+
+Translucent client support is what ties it together — blur only shows through a
+window that is not opaque, so a terminal with `opacity = 0.8` is currently the
+only way to see any of it. Beyond that: the workspace model, and per-frame blur
+of actual window content rather than of the wallpaper.

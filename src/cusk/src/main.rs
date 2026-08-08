@@ -24,6 +24,7 @@
 
 use cusk::config;
 
+mod chrome;
 mod floating;
 mod geometry;
 mod layout;
@@ -1063,6 +1064,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pointer = state.seat.add_pointer();
 
     let mut backdrop: Option<Backdrop> = None;
+    let mut chrome: Option<chrome::Chrome> = None;
+    let mut warned_square_corners = false;
     let mut watcher = config::Watcher::new(config_path.clone());
     let mut current = cfg.clone();
 
@@ -1390,6 +1393,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         {
             let (renderer, mut framebuffer) = backend.bind()?;
 
+            // Compiled on the first frame rather than at startup, because it
+            // needs a current GL context and the renderer only has one here.
+            let chrome = chrome.get_or_insert_with(|| chrome::Chrome::new(renderer));
+
             // Rebuild the backdrop only when something it depends on changes.
             // Preparing costs a decode, two resizes and six blur passes, which
             // is fine once and unacceptable per frame.
@@ -1416,8 +1423,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // patch can be drawn immediately beneath it. A single flat list
             // would force every patch to be drawn before every window, and the
             // patch of an upper window would then sit on top of a lower one.
-            let mut layers: Vec<(Rectangle<i32, Logical>, Vec<WaylandSurfaceRenderElement<GlesRenderer>>)> =
-                Vec::new();
+            let mut layers: Vec<(
+                Rectangle<i32, Logical>,
+                bool,
+                Vec<WaylandSurfaceRenderElement<GlesRenderer>>,
+            )> = Vec::new();
             for window in state.space.elements() {
                 let Some(loc) = state.space.element_location(window) else { continue };
                 let Some(surface) = window.toplevel().map(|t| t.wl_surface().clone()) else {
@@ -1431,7 +1441,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     1.0,
                     Kind::Unspecified,
                 );
-                layers.push((Rectangle::new(loc, window.geometry().size), elements));
+                let focused = state.focused.as_ref() == Some(window);
+                layers.push((Rectangle::new(loc, window.geometry().size), focused, elements));
             }
 
             let mut frame = renderer.render(&mut framebuffer, size, Transform::Flipped180)?;
@@ -1459,7 +1470,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // `draw_render_elements` expects for a combined list, and the
             // reason the previous flattened version stacked windows upside
             // down whenever two of them overlapped.
-            for (rect, elements) in &layers {
+            for (rect, focused, elements) in &layers {
                 if let Some(backdrop) = &backdrop {
                     if current.blur {
                         // Both textures are output-sized, so a window's
@@ -1479,6 +1490,46 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 draw_render_elements(&mut frame, 1.0, elements, &[damage])?;
+
+                // Corners are painted back over the window that was just
+                // drawn, so they must come after it and before the next one —
+                // another reason the per-window loop replaced a flat list.
+                //
+                // Clamped to half the shorter side: at any more than that,
+                // opposite corner patches overlap and erase the middle of the
+                // window.
+                let radius = current
+                    .corner_radius
+                    .min(rect.size.w / 2)
+                    .min(rect.size.h / 2)
+                    .max(0);
+                match &backdrop {
+                    Some(backdrop) => {
+                        chrome.round_corners(&mut frame, &backdrop.sharp, *rect, radius, logical_size)
+                    }
+                    // Rounding works by painting the wallpaper back over the
+                    // square corner, so with no wallpaper there is nothing to
+                    // paint and corners stay square. Said once, because
+                    // "I set corner-radius and nothing happened" is otherwise
+                    // a mystery with no evidence anywhere.
+                    None if radius > 0 && !warned_square_corners => {
+                        warned_square_corners = true;
+                        tracing::info!(
+                            "corner-radius needs appearance.wallpaper: corners are rounded by \
+                             painting the wallpaper back over them"
+                        );
+                    }
+                    None => {}
+                }
+                if *focused {
+                    chrome.focus_ring(
+                        &mut frame,
+                        *rect,
+                        radius,
+                        current.ring_width,
+                        cusk::theme::ACCENT,
+                    );
+                }
             }
 
             let _sync = frame.finish()?;
