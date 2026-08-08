@@ -36,6 +36,7 @@ configured with KDE's discoverability and Hyprland's reach.
 | Overlay windows | recognised by app id, classified on first commit not on create | 2026-08-07 |
 | Cursor | drawn in code, not loaded from an XCursor theme | 2026-08-07 |
 | dmabuf | v4 with feedback — v3 alone leaves clients unable to find a GPU | 2026-08-07 |
+| Window blur | scene built back to front offscreen; each window blurs what precedes it | 2026-08-07 |
 
 ## 1. This reverses ARCHITECTURE.md §0
 
@@ -1245,3 +1246,62 @@ found by running the thing and reading the output, not by re-reading the code.
 Per-frame blur of real window content is now genuinely available — the GPU was
 never the obstacle it was assumed to be. Also outstanding: a panel for the
 workspace indicator, and translucent-client handling.
+
+---
+
+## Milestone 13: per-frame blur, 2026-08-07
+
+`src/cusk/src/gpublur.rs`, behind `appearance.window-blur`, **default off**.
+
+Milestone 7 blurs the wallpaper. That is most of the effect for none of the
+cost, and it is a lie the moment two windows overlap: the top one shows blurred
+wallpaper where the window underneath should be. This blurs the composited
+scene instead, on the GPU, every frame.
+
+### Assembled in order, not blurred all at once
+
+The obvious version — composite everything, blur it, draw the windows over the
+result — is wrong in a way that looks like a feedback loop, because a window's
+own pixels are in the blur behind it.
+
+So the scene is built back to front into an offscreen texture, and each window
+blurs the texture **as it stands before that window is drawn**. What ends up
+behind a window is exactly what is behind it. That ordering is the entire
+design; everything else is plumbing.
+
+### Safe API, not raw GL
+
+`GlesFrame::with_context` hands out the raw context, and smithay is explicit
+that anything changed there must be restored or the renderer misbehaves far
+from the cause. `Offscreen::create_buffer` and `Bind::bind` do the same job
+through the API the renderer maintains — no state to restore, no unsafe block.
+
+The awkward part is ownership: blurring needs the scene texture *inside* the
+struct while drawing needs it *outside*. It is handed back and forth through
+`take_scene`/`put_scene` rather than borrowed, because any other arrangement is
+two mutable borrows of one struct.
+
+### Off by default, and that is the point
+
+This is a downsample plus up to six blur steps **per blurring window, per
+frame**, replacing something that cost nothing. It is also the most invasive
+change the render loop has taken. With the flag off the old path runs
+unchanged, byte for byte; with it on, a wrong result is one setting away from
+being undone rather than a compositor that will not start.
+
+The shader failing to compile disables the feature and leaves the wallpaper
+blur, like the chrome shaders before it.
+
+### Verified, and what is not
+
+Runs clean both ways: 0 GL errors, 0 shader failures, windows mapping normally,
+with blur off and on. **Correctness of the image is not verified** — the
+transform in particular. Offscreen passes render `Transform::Normal` and the
+output transform is applied once, at the final blit; applying it twice would
+put the desktop upside down, and applying it zero times would too. That is
+reasoned, not seen.
+
+### Next
+
+A panel for the workspace indicator, and translucent-client handling — blur of
+either kind is only visible through a window that is not opaque.

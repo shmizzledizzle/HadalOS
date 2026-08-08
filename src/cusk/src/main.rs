@@ -28,6 +28,7 @@ mod chrome;
 mod cursor;
 mod floating;
 mod geometry;
+mod gpublur;
 mod layout;
 mod tiling;
 mod wallpaper;
@@ -46,7 +47,7 @@ use smithay::backend::renderer::element::Kind;
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
 use smithay::backend::renderer::utils::{draw_render_elements, on_commit_buffer_handler};
-use smithay::backend::renderer::{Color32F, Frame, ImportMem, Renderer};
+use smithay::backend::renderer::{Bind, Color32F, Frame, ImportMem, Renderer};
 use smithay::backend::winit::{self, WinitEvent};
 use smithay::desktop::{Space, Window, WindowSurfaceType};
 use smithay::backend::input::KeyState;
@@ -1325,6 +1326,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The last backdrop key that failed to build, so it is not retried every frame.
     let mut refused: Option<BackdropKey> = None;
     let mut chrome: Option<chrome::Chrome> = None;
+    let mut blur: Option<gpublur::GpuBlur> = None;
     let pointer_image = cursor::arrow(24);
     let mut pointer_texture: Option<GlesTexture> = None;
     let mut warned_square_corners = false;
@@ -1762,6 +1764,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Compiled on the first frame rather than at startup, because it
             // needs a current GL context and the renderer only has one here.
             let chrome = chrome.get_or_insert_with(|| chrome::Chrome::new(renderer));
+            let blur = match &mut blur {
+                Some(blur) => blur,
+                slot => slot.insert(gpublur::GpuBlur::new(renderer)),
+            };
 
             // Rebuild the backdrop only when something it depends on changes.
             // Preparing costs a decode, two resizes and six blur passes, which
@@ -1876,9 +1882,132 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 pointer_texture = upload(renderer, &pointer_image.image);
             }
 
+            // Window blur assembles the scene in an offscreen texture so each
+            // window can blur what is behind it *before* it is drawn. Off by
+            // default: it is a blur chain per window per frame, where the
+            // wallpaper blur it replaces costs nothing.
+            let live_blur = current.window_blur
+                && backdrop.is_some()
+                && blur.begin(renderer, (size.w, size.h));
+
+            if live_blur {
+                // Held in an `Option` and handed back and forth with `blur`,
+                // because blurring needs the texture inside the struct while
+                // drawing needs it outside. Anything else is two mutable
+                // borrows of one struct.
+                let mut held = blur.take_scene();
+                if let Some(scene) = held.as_mut() {
+                    // The wallpaper, into the scene rather than the screen.
+                    {
+                        let mut target = renderer.bind(scene)?;
+                        let mut f = renderer.render(&mut target, size, Transform::Normal)?;
+                        f.clear(Color32F::new(0.03, 0.07, 0.10, 1.0), &[damage])?;
+                        if let Some(backdrop) = &backdrop {
+                            let whole = Rectangle::from_size(logical_size);
+                            Frame::render_texture_from_to(
+                                &mut f,
+                                &backdrop.sharp,
+                                texture_src(whole),
+                                Rectangle::from_size(size),
+                                &[damage],
+                                &[],
+                                Transform::Normal,
+                                1.0,
+                            )?;
+                        }
+                        let _ = f.finish();
+                    }
+
+                    for (rect, focused, elements) in &layers {
+                        let dst = to_physical(*rect);
+
+                        // Blur the scene as it stands — which is everything
+                        // behind this window and nothing in front, because the
+                        // scene is being built back to front.
+                        if let Some(scene) = held.take() {
+                            blur.put_scene(scene);
+                        }
+                        let has_blur = blur
+                            .blur_scene(renderer, current.blur_radius, current.blur_passes as u32)
+                            .is_some();
+                        held = blur.take_scene();
+                        let Some(scene) = held.as_mut() else { break };
+
+                        if has_blur {
+                            if let Some(blurred) = blur.blurred() {
+                                let mut target = renderer.bind(scene)?;
+                                let mut f =
+                                    renderer.render(&mut target, size, Transform::Normal)?;
+                                let _ = Frame::render_texture_from_to(
+                                    &mut f,
+                                    blurred,
+                                    gpublur::GpuBlur::half_src(dst),
+                                    dst,
+                                    &[damage],
+                                    &[],
+                                    Transform::Normal,
+                                    1.0,
+                                );
+                                let _ = f.finish();
+                            }
+                        }
+
+                        let mut target = renderer.bind(scene)?;
+                        let mut f = renderer.render(&mut target, size, Transform::Normal)?;
+                        draw_render_elements(&mut f, 1.0, elements, &[damage])?;
+
+                        let radius = current
+                            .corner_radius
+                            .min(rect.size.w / 2)
+                            .min(rect.size.h / 2)
+                            .max(0);
+                        if let Some(backdrop) = &backdrop {
+                            chrome.round_corners(&mut f, &backdrop.sharp, *rect, radius, logical_size);
+                        }
+                        if *focused {
+                            chrome.focus_ring(
+                                &mut f,
+                                *rect,
+                                radius,
+                                current.ring_width,
+                                cusk::theme::ACCENT,
+                            );
+                        }
+                        let _ = f.finish();
+                    }
+
+                }
+                if let Some(scene) = held {
+                    blur.put_scene(scene);
+                }
+            }
+
             let mut frame = renderer.render(&mut framebuffer, size, Transform::Flipped180)?;
             frame.clear(Color32F::new(0.05, 0.06, 0.09, 1.0), &[damage])?;
 
+            if live_blur {
+                // Everything was composited offscreen; one blit brings it to
+                // the screen. The output transform is applied here and only
+                // here — the offscreen passes all render `Normal`, so applying
+                // it twice would put the desktop back upside down.
+                if let Some(scene) = blur.scene_ref() {
+                    Frame::render_texture_from_to(
+                        &mut frame,
+                        scene,
+                        Rectangle::<f64, smithay::utils::Buffer>::from_size(Size::from((
+                            size.w as f64,
+                            size.h as f64,
+                        ))),
+                        Rectangle::from_size(size),
+                        &[damage],
+                        &[],
+                        Transform::Normal,
+                        1.0,
+                    )?;
+                }
+            }
+
+            if !live_blur {
             if let Some(backdrop) = &backdrop {
                 let whole = Rectangle::from_size(logical_size);
                 // Called through the trait explicitly: `GlesFrame` has an
@@ -1963,6 +2092,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
+
+            }
 
             // The pointer is drawn last, over everything including the focus
             // ring. A cursor that can be covered by a window is a cursor you

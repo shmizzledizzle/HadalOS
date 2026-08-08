@@ -373,6 +373,12 @@ settings! {
         apply: Live,
         default: 24, min: 0, max: 120
     },
+    window_blur: Bool {
+        key: "appearance.window-blur",
+        doc: "Blur what is actually behind a window, not just the wallpaper. Costs a blur per window per frame.",
+        apply: Live,
+        default: false
+    },
     corner_radius: Int {
         key: "appearance.corner-radius",
         doc: "Rounding of window corners, in pixels.",
