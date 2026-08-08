@@ -23,6 +23,9 @@
 //! costs a reboot.
 
 mod floating;
+mod geometry;
+mod layout;
+mod tiling;
 
 use std::sync::Arc;
 
@@ -39,7 +42,24 @@ use smithay::backend::renderer::utils::{draw_render_elements, on_commit_buffer_h
 use smithay::backend::renderer::{Color32F, Frame, Renderer};
 use smithay::backend::winit::{self, WinitEvent};
 use smithay::desktop::{Space, Window, WindowSurfaceType};
-use smithay::input::keyboard::{FilterResult, ModifiersState};
+use smithay::backend::input::KeyState;
+use smithay::input::keyboard::{FilterResult, Keysym, ModifiersState};
+use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
+
+/// A compositor-level binding, returned from the keyboard filter so the event
+/// loop can act on it after the borrow of the seat ends.
+#[derive(Debug, Clone, Copy)]
+enum Binding {
+    ToggleMaximize,
+    ToggleTiling,
+    ToggleFloating,
+    CycleLayout,
+    Widen(i32),
+    Spawn,
+    FocusStep(isize),
+    MoveInOrder(isize),
+    Promote,
+}
 use smithay::input::pointer::{ButtonEvent, GrabStartData, MotionEvent};
 use smithay::input::{Seat, SeatHandler, SeatState};
 use smithay::reexports::wayland_server::protocol::wl_buffer;
@@ -47,7 +67,7 @@ use smithay::reexports::wayland_server::protocol::wl_seat;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::backend::{ClientData, ClientId, DisconnectReason};
 use smithay::reexports::wayland_server::{Client, Display, ListeningSocket};
-use smithay::utils::{Point, Rectangle, Serial, Transform, SERIAL_COUNTER};
+use smithay::utils::{Point, Rectangle, Serial, Size, Transform, SERIAL_COUNTER};
 use smithay::wayland::buffer::BufferHandler;
 use smithay::wayland::compositor::{
     with_surface_tree_downward, CompositorClientState, CompositorHandler, CompositorState,
@@ -137,6 +157,29 @@ struct Cusk {
     modifiers: ModifiersState,
     /// Which modifier arms those bindings.
     mod_key: ModKey,
+
+    /// Tile order, oldest first.
+    ///
+    /// Deliberately *not* `space.elements()`, which is stacking order and
+    /// changes every time a window is raised. Tiling off stacking order means
+    /// clicking a window reshuffles the whole layout under the pointer — the
+    /// window you clicked jumps somewhere else as you click it.
+    order: Vec<Window>,
+    /// The window that has keyboard focus.
+    ///
+    /// Tracked explicitly rather than read back as topmost-in-stacking-order.
+    /// That equivalence holds only because focusing raises, and it silently
+    /// stops holding the moment anything else raises a window — at which point
+    /// every keyboard binding starts acting on the wrong window.
+    focused: Option<Window>,
+    /// Whether the workspace tiles. §3's "two policies over the same window
+    /// set": the set is `order`, and this picks the policy applied to it.
+    tiling: bool,
+    layout: layout::Layout,
+    gaps: layout::Gaps,
+    /// Current output size in logical coordinates, kept so relayout does not
+    /// need the render loop to hand it over.
+    output_size: (i32, i32),
 }
 
 // ── protocol handlers ────────────────────────────────────────────────────
@@ -208,7 +251,25 @@ impl XdgShellHandler for Cusk {
             toplevel.send_configure();
         }
         tracing::info!("mapped toplevel at {location:?}");
+        // Give the window a floating rectangle from birth, so maximise-first
+        // has somewhere to restore to instead of silently doing nothing.
+        geometry::remember(&self.space, &window);
+
+        // A toplevel with a parent is a dialog. §3's floating exception: tiling
+        // one is always wrong, so it is applied from the protocol rather than
+        // waiting for the user to notice a file chooser has become a tile.
+        let is_dialog = window
+            .toplevel()
+            .and_then(|t| t.parent())
+            .is_some();
+        if is_dialog {
+            geometry::set_exempt(&window, true);
+            tracing::info!("dialog exempted from tiling");
+        }
+
+        self.order.push(window.clone());
         self.focus(&window);
+        self.relayout();
     }
 
     /// A client asking to be dragged — a CSD titlebar. Honoured with the same
@@ -261,14 +322,20 @@ impl XdgShellHandler for Cusk {
             .cloned();
         if let Some(window) = gone {
             self.space.unmap_elem(&window);
+            // Drop it from the tile order too, or the layout keeps reserving a
+            // column for a window that no longer exists — a gap that looks
+            // like a rendering fault rather than stale bookkeeping.
+            self.order.retain(|w| w != &window);
             tracing::info!("toplevel destroyed");
         }
+        self.relayout();
         // Focus does not survive its window. Leaving a dead surface focused
         // sends keystrokes nowhere and looks like the keyboard has died.
         let next = self.space.elements().next_back().cloned();
         match next {
             Some(w) => self.focus(&w),
             None => {
+                self.focused = None;
                 if let Some(kb) = self.seat.get_keyboard() {
                     kb.set_focus(self, None, Serial::from(0));
                 }
@@ -357,6 +424,18 @@ impl Cusk {
         // Info, not debug. Whether a gesture was *recognised* is the first
         // question when nothing visibly happens, and requiring RUST_LOG to
         // answer it means the answer arrives one run too late.
+        // The gesture is the same; what it means is not. A tiled window has no
+        // position of its own to change, so dragging it reorders instead.
+        if self.is_tiled(&window) {
+            tracing::info!("swap grab started");
+            let grab = tiling::SwapGrab {
+                start_data: self.grab_start(button),
+                window,
+            };
+            pointer.set_grab(self, grab, SERIAL_COUNTER.next_serial(), smithay::input::pointer::Focus::Clear);
+            return;
+        }
+
         tracing::info!("move grab started at {initial:?}");
         let grab = floating::MoveGrab {
             start_data: self.grab_start(button),
@@ -373,6 +452,16 @@ impl Cusk {
         edges: smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::ResizeEdge,
     ) {
         let Some(pointer) = self.seat.get_pointer() else { return };
+
+        // A tile cannot be resized alone — its neighbours must yield the space
+        // — so the gesture drags the divider rather than one window's edge.
+        if self.is_tiled(&window) {
+            tracing::info!("ratio grab started");
+            let grab = tiling::RatioGrab { start_data: self.grab_start(button) };
+            pointer.set_grab(self, grab, SERIAL_COUNTER.next_serial(), smithay::input::pointer::Focus::Clear);
+            return;
+        }
+
         let rect = floating::window_rect(&self.space, &window);
         tracing::info!("resize grab started, edge {edges:?}, from {:?}", rect.size);
         if let Some(toplevel) = window.toplevel() {
@@ -393,12 +482,225 @@ impl Cusk {
         pointer.set_grab(self, grab, SERIAL_COUNTER.next_serial(), smithay::input::pointer::Focus::Clear);
     }
 
+    /// Move keyboard focus to the next or previous window.
+    ///
+    /// Cycles `order`, not stacking order. Stacking order is a most-recently-
+    /// used list, so cycling it walks back and forth between the same two
+    /// windows instead of touring them all.
+    fn focus_step(&mut self, delta: isize) {
+        let windows = self.order.clone();
+        if windows.is_empty() {
+            return;
+        }
+        let current = self
+            .focused
+            .as_ref()
+            .and_then(|f| windows.iter().position(|w| w == f))
+            .unwrap_or(0);
+        let next = layout::step(windows.len(), current, delta);
+        self.focus(&windows[next]);
+        tracing::info!("focus {} of {}", next + 1, windows.len());
+    }
+
+    /// Move the focused window earlier or later in the tile order.
+    fn move_in_order(&mut self, delta: isize) {
+        let Some(focused) = self.focused.clone() else { return };
+        let Some(from) = self.order.iter().position(|w| w == &focused) else { return };
+        if self.order.len() < 2 {
+            return;
+        }
+        let to = layout::step(self.order.len(), from, delta);
+        self.order.swap(from, to);
+        tracing::info!("moved window from {from} to {to}");
+        self.relayout();
+    }
+
+    /// Make the focused window the master.
+    ///
+    /// Swap rather than remove-and-insert: promoting sends the old master to
+    /// where the promoted window was, so pressing it twice returns to the
+    /// arrangement you started from. Shifting everything down instead makes
+    /// the gesture irreversible, and there is no undo in a window manager.
+    fn promote(&mut self) {
+        let Some(focused) = self.focused.clone() else { return };
+        let Some(from) = self.order.iter().position(|w| w == &focused) else { return };
+        if from == 0 {
+            return;
+        }
+        self.order.swap(0, from);
+        tracing::info!("promoted window {from} to master");
+        self.relayout();
+    }
+
+    /// Whether the layout currently owns this window's geometry.
+    ///
+    /// Both halves matter: tiling can be off, and an individual window can be
+    /// exempt from it while it is on.
+    fn is_tiled(&self, window: &Window) -> bool {
+        self.tiling && !geometry::is_exempt(window)
+    }
+
+    /// The windows the layout is entitled to place, in stable order.
+    pub fn tiled(&self) -> Vec<Window> {
+        self.order
+            .iter()
+            .filter(|w| !geometry::is_exempt(w))
+            .cloned()
+            .collect()
+    }
+
+    /// Compute and apply the current policy over the current window set.
+    ///
+    /// Safe to call after any change to either. Doing the work unconditionally
+    /// rather than tracking dirtiness is deliberate at this size: a missed
+    /// invalidation shows up as a window that silently stops participating in
+    /// the layout, which is far harder to see than a redundant recompute.
+    pub fn relayout(&mut self) {
+        if !self.tiling {
+            return;
+        }
+        let windows = self.tiled();
+        let area = Rectangle::new(
+            Point::from((0, 0)),
+            Size::from((self.output_size.0, self.output_size.1)),
+        );
+        let tiles = self.layout.arrange(area, windows.len(), self.gaps);
+
+        for (window, tile) in windows.iter().zip(tiles) {
+            // Record the floating rectangle before displacing, so leaving
+            // tiling can put the window back. `remember` is a no-op once the
+            // window is already displaced, so this does not overwrite the
+            // rectangle on every subsequent relayout.
+            geometry::remember(&self.space, window);
+            geometry::set_displaced(window, true);
+
+            if let Some(toplevel) = window.toplevel() {
+                toplevel.with_pending_state(|state| {
+                    state.size = Some(tile.size);
+                    // Tells the client it is tiled so it can drop rounded
+                    // corners and drop shadows, which otherwise leave visible
+                    // seams between tiles that look like gap bugs.
+                    state.states.set(xdg_toplevel::State::TiledLeft);
+                    state.states.set(xdg_toplevel::State::TiledRight);
+                    state.states.set(xdg_toplevel::State::TiledTop);
+                    state.states.set(xdg_toplevel::State::TiledBottom);
+                });
+                toplevel.send_pending_configure();
+            }
+            self.space.map_element(window.clone(), tile.loc, false);
+        }
+    }
+
+    /// Switch the workspace between tiled and floating.
+    fn toggle_tiling(&mut self) {
+        self.tiling = !self.tiling;
+        if self.tiling {
+            self.relayout();
+        } else {
+            // §3: "Switching a workspace from tiled to floating — tiled
+            // windows need remembered floating geometry, or they all pile at
+            // the origin." This is that restore, and the reason the geometry
+            // module exists.
+            for window in self.tiled() {
+                geometry::set_displaced(&window, false);
+                let Some(rect) = geometry::recall(&window) else { continue };
+                if let Some(toplevel) = window.toplevel() {
+                    toplevel.with_pending_state(|state| {
+                        state.size = Some(rect.size);
+                        state.states.unset(xdg_toplevel::State::TiledLeft);
+                        state.states.unset(xdg_toplevel::State::TiledRight);
+                        state.states.unset(xdg_toplevel::State::TiledTop);
+                        state.states.unset(xdg_toplevel::State::TiledBottom);
+                    });
+                    toplevel.send_pending_configure();
+                }
+                self.space.map_element(window.clone(), rect.loc, false);
+            }
+        }
+        tracing::info!(
+            "tiling {} ({})",
+            if self.tiling { "on" } else { "off" },
+            self.layout.name()
+        );
+    }
+
+    /// Exempt the focused window from tiling, or return it to the layout.
+    fn toggle_floating(&mut self, window: &Window) {
+        let now = !geometry::is_exempt(window);
+        geometry::set_exempt(window, now);
+        if now {
+            // Leaving the layout means going back to where it floated.
+            geometry::set_displaced(window, false);
+            if let Some(rect) = geometry::recall(window) {
+                if let Some(toplevel) = window.toplevel() {
+                    toplevel.with_pending_state(|state| state.size = Some(rect.size));
+                    toplevel.send_pending_configure();
+                }
+                self.space.map_element(window.clone(), rect.loc, true);
+            }
+        }
+        tracing::info!("window {} the layout", if now { "left" } else { "rejoined" });
+        self.relayout();
+    }
+
+    /// Fill the output, or return to the remembered floating rectangle.
+    ///
+    /// §3 calls maximise "neither mode": it is a departure from floating that
+    /// must be undoable, which is exactly what remembered geometry is for. It
+    /// is also the cheapest way to prove the remembering works, since the
+    /// window has to come back to the pixel.
+    fn toggle_maximize(&mut self, window: &Window, output_size: (i32, i32)) {
+        // A tiled window is already displaced, so without this guard the
+        // toggle takes the restore branch and pops the window back to its
+        // floating rectangle while tiling is still on — leaving one window
+        // loose over a layout that still believes it owns that tile.
+        if self.is_tiled(window) {
+            tracing::info!("window is tiled; maximise does not apply");
+            return;
+        }
+        if geometry::is_displaced(window) {
+            let Some(rect) = geometry::recall(window) else { return };
+            geometry::set_displaced(window, false);
+            if let Some(toplevel) = window.toplevel() {
+                toplevel.with_pending_state(|state| {
+                    state.size = Some(rect.size);
+                    state.states.unset(xdg_toplevel::State::Maximized);
+                });
+                toplevel.send_pending_configure();
+            }
+            self.space.map_element(window.clone(), rect.loc, true);
+            tracing::info!("restored to {:?}", rect);
+        } else {
+            // Record before displacing, not after: once the flag is set the
+            // recording is frozen, so the order here is the difference between
+            // remembering the floating rectangle and remembering nothing.
+            geometry::remember(&self.space, window);
+            if geometry::recall(window).is_none() {
+                // Nothing to come back to; displacing now would strand the
+                // window maximised with the toggle unable to undo it.
+                tracing::warn!("no floating geometry yet, not maximising");
+                return;
+            }
+            geometry::set_displaced(window, true);
+            if let Some(toplevel) = window.toplevel() {
+                toplevel.with_pending_state(|state| {
+                    state.size = Some(output_size.into());
+                    state.states.set(xdg_toplevel::State::Maximized);
+                });
+                toplevel.send_pending_configure();
+            }
+            self.space.map_element(window.clone(), (0, 0), true);
+            tracing::info!("maximised, will restore to {:?}", geometry::recall(window));
+        }
+    }
+
     /// Raise and give keyboard focus in one step.
     ///
     /// Kept together deliberately: a window that is focused but not raised, or
     /// raised but not focused, is the classic window-manager bug where typing
     /// goes to something you cannot see.
     fn focus(&mut self, window: &Window) {
+        self.focused = Some(window.clone());
         let location = self.space.element_location(window).unwrap_or_default();
         self.space.map_element(window.clone(), location, true);
         if let Some(kb) = self.seat.get_keyboard() {
@@ -450,6 +752,31 @@ fn send_frames(surface: &WlSurface, time: u32) {
     );
 }
 
+/// Launch a terminal as a client of this compositor.
+///
+/// Reaping is deliberate and not optional. A compositor that spawns children
+/// and never waits accumulates zombies for every window ever closed; the
+/// symptom is a process table filling up over a long session, which looks like
+/// anything but a window manager bug.
+fn spawn_terminal(term: &str, socket_name: &str) {
+    // Only the child's environment is changed. Setting WAYLAND_DISPLAY on the
+    // compositor's own process would make it a client of itself the next time
+    // anything connected.
+    match std::process::Command::new(term)
+        .env("WAYLAND_DISPLAY", socket_name)
+        .spawn()
+    {
+        Ok(child) => {
+            tracing::info!("spawned {term} (pid {})", child.id());
+            std::thread::spawn(move || {
+                let mut child = child;
+                let _ = child.wait();
+            });
+        }
+        Err(e) => tracing::error!("could not spawn {term}: {e}"),
+    }
+}
+
 fn pick_terminal() -> Option<&'static str> {
     TERMINALS.iter().copied().find(|t| {
         std::process::Command::new("sh")
@@ -494,6 +821,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         pointer_location: (0.0, 0.0).into(),
         modifiers: ModifiersState::default(),
         mod_key,
+        order: Vec::new(),
+        focused: None,
+        tiling: false,
+        layout: layout::Layout::default(),
+        gaps: layout::Gaps::default(),
+        output_size: (1280, 800),
     };
 
     // Let the socket be allocated rather than hardcoded. A fixed name collides
@@ -513,26 +846,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (mut backend, mut winit_loop) = winit::init::<GlesRenderer>()?;
     let start = std::time::Instant::now();
 
+    // Resolved once, outside the startup branch, because the spawn keybinding
+    // needs it for the whole life of the session — not just at boot. Owned
+    // rather than borrowed: `pick_terminal` yields &'static str and `requested`
+    // a local String, and unifying the two by reference makes the local's
+    // lifetime the binding constraint for no gain.
+    let terminal: Option<String> =
+        requested.clone().or_else(|| pick_terminal().map(str::to_owned));
+
     if !no_spawn {
-        // Owned rather than borrowed. `pick_terminal` yields &'static str and
-        // `requested` a local String; unifying the two by reference makes the
-        // local's lifetime the binding constraint for no gain.
-        let chosen: Option<String> =
-            requested.clone().or_else(|| pick_terminal().map(str::to_owned));
-        match chosen.as_deref() {
-            Some(term) => {
-                tracing::info!("spawning {term}");
-                // Only the child's environment is changed. Setting
-                // WAYLAND_DISPLAY on the compositor's own process would make it
-                // a client of itself the next time anything connected.
-                match std::process::Command::new(term)
-                    .env("WAYLAND_DISPLAY", &socket_name)
-                    .spawn()
-                {
-                    Ok(_) => {}
-                    Err(e) => tracing::error!("could not spawn {term}: {e}"),
-                }
-            }
+        match terminal.as_deref() {
+            Some(term) => spawn_terminal(term, &socket_name),
             None => tracing::warn!(
                 "no terminal found (tried {TERMINALS:?}) — start one by hand with \
                  WAYLAND_DISPLAY={socket_name}"
@@ -558,6 +882,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "      click           focus and raise".into(),
         format!("      {} + drag     move", mod_key.label()),
         format!("      {} + right    resize from the nearest corner", mod_key.label()),
+        format!("      {} + m        maximise / restore", mod_key.label()),
+        format!("      {} + t        tiling on / off", mod_key.label()),
+        format!("      {} + e        cycle layout (master-stack, columns)", mod_key.label()),
+        format!("      {} + h / l    narrow / widen the master column", mod_key.label()),
+        format!("      {} + space    float this window out of the layout", mod_key.label()),
+        format!("      {} + enter    open another terminal", mod_key.label()),
+        format!("      {} + j / k    focus next / previous window", mod_key.label()),
+        format!("      {} + shift + j / k", mod_key.label()),
+        "                      move it earlier / later in the layout".into(),
+        format!("      {} + shift + p    promote it to master", mod_key.label()),
         "      close window    quit".into(),
         String::new(),
     ] {
@@ -582,26 +916,95 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // silently wrong on the first HiDPI output otherwise.
         let output_size = backend.window_size();
         let logical_size = output_size.to_f64().to_logical(1.0).to_i32_round();
+        // Relayout on resize, not just on window changes — otherwise tiles keep
+        // the old output's dimensions and either overhang the window or leave a
+        // margin, both of which read as a layout bug rather than a stale size.
+        if state.output_size != (logical_size.w, logical_size.h) {
+            state.output_size = (logical_size.w, logical_size.h);
+            state.relayout();
+        }
 
         let status = winit_loop.dispatch_new_events(|event| match event {
             WinitEvent::Input(InputEvent::Keyboard { event }) => {
                 let serial = SERIAL_COUNTER.next_serial();
                 let time = event.time_msec();
-                keyboard.input::<(), _>(
+                let key_state = event.state();
+                let binding = keyboard.input::<Option<Binding>, _>(
                     &mut state,
                     event.key_code(),
                     event.state(),
                     serial,
                     time,
-                    |state, modifiers, _keysym| {
+                    |state, modifiers, handle| {
                         // Modifiers are only offered here, and compositor
                         // bindings need them at button time. Cache rather than
                         // ask the seat later, which would report the state as
                         // of now instead of as of the click.
                         state.modifiers = *modifiers;
+
+                        // Intercepted, not forwarded: a binding the compositor
+                        // acts on must not also reach the client, or the
+                        // terminal receives an 'm' every time a window is
+                        // maximised.
+                        if key_state == KeyState::Pressed && state.mod_key.held(modifiers) {
+                            let bound = match handle.modified_sym() {
+                                Keysym::m => Some(Binding::ToggleMaximize),
+                                Keysym::t => Some(Binding::ToggleTiling),
+                                Keysym::space => Some(Binding::ToggleFloating),
+                                Keysym::e => Some(Binding::CycleLayout),
+                                Keysym::l => Some(Binding::Widen(1)),
+                                Keysym::h => Some(Binding::Widen(-1)),
+                                Keysym::Return | Keysym::KP_Enter => Some(Binding::Spawn),
+                                Keysym::j => Some(Binding::FocusStep(1)),
+                                Keysym::k => Some(Binding::FocusStep(-1)),
+                                // Shift gives the capitalised keysym, so the
+                                // shifted bindings are distinguished here
+                                // rather than by re-reading modifier state.
+                                Keysym::J => Some(Binding::MoveInOrder(1)),
+                                Keysym::K => Some(Binding::MoveInOrder(-1)),
+                                Keysym::P => Some(Binding::Promote),
+                                _ => None,
+                            };
+                            if let Some(binding) = bound {
+                                return FilterResult::Intercept(Some(binding));
+                            }
+                        }
                         FilterResult::Forward
                     },
                 );
+
+                if let Some(Some(binding)) = binding {
+                    let focused = state.focused.clone();
+                    match binding {
+                        Binding::ToggleMaximize => {
+                            if let Some(w) = focused {
+                                state.toggle_maximize(&w, (logical_size.w, logical_size.h));
+                            }
+                        }
+                        Binding::ToggleTiling => state.toggle_tiling(),
+                        Binding::ToggleFloating => {
+                            if let Some(w) = focused {
+                                state.toggle_floating(&w);
+                            }
+                        }
+                        Binding::CycleLayout => {
+                            state.layout = state.layout.next();
+                            tracing::info!("layout: {}", state.layout.name());
+                            state.relayout();
+                        }
+                        Binding::FocusStep(d) => state.focus_step(d),
+                        Binding::MoveInOrder(d) => state.move_in_order(d),
+                        Binding::Promote => state.promote(),
+                        Binding::Spawn => match terminal.as_deref() {
+                            Some(term) => spawn_terminal(term, &socket_name),
+                            None => tracing::warn!("no terminal to spawn"),
+                        },
+                        Binding::Widen(dir) => {
+                            state.layout = state.layout.widen(0.05 * dir as f64);
+                            state.relayout();
+                        }
+                    }
+                }
             }
 
             WinitEvent::Input(InputEvent::PointerMotionAbsolute { event }) => {

@@ -88,6 +88,10 @@ impl PointerGrab<Cusk> for MoveGrab {
         // specific button matters: a second button pressed mid-drag must not
         // cancel the drag when it is released.
         if !handle.current_pressed().contains(&self.start_data.button) {
+            // The drag is the geometry change; record it now that it has
+            // settled. Recording per-motion would be the same value hundreds
+            // of times, and would still be wrong if the grab is cancelled.
+            crate::geometry::remember(&data.space, &self.window);
             handle.unset_grab(self, data, event.serial, event.time, true);
         }
     }
@@ -200,6 +204,10 @@ impl PointerGrab<Cusk> for ResizeGrab {
     ) {
         handle.button(data, event);
         if !handle.current_pressed().contains(&self.start_data.button) {
+            // The drag is the geometry change; record it now that it has
+            // settled. Recording per-motion would be the same value hundreds
+            // of times, and would still be wrong if the grab is cancelled.
+            crate::geometry::remember(&data.space, &self.window);
             handle.unset_grab(self, data, event.serial, event.time, true);
         }
     }
