@@ -17,6 +17,10 @@ configured with KDE's discoverability and Hyprland's reach.
 | Tile order | its own list, never stacking order | 2026-08-07 |
 | Tiled drag | reorders; it does not move the window | 2026-08-07 |
 | Per-window state | the window's `UserDataMap`, not a side table | 2026-08-07 |
+| Config format | TOML, edited as a syntax tree (`toml_edit`) | 2026-08-07 |
+| Schema | one macro declaration; struct and table cannot drift | 2026-08-07 |
+| Bad values | rejected and reported, never clamped or defaulted | 2026-08-07 |
+| Config watching | poll the path; inotify dies on rename-based saves | 2026-08-07 |
 
 ## 1. This reverses ARCHITECTURE.md §0
 
@@ -556,3 +560,98 @@ promote, and the floating round-trip. 32 tests pass.
 Everything above hardcodes gaps, ratios, layouts and every binding, and each of
 those is a setting the schema will have to claw back. Doing it now costs less
 than doing it after a shell and a GUI also depend on them.
+
+---
+
+## Milestone 5: the typed schema and hot reload, 2026-08-07
+
+`src/cusk/src/config.rs`. §4 minus the GUI.
+
+**The macro is the design.** §4's constraint is "there is no second list to keep
+in sync", and declaring settings twice — struct fields plus a descriptor table —
+decays immediately into a key the parser accepts and nothing reads, or a field
+the GUI cannot see. One declaration generates the `Config` struct, its
+defaults, `SCHEMA`, and `get`/`set` by key. That last pair is the surface §4 has
+Hadal propose `SetSetting { key, value }` through, range-checked before anything
+is written.
+
+TOML via `toml_edit`, because §4 requires a round-tripping editor and that is a
+syntax-tree editor built for the job. A bespoke Hyprland-style format would
+mean writing that tree by hand, which is the actual work — the syntax is not.
+
+| decision | why |
+|---|---|
+| reject, never clamp | a clamped value means the file says one thing and the compositor does another, with nothing to say which |
+| per-setting, not all-or-nothing | a compositor that will not start over one bad line leaves no desktop to fix it from |
+| unknown keys reported | a silently ignored typo is the most common configuration complaint there is |
+| the sample file is generated | a hand-written one is the second list this module exists to avoid, and goes stale on the first default change |
+
+### When a setting takes effect is part of the schema
+
+`Apply::Live` or `Apply::Restart`, declared per setting. The alternative is the
+worst thing hot reload can do: the user edits a value, nothing happens, and
+nothing says why. `layout.default` and `layout.tile-by-default` describe
+*initial* state — reapplying them live would overrule a layout chosen since
+with Super+E and make the keybinding feel broken. Changes to them are named in
+the log rather than silently skipped, and the generated file says so too.
+
+### Polling, not inotify
+
+Editors overwhelmingly save by writing a temporary file and renaming it over
+the target. That replaces the inode and silently kills a watch registered on
+the old one — the reload works exactly once and then never again, which is
+worse than not having it. Watching the directory instead means handling every
+unrelated event in it. Re-stating one path every 500ms costs nothing and cannot
+be fooled by a rename.
+
+The fingerprint is mtime *and* length *and* inode: mtime has one-second
+granularity on some filesystems, and two saves inside one second is precisely
+what iterating on a setting looks like.
+
+### A broken file must not reset the desktop
+
+The most important behaviour in the module. Editors flush partial saves, so a
+syntax error is a normal intermediate state, not a user decision. Falling back
+to defaults would tear the session apart mid-edit — and from inside a
+compositor that just lost its configuration there is no comfortable way back.
+`Reload::Failed` keeps what is running. A file that vanishes is treated the
+same way, since that is the window a rename-based save passes through.
+
+### Verified live
+
+```
+INFO  reloaded cusk.toml
+INFO  layout.default changed; takes effect on restart
+WARN  cusk.toml: TOML parse error at line 2, column 13 — keeping the running configuration
+```
+
+Live settings applied, the restart-only change named, the half-written save
+survived. Earlier, from a real file: `mod-key = "alt"` took effect,
+`layout.master-ratio: allowed: 0.1 to 0.9` was reported and fell back while
+every other setting still applied, and `layout.outer-gpa: no such setting`
+caught the typo.
+
+### Two things this caught in itself
+
+`set_in_document` **ate trailing comments.** Assigning a fresh value discards
+the node's decor, which is where `toml_edit` keeps `# tight` beside
+`inner-gap = 4`. Writing the setting silently destroyed the note — precisely
+the failure §4 names as making a GUI unusable. The old decor is carried onto
+the new value now.
+
+`focus-follows-mouse` **was declared and not implemented.** It parsed,
+validated, documented itself and did nothing; the dead-code warning caught it.
+Now implemented, with two guards: an empty hit does not unfocus, or crossing
+the gap between two tiles would stop your typing mid-sentence; and an
+already-focused window is skipped, since `focus` raises and raising on every
+motion event re-stacks the space hundreds of times a second.
+
+`TERMINALS` is gone — the launcher reads the schema's choice list, so a name
+the file accepts cannot be one nothing will start.
+
+### Next
+
+The settings GUI, which is the half of §4 that is actually hard.
+`set_in_document` and `Config::get` are its foundation: tested, and currently
+with no in-compositor caller. The schema already carries everything a generated
+UI needs — type, default, range, description, and when the change takes effect.

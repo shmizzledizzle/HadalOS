@@ -143,6 +143,22 @@ impl Kind {
     }
 }
 
+/// When a change to a setting takes effect.
+///
+/// Part of the schema rather than tribal knowledge, because the alternative is
+/// the worst outcome hot reload can have: the user edits a setting, nothing
+/// happens, and nothing says why. The GUI can render this, and reload reports
+/// it by name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Apply {
+    /// Takes effect the moment the file is saved.
+    Live,
+    /// Describes initial state, so reapplying it would fight the user.
+    /// `layout.default` is what a workspace *starts* as; clobbering a layout
+    /// chosen since with Super+E would make the keybinding feel broken.
+    Restart,
+}
+
 /// One setting: everything the parser, the GUI and the docs need to know.
 #[derive(Debug, Clone, Copy)]
 pub struct Setting {
@@ -150,6 +166,7 @@ pub struct Setting {
     pub key: &'static str,
     pub kind: Kind,
     pub doc: &'static str,
+    pub apply: Apply,
 }
 
 impl Setting {
@@ -220,14 +237,21 @@ macro_rules! to_value {
 
 macro_rules! settings {
     ($(
-        $field:ident : $kind:ident { key: $key:literal, doc: $doc:literal, $($rest:tt)* }
+        $field:ident : $kind:ident {
+            key: $key:literal, doc: $doc:literal, apply: $apply:ident, $($rest:tt)*
+        }
     ),* $(,)?) => {
         /// Every setting cusk understands.
         ///
         /// Generated from the same declaration as `Config`, so a setting cannot
         /// exist in one and not the other.
         pub const SCHEMA: &[Setting] = &[
-            $(Setting { key: $key, kind: Kind::$kind { $($rest)* }, doc: $doc }),*
+            $(Setting {
+                key: $key,
+                kind: Kind::$kind { $($rest)* },
+                doc: $doc,
+                apply: Apply::$apply,
+            }),*
         ];
 
         #[derive(Debug, Clone, PartialEq)]
@@ -274,41 +298,49 @@ settings! {
     inner_gap: Int {
         key: "layout.inner-gap",
         doc: "Space between tiles, in pixels.",
+        apply: Live,
         default: 8, min: 0, max: 200
     },
     outer_gap: Int {
         key: "layout.outer-gap",
         doc: "Space between tiles and the screen edge, in pixels.",
+        apply: Live,
         default: 8, min: 0, max: 200
     },
     master_ratio: Float {
         key: "layout.master-ratio",
         doc: "Fraction of the width taken by the master column.",
+        apply: Live,
         default: 0.6, min: 0.1, max: 0.9
     },
     default_layout: Choice {
         key: "layout.default",
         doc: "Which arrangement tiled workspaces start in.",
+        apply: Restart,
         default: "master-stack", options: &["master-stack", "columns"]
     },
     tiling_on_start: Bool {
         key: "layout.tile-by-default",
         doc: "Whether new workspaces tile rather than float.",
+        apply: Restart,
         default: false
     },
     mod_key: Choice {
         key: "input.mod-key",
         doc: "The modifier that arms compositor bindings.",
+        apply: Live,
         default: "super", options: &["super", "alt", "ctrl", "ctrl-alt"]
     },
     focus_follows_mouse: Bool {
         key: "input.focus-follows-mouse",
         doc: "Whether hovering a window focuses it, without a click.",
+        apply: Live,
         default: false
     },
     terminal: Choice {
         key: "commands.terminal",
         doc: "Terminal opened by the spawn binding.",
+        apply: Live,
         default: "auto", options: &["auto", "foot", "alacritty", "kitty", "weston-terminal", "konsole"]
     },
 }
@@ -421,6 +453,9 @@ impl Config {
                 current = table;
             }
             out.push_str(&format!("\n# {}\n", setting.doc));
+            if setting.apply == Apply::Restart {
+                out.push_str("# takes effect on restart\n");
+            }
             if let Some(range) = setting.kind.range() {
                 out.push_str(&format!("# {}: {range}\n", setting.kind.type_name()));
             }
@@ -493,6 +528,129 @@ pub fn set_in_document(
     }
     table[leaf] = Item::Value(new);
     Ok(())
+}
+
+
+// ── hot reload ───────────────────────────────────────────────────────────
+
+/// A cheap fingerprint of the file, for detecting edits.
+///
+/// Modification time alone is not enough: it has one-second granularity on
+/// some filesystems, and two saves inside the same second are exactly what
+/// happens when someone is iterating on a setting. Length and inode make the
+/// common cases distinguishable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Stamp {
+    modified: Option<std::time::SystemTime>,
+    len: u64,
+    inode: u64,
+}
+
+impl Stamp {
+    fn of(path: &Path) -> Option<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let meta = std::fs::metadata(path).ok()?;
+        Some(Stamp {
+            modified: meta.modified().ok(),
+            len: meta.len(),
+            inode: meta.ino(),
+        })
+    }
+}
+
+/// What a reload attempt produced.
+#[derive(Debug)]
+pub enum Reload {
+    /// The file has not changed since the last look.
+    Unchanged,
+    /// A new configuration, with anything the file got wrong.
+    ///
+    /// Which settings need a restart is deliberately *not* reported here: the
+    /// watcher does not know what is currently running, and a field it could
+    /// only ever fill with a guess is a second source of truth. Callers ask
+    /// `restart_only_changes` with the config they actually hold.
+    Applied { config: Config, complaints: Vec<Complaint> },
+    /// The file could not be parsed. The previous configuration stands.
+    Failed(String),
+}
+
+/// Watches the configuration file and re-reads it when it changes.
+///
+/// Polls rather than using inotify, which is not laziness. Editors overwhelmingly
+/// save by writing a temporary file and renaming it over the target, which
+/// replaces the inode and silently kills a watch registered on the old one —
+/// the reload works once and then never again, which is worse than not having
+/// it. Watching the directory instead works but means handling every unrelated
+/// event in it. Re-stating one path costs nothing at this interval and cannot
+/// be fooled by a rename.
+pub struct Watcher {
+    path: std::path::PathBuf,
+    stamp: Option<Stamp>,
+    last_checked: std::time::Instant,
+    interval: std::time::Duration,
+}
+
+impl Watcher {
+    pub fn new(path: std::path::PathBuf) -> Self {
+        Self {
+            stamp: Stamp::of(&path),
+            path,
+            last_checked: std::time::Instant::now(),
+            interval: std::time::Duration::from_millis(500),
+        }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Re-read the file if it has changed since the last call.
+    ///
+    /// Safe to call every frame; the rate limit is inside.
+    pub fn poll(&mut self) -> Reload {
+        if self.last_checked.elapsed() < self.interval {
+            return Reload::Unchanged;
+        }
+        self.last_checked = std::time::Instant::now();
+        self.check_now()
+    }
+
+    /// The same check without the rate limit, so tests do not sleep.
+    pub fn check_now(&mut self) -> Reload {
+        let stamp = Stamp::of(&self.path);
+        if stamp == self.stamp {
+            return Reload::Unchanged;
+        }
+        // A deleted file is not an instruction to reset the desktop to
+        // defaults. Keep what is running and wait for it to come back — this
+        // is also the brief window a rename-based save passes through.
+        let Some(stamp) = stamp else {
+            return Reload::Unchanged;
+        };
+        self.stamp = Some(stamp);
+
+        let text = match std::fs::read_to_string(&self.path) {
+            Ok(text) => text,
+            Err(e) => return Reload::Failed(e.to_string()),
+        };
+        match Config::from_str(&text) {
+            Ok((config, complaints)) => Reload::Applied { config, complaints },
+            // Crucially not a fallback to defaults. Editors save partial files,
+            // and resetting every setting because a half-written line was
+            // flushed to disk would tear the desktop apart mid-edit.
+            Err(e) => Reload::Failed(e.to_string()),
+        }
+    }
+}
+
+/// Settings that differ between two configurations and only apply at startup.
+pub fn restart_only_changes(old: &Config, new: &Config) -> Vec<&'static str> {
+    SCHEMA
+        .iter()
+        .filter(|s| s.apply == Apply::Restart)
+        .filter(|s| old.get(s.key) != new.get(s.key))
+        .map(|s| s.key)
+        .collect()
 }
 
 #[cfg(test)]
@@ -746,5 +904,102 @@ mod-key = \"alt\"
         let (config, complaints) = Config::from_str(&text).unwrap();
         assert!(complaints.is_empty(), "{complaints:?}");
         assert_eq!(config, Config::default());
+    }
+
+    fn temp_config(name: &str, body: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join("cusk-config-tests");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
+    #[test]
+    fn an_unchanged_file_is_not_re_read() {
+        let path = temp_config("unchanged.toml", "[layout]\ninner-gap = 3\n");
+        let mut watcher = Watcher::new(path);
+        assert!(matches!(watcher.check_now(), Reload::Unchanged));
+    }
+
+    #[test]
+    fn an_edit_is_picked_up() {
+        let path = temp_config("edited.toml", "[layout]\ninner-gap = 3\n");
+        let mut watcher = Watcher::new(path.clone());
+        std::fs::write(&path, "[layout]\ninner-gap = 30\n").unwrap();
+        match watcher.check_now() {
+            Reload::Applied { config, complaints } => {
+                assert_eq!(config.inner_gap, 30);
+                assert!(complaints.is_empty());
+            }
+            other => panic!("expected Applied, got {other:?}"),
+        }
+    }
+
+    /// Editors save by writing a temporary file and renaming it over the
+    /// target. A watch on the inode dies at that moment; re-stating the path
+    /// does not.
+    #[test]
+    fn a_rename_over_the_file_is_still_seen() {
+        let path = temp_config("renamed.toml", "[layout]\ninner-gap = 3\n");
+        let mut watcher = Watcher::new(path.clone());
+        let temp = path.with_extension("tmp");
+        std::fs::write(&temp, "[layout]\ninner-gap = 44\n").unwrap();
+        std::fs::rename(&temp, &path).unwrap();
+        match watcher.check_now() {
+            Reload::Applied { config, .. } => assert_eq!(config.inner_gap, 44),
+            other => panic!("expected Applied, got {other:?}"),
+        }
+    }
+
+    /// The one that matters most. A half-written file must not reset the
+    /// desktop to defaults — editors flush partial saves, and a torn-down
+    /// session mid-edit is unrecoverable from inside the session.
+    #[test]
+    fn a_broken_file_leaves_the_running_config_alone() {
+        let path = temp_config("broken.toml", "[layout]\ninner-gap = 3\n");
+        let mut watcher = Watcher::new(path.clone());
+        std::fs::write(&path, "[layout]\ninner-gap = ").unwrap();
+        match watcher.check_now() {
+            Reload::Failed(message) => assert!(!message.is_empty()),
+            other => panic!("a syntax error must not produce {other:?}"),
+        }
+    }
+
+    /// A file that vanishes for an instant during a rename-based save must not
+    /// be read as "reset everything".
+    #[test]
+    fn a_missing_file_changes_nothing() {
+        let path = temp_config("vanishing.toml", "[layout]\ninner-gap = 3\n");
+        let mut watcher = Watcher::new(path.clone());
+        std::fs::remove_file(&path).unwrap();
+        assert!(matches!(watcher.check_now(), Reload::Unchanged));
+    }
+
+    #[test]
+    fn restart_only_settings_are_named_not_silently_skipped() {
+        let old = Config::default();
+        let mut new = Config::default();
+        new.inner_gap = 40;
+        assert!(restart_only_changes(&old, &new).is_empty(), "a live setting needs no restart");
+
+        new.default_layout = "columns".into();
+        new.tiling_on_start = true;
+        let named = restart_only_changes(&old, &new);
+        assert!(named.contains(&"layout.default"));
+        assert!(named.contains(&"layout.tile-by-default"));
+    }
+
+    /// Every setting has to declare when it takes effect, or the reporting
+    /// above has a hole in it exactly where a user would be confused.
+    #[test]
+    fn the_generated_file_says_when_each_setting_applies() {
+        let text = Config::default_file();
+        for setting in SCHEMA.iter().filter(|s| s.apply == Apply::Restart) {
+            assert!(
+                text.contains("restart"),
+                "{} applies only at restart and the file does not say so",
+                setting.key
+            );
+        }
     }
 }

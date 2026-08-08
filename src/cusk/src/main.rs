@@ -708,6 +708,24 @@ impl Cusk {
         }
     }
 
+    /// Apply a reloaded configuration to the running compositor.
+    ///
+    /// Only the settings the schema marks `Apply::Live`. The rest describe
+    /// initial state, and reapplying them would overrule choices the user has
+    /// made since — reloading the file must not undo a layout picked with
+    /// Super+E.
+    fn apply_config(&mut self, cfg: &config::Config) {
+        self.gaps = layout::Gaps { inner: cfg.inner_gap, outer: cfg.outer_gap };
+        self.focus_follows_mouse = cfg.focus_follows_mouse;
+        self.mod_key = ModKey::resolve(&cfg.mod_key);
+        // The ratio lives inside the master-stack variant, so it can only be
+        // applied while that is the layout. Columns has no divider to move.
+        if let layout::Layout::MasterStack { .. } = self.layout {
+            self.layout = layout::Layout::MasterStack { ratio: cfg.master_ratio };
+        }
+        self.relayout();
+    }
+
     /// Focus whatever the pointer is over, if it is not already focused.
     ///
     /// Two guards, both of which are the difference between this being usable
@@ -910,6 +928,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let keyboard = state.seat.add_keyboard(Default::default(), 200, 25)?;
     let pointer = state.seat.add_pointer();
 
+    let mut watcher = config::Watcher::new(config_path.clone());
+    let mut current = cfg.clone();
+
     let (mut backend, mut winit_loop) = winit::init::<GlesRenderer>()?;
     let start = std::time::Instant::now();
 
@@ -918,7 +939,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // rather than borrowed: `pick_terminal` yields &'static str and `requested`
     // a local String, and unifying the two by reference makes the local's
     // lifetime the binding constraint for no gain.
-    let terminal: Option<String> = requested
+    let mut terminal: Option<String> = requested
         .clone()
         .or_else(|| match cfg.terminal.as_str() {
             // "auto" is a strategy, not a program: probe the schema's list in
@@ -1195,6 +1216,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             _ => {}
         });
+
+        match watcher.poll() {
+            config::Reload::Unchanged => {}
+            config::Reload::Applied { config: fresh, complaints } => {
+                for complaint in &complaints {
+                    tracing::warn!("{}: {}", watcher.path().display(), complaint);
+                }
+                // Named, not silently skipped. A setting that was edited and
+                // did nothing, with nothing said about it, is the worst thing
+                // hot reload can do.
+                for key in config::restart_only_changes(&current, &fresh) {
+                    tracing::info!("{key} changed; takes effect on restart");
+                }
+                state.apply_config(&fresh);
+                terminal = match fresh.terminal.as_str() {
+                    "auto" => pick_terminal().map(str::to_owned),
+                    named => Some(named.to_string()),
+                };
+                tracing::info!("reloaded {}", watcher.path().display());
+                current = fresh;
+            }
+            config::Reload::Failed(e) => {
+                tracing::warn!(
+                    "{}: {e} — keeping the running configuration",
+                    watcher.path().display()
+                );
+            }
+        }
 
         if let PumpStatus::Exit(_) = status {
             tracing::info!("window closed, exiting");
