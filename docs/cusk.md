@@ -13,6 +13,10 @@ configured with KDE's discoverability and Hyprland's reach.
 | Dev backend | winit — nested in the running session | 2026-08-07 |
 | Config source of truth | a text file, typed schema | 2026-08-07 |
 | GUI config | an editor over that file, comment-preserving | 2026-08-07 |
+| Layout engine | pure function of area and count, no Wayland types | 2026-08-07 |
+| Tile order | its own list, never stacking order | 2026-08-07 |
+| Tiled drag | reorders; it does not move the window | 2026-08-07 |
+| Per-window state | the window's `UserDataMap`, not a side table | 2026-08-07 |
 
 ## 1. This reverses ARCHITECTURE.md §0
 
@@ -390,3 +394,165 @@ its shadow. Worth knowing before tiling: **a window's surfaces are not confined
 to its geometry**, so a layout that computes rectangles from surface extents
 rather than from `Window::geometry()` will leave gaps the size of every
 client's shadow.
+
+---
+
+## Milestone 3: remembered floating geometry, 2026-08-07
+
+`src/cusk/src/geometry.rs`. §3 lists this as a prerequisite for mode switching,
+and maximise is its first consumer — §3 also says maximise is *neither* mode, so
+it is modelled as a departure from floating rather than as a third mode.
+
+State lives in the window's own `UserDataMap`, not a side table in the
+compositor. A side table has to be pruned on unmap; when it is not, the symptom
+is a slow leak and eventually a stale rectangle applied to an unrelated window.
+Attached to the window, it dies with the window.
+
+### The guard the module exists for
+
+Geometry is recorded on **every** move and resize, because recording only on the
+way into another mode loses the last drag. Recording unconditionally is worse:
+maximising overwrites the rectangle it is supposed to return to, and "restore"
+silently becomes "do nothing" — which reads as a broken keybinding, not as a
+lost rectangle. So a window is explicitly marked `displaced`, and while
+displaced its floating rectangle is frozen.
+
+This was caught by writing a test named `a_round_trip_restores_exactly` whose
+body asserted `assert_ne!` — the test contradicted its own name and encoded the
+bug as though it were the spec.
+
+- **0×0 is refused.** Before its first commit a window reports zero size;
+  storing that restores it to invisibility later, which looks like the window
+  vanishing rather than like a bad rectangle.
+- **Nothing displaces without somewhere to return to**, or a window maximised
+  before its first commit strands itself with the toggle unable to undo it.
+
+### Verified
+
+```
+maximised, will restore to Some(Rectangle { x: 128, y: 84, width: 800, height: 635 })
+restored to  Rectangle { x: 128, y: 84, width: 800, height: 635 }
+```
+
+Exact, and across an intervening tiling on/off cycle.
+
+---
+
+## Milestone 4: dynamic tiling, 2026-08-07
+
+`src/cusk/src/layout.rs` and `src/cusk/src/tiling.rs`.
+
+**The engine knows nothing about Wayland.** `arrange(area, n, gaps) ->
+Vec<Rectangle>` is a pure function, which is what makes the layout testable
+without a display, a client, or an event loop — 22 of the 32 tests are that.
+
+Floating is deliberately **not** a variant of `Layout`. A floating window's
+rectangle is its own, so floating is the absence of an arrangement rather than
+an identity arrangement; a `Layout::Floating` would force every caller to ask
+whether the returned rectangles mean anything.
+
+| | |
+|---|---|
+| layouts | master-stack (adjustable ratio), columns |
+| **Super + T** | tiling on / off |
+| **Super + E** | cycle layout |
+| **Super + H / L** | narrow / widen master |
+| **Super + Space** | float this window out of the layout |
+| **Super + Return** | open another terminal |
+| **Super + J / K** | focus next / previous |
+| **Super + Shift + J / K** | move earlier / later in the layout |
+| **Super + Shift + P** | promote to master |
+
+### The seams from §3, resolved
+
+- **Floating exception** — a toplevel with a parent is a dialog and is exempted
+  from the protocol, rather than waiting for someone to notice a file chooser
+  has become a tile.
+- **Tiled → floating** — restores through milestone 3, which is what that
+  milestone was for.
+- **Fullscreen and maximise are neither mode** — carried by the `displaced`
+  flag, not by a mode enum.
+
+### Decisions made while building
+
+- **Tile order is its own `Vec<Window>`, not `space.elements()`.** That is
+  stacking order and changes on raise; tiling off it means clicking a window
+  reshuffles the layout under the pointer and the window jumps away as you
+  click it.
+- **Focus cycles that same order.** Stacking order is a most-recently-used
+  list, so cycling it walks between the same two windows instead of touring
+  them all.
+- **The same gesture means different things per policy.** A tiled window has no
+  position of its own, so dragging it *reorders* and dragging its edge moves
+  the *divider*. A free-moving drag would leave the layout and the screen
+  disagreeing until the next relayout snapped it back with no explanation.
+- **Swap commits on release; the divider updates live.** Opposite choices on
+  purpose: swapping on hover makes the layout churn under the drag, while a
+  divider you cannot see land is guesswork.
+- **Promote swaps rather than reinserts**, so pressing it twice returns to the
+  previous arrangement. A window manager has no undo.
+- **Wrapping, not clamping**, for focus and reordering. Clamping makes the ends
+  dead, and a key that stops responding is indistinguishable from one that was
+  never bound.
+- **`relayout()` recomputes unconditionally** rather than tracking dirtiness. A
+  missed invalidation shows up as a window that silently stops participating,
+  which is far harder to see than a redundant recompute.
+
+### Two tests that lied to each other
+
+`tiles_never_overlap` ran on 1920×1080; `tiles_never_collapse_below_the_minimum`
+ran on 640×480. Each passed. Checked on the *same* inputs, they failed at once:
+
+```
+n=7: Rectangle { x: 386, y: 448, width: 246, height: 80 } escapes the screen
+```
+
+Clamping each tile up to a minimum while advancing the offset by the clamped
+size overflows the column. Tiles shrink instead, and the minimum now applies
+only to the master column, where it genuinely prevents starving a side. Visibly
+cramped is honest; silently stacked is not.
+
+The lesson generalises past this file: **two properties tested on different
+inputs can both pass while the conjunction fails.** Same shape as the boot
+layer, where each component was correct and the composition was not.
+
+### A bug the guard caught before it shipped
+
+A tiled window is already `displaced`, so without a guard `Super+M` took the
+*restore* branch and popped it back to its floating rectangle while tiling
+stayed on — one window loose over a layout that still believed it owned that
+tile. Maximise is now a no-op on tiled windows.
+
+### "I can't open multiple windows" was not a compositor bug
+
+Reproduced rather than guessed: two clients connected and mapped cleanly. The
+compositor was fine; there was simply no way to *open* a window from inside
+cusk, so every new one meant returning to another terminal. `Super+Return`
+fixed it, and spawned children are reaped on a thread — a compositor that never
+waits accumulates a zombie per closed window, and a filling process table looks
+like anything except a window manager bug.
+
+That is the second time on this project that reproducing beat theorising, after
+the three wrong guesses in milestone 2.
+
+### Verified
+
+Interactive, 2026-08-07: four windows via `Super+Return`, master-stack and
+columns both correct, drag-to-swap, divider drag, keyboard focus and reorder,
+promote, and the floating round-trip. 32 tests pass.
+
+### Known rough edges
+
+- **No drag feedback.** A swap gives no hint of its target until release.
+- **Reorder bindings are live in floating mode**, where they change an order
+  nothing currently reads. Harmless, and takes effect on tiling — but a
+  keypress with no visible result reads as a dead binding.
+- **Still no cursor**, and still no `zwp_linux_dmabuf` — both carried from
+  milestone 1.
+
+### Next
+
+§4, the config schema — called "the actually hard part" for good reason.
+Everything above hardcodes gaps, ratios, layouts and every binding, and each of
+those is a setting the schema will have to claw back. Doing it now costs less
+than doing it after a shell and a GUI also depend on them.
