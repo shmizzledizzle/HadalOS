@@ -373,6 +373,12 @@ settings! {
         apply: Live,
         default: 24, min: 0, max: 120
     },
+    panel_height: Int {
+        key: "appearance.panel-height",
+        doc: "Height of the workspace bar along the top edge. Zero hides it.",
+        apply: Live,
+        default: 28, min: 0, max: 64
+    },
     window_opacity: Float {
         key: "appearance.window-opacity",
         doc: "How opaque windows are. Below 1.0 the blur behind them becomes visible.",

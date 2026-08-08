@@ -37,6 +37,8 @@ configured with KDE's discoverability and Hyprland's reach.
 | Cursor | drawn in code, not loaded from an XCursor theme | 2026-08-07 |
 | dmabuf | v4 with feedback — v3 alone leaves clients unable to find a GPU | 2026-08-07 |
 | Window blur | scene built back to front offscreen; each window blurs what precedes it | 2026-08-07 |
+| Panel | drawn by the compositor; iced cannot speak layer-shell | 2026-08-08 |
+| Reserved space | one `usable_area`, read by tiling, placement and maximise | 2026-08-08 |
 
 ## 1. This reverses ARCHITECTURE.md §0
 
@@ -1339,3 +1341,64 @@ and the reload reached the render path.
 A panel for the workspace indicator, which is the last thing `Super+1..9` is
 missing — switching to an empty workspace is still indistinguishable from a
 hang except in the log.
+
+---
+
+## Milestone 15: the panel, 2026-08-08
+
+`src/cusk/src/panel.rs`. A workspace bar along the top edge, `panel-height`
+(default 28, zero hides it).
+
+`Super+1..9` has worked since milestone 9, but switching to an empty workspace
+was indistinguishable from the compositor having hung — the only evidence was a
+log line. Now each workspace is a pill: **accent and wider when active, filled
+when occupied, faint when empty.**
+
+### Drawn by the compositor, and that is a limitation not a design
+
+A panel client would want `wlr-layer-shell`, to sit above windows and reserve
+space. iced — which the settings editor and the launcher are built on — speaks
+xdg-shell only, so the choice was a compositor-drawn bar or a client pretending
+to be an ordinary window and being special-cased into position. The second
+would have to be undone the day layer-shell arrives.
+
+### No text, and that is why the pills exist
+
+A window title and a clock are the obvious contents and neither is here,
+because cusk cannot draw a glyph: there is no font rasteriser in the
+compositor. Rather than add one to get a milestone, the indicator was designed
+around what can already be drawn. Rectangles were enough for the thing
+`Super+1..9` was actually missing.
+
+### Decisions
+
+- **The active pill is wider, not only a different colour.** Shape survives a
+  bad monitor, a colourblind user, and a screenshot at low contrast.
+- **`usable_area` is computed in exactly one place**, and tiling, cascade
+  placement and maximise all read it. Three separate subtractions would
+  eventually disagree by a pixel, and the symptom is a window tucked one row
+  under the bar.
+- **A click on the panel is consumed whether or not it hits a pill.** The bar
+  owns its strip outright; falling through to a window behind it would let a
+  press both switch workspace and activate something on the workspace being
+  left.
+- **The panel is tested before the surface hit**, or a floating window dragged
+  over the bar would take the click instead.
+- **Pills that would run off the edge are not drawn at all.** Drawing some that
+  cannot be reached is worse than drawing none.
+- **Drawn after the windows.** Only tiling is obliged to respect the reserved
+  strip, so a floating window can still be dragged over it — painted
+  underneath, the bar would vanish under the first window someone moved up.
+
+### Verified
+
+Windows now map at `(40, 68)` rather than `(40, 40)` with a 28px bar, so the
+reservation reaches placement. Setting `panel-height = 0` live reclaims the
+strip. Three windows, no errors.
+
+### Next
+
+A font rasteriser is the gate on everything else a panel wants — window title,
+clock, workspace names — and on the launcher showing anything but its own list.
+Beyond that, `wlr-layer-shell` would let the panel become a replaceable client,
+and the tty backend is what makes cusk a session rather than a window.

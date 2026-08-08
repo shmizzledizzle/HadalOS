@@ -30,6 +30,7 @@ mod floating;
 mod geometry;
 mod gpublur;
 mod layout;
+mod panel;
 mod tiling;
 mod wallpaper;
 mod workspace;
@@ -204,6 +205,8 @@ struct Cusk {
 
     /// Whether hovering a window focuses it.
     focus_follows_mouse: bool,
+    /// Height of the workspace bar. Zero disables it entirely.
+    panel_height: i32,
     /// Dmabufs a client has offered but that have not been tested against the
     /// renderer yet. Drained every frame, where the renderer is reachable.
     pending_dmabufs: Vec<(
@@ -290,7 +293,11 @@ impl XdgShellHandler for Cusk {
         // visibly a second window. Floating placement policy in miniature —
         // §3's floating mode is this, with intent.
         let n = self.space.elements().count() as i32;
-        let location = (40 + n * 30, 40 + n * 30);
+        let usable = panel::usable_area(
+            Size::from((self.output_size.0, self.output_size.1)),
+            self.panel_height,
+        );
+        let location = (40 + n * 30, usable.loc.y + 40 + n * 30);
         self.space.map_element(window.clone(), location, true);
 
         if let Some(toplevel) = window.toplevel() {
@@ -688,6 +695,31 @@ impl Cusk {
         tracing::info!("overlay {OVERLAY_APP_ID} centred at {location:?} ({}x{})", size.w, size.h);
     }
 
+    /// A click on the panel, if it landed on one.
+    ///
+    /// Returns whether the click was the panel's, so the caller knows not to
+    /// forward it. A press that both switches workspace *and* reaches whatever
+    /// is underneath would activate something on the workspace being left.
+    fn panel_click(&mut self, at: Point<i32, Logical>) -> bool {
+        let output = Size::from((self.output_size.0, self.output_size.1));
+        if !panel::contains(output, self.panel_height, at) {
+            return false;
+        }
+        let pills = panel::pills(
+            output,
+            self.panel_height,
+            self.workspaces.len(),
+            self.workspaces.active_index(),
+        );
+        if let Some(index) = panel::pill_at(&pills, at) {
+            self.switch_workspace(index);
+        }
+        // Consumed either way. The bar is the compositor's strip of screen, so
+        // a click on an empty part of it belongs to nothing rather than
+        // falling through to a window that happens to be behind it.
+        true
+    }
+
     /// Show a different workspace.
     fn switch_workspace(&mut self, index: usize) {
         let Some(switch) = self.workspaces.switch_to(index) else { return };
@@ -783,9 +815,11 @@ impl Cusk {
             return;
         }
         let windows = self.tiled();
-        let area = Rectangle::new(
-            Point::from((0, 0)),
+        // The one place the usable area is computed, so tiling, placement and
+        // maximise cannot disagree about where the screen starts.
+        let area = panel::usable_area(
             Size::from((self.output_size.0, self.output_size.1)),
+            self.panel_height,
         );
         let tiles = self.layout().arrange(area, windows.len(), self.gaps);
 
@@ -906,14 +940,18 @@ impl Cusk {
                 return;
             }
             geometry::set_displaced(window, true);
+            let area = panel::usable_area(
+                Size::from((output_size.0, output_size.1)),
+                self.panel_height,
+            );
             if let Some(toplevel) = window.toplevel() {
                 toplevel.with_pending_state(|state| {
-                    state.size = Some(output_size.into());
+                    state.size = Some(area.size);
                     state.states.set(xdg_toplevel::State::Maximized);
                 });
                 toplevel.send_pending_configure();
             }
-            self.space.map_element(window.clone(), (0, 0), true);
+            self.space.map_element(window.clone(), area.loc, true);
             tracing::info!("maximised, will restore to {:?}", geometry::recall(window));
         }
     }
@@ -953,6 +991,7 @@ impl Cusk {
         }
         self.gaps = layout::Gaps { inner: cfg.inner_gap, outer: cfg.outer_gap };
         self.focus_follows_mouse = cfg.focus_follows_mouse;
+        self.panel_height = cfg.panel_height;
         self.mod_key = ModKey::resolve(&cfg.mod_key);
         // The ratio lives inside the master-stack variant, so it can only be
         // applied while that is the layout. Columns has no divider to move.
@@ -1303,6 +1342,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ),
         gaps: layout::Gaps { inner: cfg.inner_gap, outer: cfg.outer_gap },
         focus_follows_mouse: cfg.focus_follows_mouse,
+        panel_height: cfg.panel_height,
         pending_dmabufs: Vec::new(),
         cursor: smithay::input::pointer::CursorImageStatus::default_named(),
         output_size: (1280, 800),
@@ -1652,7 +1692,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let button_state = event.state();
                 let mut forward = true;
 
-                if button_state == ButtonState::Pressed {
+                // The panel is checked before anything else, because it owns
+                // its strip of screen outright. Testing it after the surface
+                // hit would let a floating window that overlaps the bar take
+                // the click instead.
+                if button_state == ButtonState::Pressed
+                    && state.panel_click(state.pointer_location.to_i32_round())
+                {
+                    forward = false;
+                }
+
+                if forward && button_state == ButtonState::Pressed {
                     let hit = state.surface_under(state.pointer_location);
                     tracing::debug!(
                         "press {button:#x} at {:?} -> {}, super={} alt={}",
@@ -2103,6 +2153,59 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
 
+            }
+
+
+            // Drawn after the windows and before the cursor. A floating window
+            // can still be dragged over the reserved strip — only tiling is
+            // obliged to respect it — so the bar has to be painted over the
+            // top or it disappears under the first window someone moves up.
+            if state.panel_height > 0 {
+                let output = Size::from((logical_size.w, logical_size.h));
+                let bar = to_physical(panel::panel_area(output, state.panel_height));
+                let bg = cusk::theme::premultiplied([
+                    cusk::theme::BG[0],
+                    cusk::theme::BG[1],
+                    cusk::theme::BG[2],
+                    0.85,
+                ]);
+                frame.draw_solid(bar, &[damage], Color32F::new(bg[0], bg[1], bg[2], bg[3]))?;
+
+                let active = state.workspaces.active_index();
+                let occupied = state.workspaces.occupied();
+                for (index, pill) in
+                    panel::pills(output, state.panel_height, state.workspaces.len(), active)
+                        .into_iter()
+                        .enumerate()
+                {
+                    // Three states, and the empty one is the point: a
+                    // workspace with nothing on it has to look different from
+                    // one that does, or switching to it still looks like a
+                    // hang.
+                    let colour = if index == active {
+                        cusk::theme::ACCENT
+                    } else if occupied.get(index).copied().unwrap_or(false) {
+                        [
+                            cusk::theme::TEXT_DIM[0],
+                            cusk::theme::TEXT_DIM[1],
+                            cusk::theme::TEXT_DIM[2],
+                            0.75,
+                        ]
+                    } else {
+                        [
+                            cusk::theme::SURFACE_HI[0],
+                            cusk::theme::SURFACE_HI[1],
+                            cusk::theme::SURFACE_HI[2],
+                            0.55,
+                        ]
+                    };
+                    let c = cusk::theme::premultiplied(colour);
+                    frame.draw_solid(
+                        to_physical(pill),
+                        &[damage],
+                        Color32F::new(c[0], c[1], c[2], c[3]),
+                    )?;
+                }
             }
 
             // The pointer is drawn last, over everything including the focus
