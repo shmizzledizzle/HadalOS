@@ -25,6 +25,7 @@
 use cusk::config;
 
 mod chrome;
+mod cursor;
 mod floating;
 mod geometry;
 mod layout;
@@ -197,6 +198,8 @@ struct Cusk {
 
     /// Whether hovering a window focuses it.
     focus_follows_mouse: bool,
+    /// What the pointer should look like right now, as clients request it.
+    cursor: smithay::input::pointer::CursorImageStatus,
     /// Every workspace, and which one is on screen.
     ///
     /// Order, tiling mode, layout and focus all live per-workspace: switching
@@ -386,8 +389,13 @@ impl SeatHandler for Cusk {
     fn cursor_image(
         &mut self,
         _seat: &Seat<Self>,
-        _image: smithay::input::pointer::CursorImageStatus,
+        image: smithay::input::pointer::CursorImageStatus,
     ) {
+        // Recorded, not ignored. A client that asks for an I-beam over its text
+        // and gets an arrow is a small wrongness; a compositor that draws no
+        // pointer at all is an unusable one, and this handler being empty was
+        // the reason for the second.
+        self.cursor = image;
     }
     fn focus_changed(&mut self, _seat: &Seat<Self>, _focused: Option<&WlSurface>) {}
 }
@@ -1260,6 +1268,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ),
         gaps: layout::Gaps { inner: cfg.inner_gap, outer: cfg.outer_gap },
         focus_follows_mouse: cfg.focus_follows_mouse,
+        cursor: smithay::input::pointer::CursorImageStatus::default_named(),
         output_size: (1280, 800),
     };
 
@@ -1279,6 +1288,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut backdrop: Option<Backdrop> = None;
     let mut chrome: Option<chrome::Chrome> = None;
+    let pointer_image = cursor::arrow(24);
+    let mut pointer_texture: Option<GlesTexture> = None;
     let mut warned_square_corners = false;
     let mut watcher = config::Watcher::new(config_path.clone());
     let mut current = cfg.clone();
@@ -1702,6 +1713,43 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 layers.push((Rectangle::new(loc, window.geometry().size), focused, elements));
             }
 
+            // Built before the frame for the same reason the window layers are:
+            // constructing elements needs the renderer mutably, and the frame
+            // borrows it for its whole life.
+            let cursor_elements: Option<Vec<WaylandSurfaceRenderElement<GlesRenderer>>> =
+                match &state.cursor {
+                    smithay::input::pointer::CursorImageStatus::Surface(surface) => {
+                        // The hotspot comes from the surface's own role data.
+                        // Assuming (0,0) puts a text I-beam's tip at its
+                        // top-left corner, so text lands a glyph off from where
+                        // it was aimed.
+                        let hotspot =
+                            smithay::wayland::compositor::with_states(surface, |states| {
+                                states
+                                    .data_map
+                                    .get::<smithay::input::pointer::CursorImageSurfaceData>()
+                                    .and_then(|d| d.lock().ok().map(|d| d.hotspot))
+                                    .unwrap_or_default()
+                            });
+                        let at = state.pointer_location.to_i32_round() - hotspot;
+                        Some(render_elements_from_surface_tree(
+                            renderer,
+                            surface,
+                            (at.x, at.y),
+                            1.0,
+                            1.0,
+                            Kind::Cursor,
+                        ))
+                    }
+                    _ => None,
+                };
+
+            // Uploaded once. The arrow never changes, so rebuilding it per
+            // frame would be a texture upload per frame for a 24x24 image.
+            if pointer_texture.is_none() {
+                pointer_texture = upload(renderer, &pointer_image.image);
+            }
+
             let mut frame = renderer.render(&mut framebuffer, size, Transform::Flipped180)?;
             frame.clear(Color32F::new(0.05, 0.06, 0.09, 1.0), &[damage])?;
 
@@ -1786,6 +1834,49 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         current.ring_width,
                         cusk::theme::ACCENT,
                     );
+                }
+            }
+
+
+            // The pointer is drawn last, over everything including the focus
+            // ring. A cursor that can be covered by a window is a cursor you
+            // lose exactly when you are trying to click something.
+            match &state.cursor {
+                smithay::input::pointer::CursorImageStatus::Hidden => {}
+
+                // A client's own cursor, from the elements built above.
+                smithay::input::pointer::CursorImageStatus::Surface(_) => {
+                    if let Some(elements) = &cursor_elements {
+                        draw_render_elements(&mut frame, 1.0, elements, &[damage])?;
+                    }
+                }
+
+                // Nothing has an opinion, or it asked for a named shape cusk
+                // does not have artwork for. Every named shape gets the arrow
+                // rather than nothing: the wrong pointer is usable, no pointer
+                // is not.
+                smithay::input::pointer::CursorImageStatus::Named(_) => {
+                    if let Some(texture) = &pointer_texture {
+                        let at: Point<i32, Logical> = state.pointer_location.to_i32_round();
+                        let size = pointer_image.image.width as i32;
+                        let dst = Rectangle::<i32, Physical>::new(
+                            Point::from((
+                                at.x - pointer_image.hotspot.0,
+                                at.y - pointer_image.hotspot.1,
+                            )),
+                            Size::from((size, size)),
+                        );
+                        Frame::render_texture_from_to(
+                            &mut frame,
+                            texture,
+                            Rectangle::from_size(Size::from((size as f64, size as f64))),
+                            dst,
+                            &[damage],
+                            &[],
+                            Transform::Normal,
+                            1.0,
+                        )?;
+                    }
                 }
             }
 

@@ -34,6 +34,7 @@ configured with KDE's discoverability and Hyprland's reach.
 | Palette source | HadalOS's own launcher icon: deep blue, cyan accent | 2026-08-07 |
 | Launcher | a separate client, not part of the compositor | 2026-08-07 |
 | Overlay windows | recognised by app id, classified on first commit not on create | 2026-08-07 |
+| Cursor | drawn in code, not loaded from an XCursor theme | 2026-08-07 |
 
 ## 1. This reverses ARCHITECTURE.md §0
 
@@ -1110,3 +1111,61 @@ says. Built once in `boot` now.
 The workspace indicator the launcher makes room for, per-frame blur of real
 window content, and the gaps carried since milestone 1 — cursor rendering and
 `zwp_linux_dmabuf`.
+
+---
+
+## Milestone 11: the pointer, 2026-08-07
+
+`src/cusk/src/cursor.rs`. Carried unfinished since milestone 1, deferred twice.
+
+The milestone 2 note said cursor shape "says nothing about whether pointer
+routing works". True, and the wrong thing to leave: cusk drew **no pointer at
+all**, so every gesture it has — click to focus, Super+drag, drag the divider,
+drop a tile onto another — was aimed blind. Running nested, the host's cursor
+covered for it. On a tty there would have been nothing on screen.
+
+### Drawn, not loaded
+
+The usual source is an XCursor theme from the filesystem: a search path, a name
+lookup, a fallback chain, and a set of failure modes that all end in "no
+pointer" — the exact outcome being fixed. A cursor drawn in code is always
+available, has nothing to configure wrongly, and is a pure function from a size
+to a bitmap, so it is testable without a GPU or a session. Eight tests.
+
+The properties worth having are the ones that catch a shape gone wrong in a way
+that still renders: the tip is at the hotspot and is drawn; the arrow is
+neither empty nor a solid block (both easy to produce by getting the polygon
+test backwards); the far corner is transparent; there is a white body *and* a
+dark outline, because a single-colour cursor disappears against something,
+always; and the colours are premultiplied, or the outline blends as a halo
+instead of a line.
+
+### Client cursors still win
+
+`cursor_image` records the status instead of ignoring it. A client asking for an
+I-beam over its text gets its own surface rendered, with the hotspot from the
+surface's role data — assuming `(0,0)` there puts an I-beam's tip at its
+top-left corner, so text lands a glyph off from where it was aimed.
+
+Every *named* shape gets the arrow, including ones there is no artwork for. The
+wrong pointer is usable; no pointer is not.
+
+`Hidden` is honoured, because a client that hides the cursor — a video player,
+a game — has a reason to.
+
+### Details
+
+- Drawn last, over everything including the focus ring. A cursor a window can
+  cover is one you lose exactly when you are trying to click something.
+- Uploaded once. The arrow never changes, so building it per frame would be a
+  texture upload per frame for a 24x24 image — the same mistake the launcher
+  icon made one milestone ago.
+- Cursor surface elements are built before the frame, for the same reason the
+  window layers are: constructing elements needs the renderer mutably and the
+  frame borrows it for its whole life.
+
+### Next
+
+`zwp_linux_dmabuf`, so clients stop falling back to shared memory — the last
+gap carried from milestone 1. Then per-frame blur of real window content, and a
+panel to hold the workspace indicator.
