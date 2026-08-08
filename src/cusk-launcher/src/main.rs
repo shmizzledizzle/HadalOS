@@ -20,7 +20,7 @@ use cusk::config::Config;
 use entry::Entry;
 use iced::keyboard::{self, key::Named};
 use iced::widget::operation;
-use iced::widget::{column, container, row, scrollable, space, text, text_input, Id};
+use iced::widget::{column, container, image, row, scrollable, space, text, text_input, Id};
 use iced::{Element, Fill, Length, Subscription, Task};
 
 /// Matches the app id cusk looks for. Changing one without the other turns the
@@ -29,6 +29,14 @@ use iced::{Element, Fill, Length, Subscription, Task};
 const APP_ID: &str = "cusk-launcher";
 
 const INPUT_ID: &str = "query";
+
+/// The HadalOS mark, bundled rather than read from disk.
+///
+/// `include_bytes!` resolves at compile time, so the source artwork's path —
+/// which lives outside this repository — would make the crate build on exactly
+/// one machine. `assets/README.md` records that this is a copy and has to be
+/// refreshed when the icon is redesigned.
+const ICON: &[u8] = include_bytes!("../assets/menu_icon.png");
 
 fn main() -> iced::Result {
     iced::application(App::boot, App::update, App::view)
@@ -56,6 +64,10 @@ struct App {
     /// From the compositor's own config, so a `Terminal=true` entry opens in
     /// the terminal cusk would have spawned rather than a guess.
     terminal: String,
+    /// Built once. `Handle::from_bytes` stamps a fresh unique id on every call,
+    /// so constructing one per `view` gives the renderer a new texture to
+    /// upload every frame and a cache that never stops growing.
+    mark: image::Handle,
 }
 
 #[derive(Debug, Clone)]
@@ -77,6 +89,7 @@ impl App {
             query: String::new(),
             selected: 0,
             terminal: if terminal == "auto" { "foot".into() } else { terminal },
+            mark: image::Handle::from_bytes(ICON),
         };
         // Focus the field immediately. A launcher you have to click before
         // typing has failed at the only thing it does.
@@ -161,6 +174,10 @@ impl App {
     fn view(&self) -> Element<'_, Message> {
         let matches = self.matches();
 
+        let mark = image(self.mark.clone())
+            .width(Length::Fixed(34.0))
+            .height(Length::Fixed(34.0));
+
         let field = text_input("Search applications", &self.query)
             .id(Id::new(INPUT_ID))
             .on_input(Message::Query)
@@ -195,7 +212,7 @@ impl App {
 
         container(
             column![
-                field,
+                row![mark, field].spacing(12).align_y(iced::Center),
                 list,
                 // A count rather than nothing: "no matches" and "the launcher
                 // failed to read anything" look identical otherwise.

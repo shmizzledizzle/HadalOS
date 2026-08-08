@@ -1090,6 +1090,21 @@ window exists" and "the window is described" are different events.**
   development the two crates build into separate target directories and
   anything on `PATH` is a stale install. `commands.launcher` overrides it.
 
+### The icon, and a bug it introduced
+
+The launcher shows the HadalOS mark, bundled at `assets/menu_icon.png` — a
+**copy** of the artwork outside the repo, because `include_bytes!` resolves at
+compile time and an absolute path outside the tree makes the crate build on one
+machine only. The cost is the usual one and is written down in
+`assets/README.md`: the copy does not follow the original.
+
+The first version built the handle inside `view`. `Handle::from_bytes` stamps a
+fresh `Id::unique()` on every call, so each frame handed the renderer a new
+texture to upload and a cache that never stopped growing; the launcher mapped
+and died about a second later. The comment above that line confidently claimed
+iced would hash the bytes and reuse the upload, which is not what the source
+says. Built once in `boot` now.
+
 ### Next
 
 The workspace indicator the launcher makes room for, per-frame blur of real
