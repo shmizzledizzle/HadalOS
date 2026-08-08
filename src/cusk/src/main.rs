@@ -62,6 +62,7 @@ enum Binding {
     CycleLayout,
     Widen(i32),
     Spawn,
+    Launcher,
     FocusStep(isize),
     MoveInOrder(isize),
     Promote,
@@ -156,6 +157,26 @@ impl ModKey {
     }
 }
 
+/// The app id cusk treats as an overlay: exempt from tiling and centred.
+/// Must match `cusk-launcher`'s own constant; changing one without the other
+/// turns the launcher back into an ordinary tiled window.
+const OVERLAY_APP_ID: &str = "cusk-launcher";
+
+/// What `classify` has worked out about a window so far.
+///
+/// Two separate questions with two separate arrival times, which is why this
+/// is not one boolean: *what* a window is comes from `set_app_id`, and *how
+/// big* it is only exists once it has committed a buffer. Placing it on the
+/// first commit centres a 0x0 window, which puts its top-left corner in the
+/// middle of the screen — the failure that produced `x: 640` on a 1280-wide
+/// output.
+#[derive(Default)]
+struct Classification {
+    /// `None` until an app id has been seen at all.
+    overlay: std::cell::Cell<Option<bool>>,
+    placed: std::cell::Cell<bool>,
+}
+
 struct Cusk {
     compositor_state: CompositorState,
     xdg_shell_state: XdgShellState,
@@ -229,6 +250,7 @@ impl CompositorHandler for Cusk {
             // geometry, so the window draws perfectly while being, as far as
             // input is concerned, zero pixels wide.
             window.on_commit();
+            self.classify(&window);
 
             if let Some(toplevel) = window.toplevel() {
                 toplevel.send_configure();
@@ -244,6 +266,10 @@ impl XdgShellHandler for Cusk {
     }
 
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
+        // `app_id` is deliberately *not* read here. `xdg_toplevel.set_app_id`
+        // is a separate request that arrives after the toplevel is created, so
+        // at this point it is always `None` — a window is classified on its
+        // first commit instead, in `classify`.
         let window = Window::new_wayland_window(surface);
         // Cascade rather than stack at the origin, so a second window is
         // visibly a second window. Floating placement policy in miniature —
@@ -555,6 +581,70 @@ impl Cusk {
 
     pub fn focused(&self) -> Option<Window> {
         self.workspaces.active().focused.clone()
+    }
+
+    /// Decide what a window *is*, once, on its first commit.
+    ///
+    /// Not at `new_toplevel`: `set_app_id` is a separate request that has not
+    /// arrived yet, so the id is always `None` there. Reading it too early is
+    /// silent — the window simply never matches, and the special case looks
+    /// like it was never written.
+    fn classify(&mut self, window: &Window) {
+        window.user_data().insert_if_missing(Classification::default);
+        let (known, placed) = {
+            let data = window
+                .user_data()
+                .get::<Classification>()
+                .expect("just inserted");
+
+            if data.overlay.get().is_none() {
+                let app_id = window.toplevel().and_then(|toplevel| {
+                    smithay::wayland::compositor::with_states(toplevel.wl_surface(), |states| {
+                        states
+                            .data_map
+                            .get::<smithay::wayland::shell::xdg::XdgToplevelSurfaceData>()
+                            .and_then(|d| d.lock().ok().and_then(|d| d.app_id.clone()))
+                    })
+                });
+                // Recorded only once an id has actually arrived. Deciding "not
+                // an overlay" from a `None` that simply has not been sent yet
+                // is the bug this replaced.
+                if let Some(app_id) = app_id {
+                    data.overlay.set(Some(app_id == OVERLAY_APP_ID));
+                }
+            }
+            (data.overlay.get(), data.placed.get())
+        };
+
+        if known != Some(true) || placed {
+            return;
+        }
+
+        // Exempt as soon as it is known to be an overlay, before it is placed:
+        // a relayout in between would otherwise tile it for a frame.
+        geometry::set_exempt(window, true);
+
+        // Placement waits for a real size.
+        let size = window.geometry().size;
+        if size.w <= 0 || size.h <= 0 {
+            return;
+        }
+        if let Some(data) = window.user_data().get::<Classification>() {
+            data.placed.set(true);
+        }
+
+        // Centred horizontally, high vertically — a launcher pinned to the
+        // exact middle sits under the pointer and covers what you were looking
+        // at.
+        let location = Point::from((
+            ((self.output_size.0 - size.w) / 2).max(0),
+            ((self.output_size.1 - size.h) / 3).max(0),
+        ));
+        self.space.map_element(window.clone(), location, true);
+        geometry::remember(&self.space, window);
+        self.focus(window);
+        self.relayout();
+        tracing::info!("overlay {OVERLAY_APP_ID} centred at {location:?} ({}x{})", size.w, size.h);
     }
 
     /// Show a different workspace.
@@ -1066,6 +1156,25 @@ fn spawn_terminal(term: &str, socket_name: &str) {
     }
 }
 
+/// Find the launcher binary.
+///
+/// A bare name is looked for beside cusk first, then left to `PATH`. Beside-
+/// first matters during development, where the two crates build into separate
+/// target directories and the one on `PATH` — if any — is a stale install.
+fn resolve_launcher(name: &str) -> String {
+    if name.contains('/') {
+        return name.to_string();
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(sibling) = exe.parent().map(|d| d.join(name)) {
+            if sibling.exists() {
+                return sibling.to_string_lossy().into_owned();
+            }
+        }
+    }
+    name.to_string()
+}
+
 fn pick_terminal() -> Option<&'static str> {
     config::known_terminals().find(|t| {
         std::process::Command::new("sh")
@@ -1233,6 +1342,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         format!("      {} + h / l    narrow / widen the master column", mod_key.label()),
         format!("      {} + space    float this window out of the layout", mod_key.label()),
         format!("      {} + enter    open another terminal", mod_key.label()),
+        format!("      {} + d        application launcher", mod_key.label()),
         format!("      {} + j / k    focus next / previous window", mod_key.label()),
         format!("      {} + shift + j / k", mod_key.label()),
         "                      move it earlier / later in the layout".into(),
@@ -1303,6 +1413,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 Keysym::l => Some(Binding::Widen(1)),
                                 Keysym::h => Some(Binding::Widen(-1)),
                                 Keysym::Return | Keysym::KP_Enter => Some(Binding::Spawn),
+                                Keysym::d => Some(Binding::Launcher),
                                 Keysym::j => Some(Binding::FocusStep(1)),
                                 Keysym::k => Some(Binding::FocusStep(-1)),
                                 // Shift gives the capitalised keysym, so the
@@ -1364,6 +1475,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         Binding::Promote => state.promote(),
                         Binding::Workspace(i) => state.switch_workspace(i),
                         Binding::SendToWorkspace(i) => state.send_to_workspace(i),
+                        Binding::Launcher => {
+                            let program = resolve_launcher(&current.launcher);
+                            match std::process::Command::new(&program)
+                                .env("WAYLAND_DISPLAY", &socket_name)
+                                .spawn()
+                            {
+                                Ok(child) => {
+                                    tracing::info!("launcher {program} (pid {})", child.id());
+                                    std::thread::spawn(move || {
+                                        let mut child = child;
+                                        let _ = child.wait();
+                                    });
+                                }
+                                Err(e) => tracing::warn!("could not run {program}: {e}"),
+                            }
+                        }
                         Binding::Spawn => match terminal.as_deref() {
                             Some(term) => spawn_terminal(term, &socket_name),
                             None => tracing::warn!("no terminal to spawn"),

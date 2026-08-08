@@ -391,6 +391,12 @@ settings! {
         apply: Live,
         default: 3, min: 1, max: 5
     },
+    launcher: Text {
+        key: "commands.launcher",
+        doc: "Program the launcher binding runs. A bare name is looked for beside cusk, then on PATH.",
+        apply: Live,
+        default: "cusk-launcher"
+    },
     terminal: Choice {
         key: "commands.terminal",
         doc: "Terminal opened by the spawn binding.",

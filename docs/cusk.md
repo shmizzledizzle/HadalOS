@@ -32,6 +32,8 @@ configured with KDE's discoverability and Hyprland's reach.
 | Workspaces | generic over the element type, so the logic is testable without Wayland | 2026-08-07 |
 | Hidden windows | unmapped from the `Space`, never parked off-screen | 2026-08-07 |
 | Palette source | HadalOS's own launcher icon: deep blue, cyan accent | 2026-08-07 |
+| Launcher | a separate client, not part of the compositor | 2026-08-07 |
+| Overlay windows | recognised by app id, classified on first commit not on create | 2026-08-07 |
 
 ## 1. This reverses ARCHITECTURE.md §0
 
@@ -1002,3 +1004,94 @@ the whole reason the palette was moved there in milestone 8.
 The launcher, which is what the icon is for. After that: per-frame blur of real
 window content, and the carried gaps — cursor rendering, `zwp_linux_dmabuf`,
 translucent-client handling.
+
+---
+
+## Milestone 10: the launcher, 2026-08-07
+
+`src/cusk-launcher` — `Super+D`. A separate client, for the same reason rofi
+and fuzzel are: text input, matching and a scrolling list are an application's
+problems, and putting them inside the compositor means a bug in any of them
+takes the session down.
+
+Parsing is the whole risk, so it is a pure function over strings with 19 tests
+and nothing that opens a window. Against this machine's real applications
+directory it reads **149 entries**, and ranks the way a person expects:
+
+```
+  fire -> Mozilla Firefox (bin)
+  term -> Alacritty, Yakuake
+   set -> Print Settings, System Settings, KDE System Settings
+  file -> Filelight, Ark, Dolphin
+```
+
+Ranking is by kind of match rather than string distance: exact name, then
+prefix, then a word inside the name, then anywhere, then the command, then the
+comment. Ties break on name, because a list that reshuffles between keystrokes
+that score the same is unusable — you aim for the second row and it moves.
+
+### Parsing decisions that are each a bug avoided
+
+- **Field codes are stripped.** `%f`, `%U`, `%i` are placeholders for files the
+  launcher is not passing. Left in, they are handed over as literal arguments
+  and the application opens and complains it cannot find a file called `%U`.
+- **`[Desktop Action …]` groups do not leak into the main entry.** They have
+  their own `Name` and `Exec`; reading them into the same map launches the
+  wrong command under the right name.
+- **Localised keys are skipped**, or whichever locale sorted last becomes the
+  name.
+- **`NoDisplay` and `Hidden` are honoured.** Offering something the user asked
+  to hide is worse than missing an app.
+- **First file with a given id wins**, so `~/.local/share` overrides the
+  system — which is how someone fixes a broken launcher line without root.
+
+Not implemented, and said out loud rather than left to be discovered: desktop
+actions, D-Bus activation, and startup notification.
+
+### Two arrival times, learned the hard way
+
+The compositor special-cases the app id `cusk-launcher`: exempt from tiling,
+centred, focused. The first attempt read `app_id` in `new_toplevel` and it was
+always `None` — `xdg_toplevel.set_app_id` is a **separate request that arrives
+after the toplevel is created**. The symptom was silent: the launcher simply
+cascaded like any other window, and the special case looked like it had never
+been written.
+
+Moving the check to the first commit fixed the id and exposed the second half
+of the same mistake. The launcher was then centred at `x: 640` on a 1280-wide
+output — which is `(1280 - 0) / 2`, because a window's geometry is still `0x0`
+on its first commit.
+
+So *what* a window is and *how big* it is arrive at different times, and the
+classification tracks them separately: the id is recorded only once one has
+actually been sent, exemption is applied as soon as it is known (so a relayout
+in between cannot tile it for a frame), and placement waits for a non-zero
+size. Now: `overlay cusk-launcher centred at (320, 126) (640x420)`.
+
+This is the third time on this project that a value was read before the
+protocol guarantees it exists, after `Window::on_commit` in milestone 2 and the
+0x0 geometry in milestone 3. The pattern is worth naming: **on Wayland, "the
+window exists" and "the window is described" are different events.**
+
+### Details
+
+- Centred horizontally but a third of the way down, not dead centre: a launcher
+  pinned to the middle sits under the pointer and covers what you were looking
+  at.
+- Selection is an accent bar, not a highlight box — the same move the reference
+  shells use.
+- Arrow keys clamp rather than wrap; holding Down should stop at the bottom of a
+  long unlabelled list rather than silently return to the top.
+- The query resets the selection to the top on every edit, or Enter launches
+  whatever moved into the highlighted row.
+- A `Terminal=true` entry is wrapped in the terminal from cusk's *own* config,
+  so it matches what `Super+Return` would open.
+- The launcher binary is looked for beside cusk before `PATH`, because in
+  development the two crates build into separate target directories and
+  anything on `PATH` is a stale install. `commands.launcher` overrides it.
+
+### Next
+
+The workspace indicator the launcher makes room for, per-frame blur of real
+window content, and the gaps carried since milestone 1 — cursor rendering and
+`zwp_linux_dmabuf`.

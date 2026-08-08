@@ -1,0 +1,16 @@
+[package]
+name = "cusk-launcher"
+version = "0.1.0"
+edition = "2021"
+description = "Application launcher for the cusk window manager"
+license = "GPL-2.0-only"
+
+[[bin]]
+name = "cusk-launcher"
+path = "src/main.rs"
+
+[dependencies]
+# For the shared palette and the config schema, so the launcher honours the
+# same terminal setting the compositor spawns with.
+cusk = { path = "../cusk" }
+iced = { version = "0.14.0", features = ["tokio"] }
