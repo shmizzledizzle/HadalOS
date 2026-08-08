@@ -28,6 +28,7 @@ mod floating;
 mod geometry;
 mod layout;
 mod tiling;
+mod wallpaper;
 
 use std::sync::Arc;
 
@@ -39,9 +40,10 @@ use smithay::backend::renderer::element::surface::{
     render_elements_from_surface_tree, WaylandSurfaceRenderElement,
 };
 use smithay::backend::renderer::element::Kind;
-use smithay::backend::renderer::gles::GlesRenderer;
+use smithay::backend::allocator::Fourcc;
+use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
 use smithay::backend::renderer::utils::{draw_render_elements, on_commit_buffer_handler};
-use smithay::backend::renderer::{Color32F, Frame, Renderer};
+use smithay::backend::renderer::{Color32F, Frame, ImportMem, Renderer};
 use smithay::backend::winit::{self, WinitEvent};
 use smithay::desktop::{Space, Window, WindowSurfaceType};
 use smithay::backend::input::KeyState;
@@ -69,7 +71,7 @@ use smithay::reexports::wayland_server::protocol::wl_seat;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::backend::{ClientData, ClientId, DisconnectReason};
 use smithay::reexports::wayland_server::{Client, Display, ListeningSocket};
-use smithay::utils::{Point, Rectangle, Serial, Size, Transform, SERIAL_COUNTER};
+use smithay::utils::{Logical, Physical, Point, Rectangle, Serial, Size, Transform, SERIAL_COUNTER};
 use smithay::wayland::buffer::BufferHandler;
 use smithay::wayland::compositor::{
     with_surface_tree_downward, CompositorClientState, CompositorHandler, CompositorState,
@@ -780,6 +782,140 @@ impl ClientData for ClientState {
 /// Frame callbacks. A client that does not get these draws once and then waits
 /// forever, which reads as "the app froze" rather than "the compositor never
 /// asked for another frame".
+/// Everything the backdrop depends on. When this changes, the textures are
+/// rebuilt; while it does not, they are reused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BackdropKey {
+    path: String,
+    size: (i32, i32),
+    radius: i32,
+    passes: i32,
+}
+
+/// The wallpaper, uploaded: sharp for the desktop, blurred for behind windows.
+struct Backdrop {
+    /// What produced the sharp texture. Decoding and scaling is the expensive
+    /// half, so it is keyed separately from the blur — changing the blur
+    /// radius must not re-read the file.
+    source: (String, (i32, i32)),
+    blur: (i32, i32),
+    /// Kept so the blur can be recomputed without touching the disk.
+    scaled: wallpaper::Image,
+    sharp: GlesTexture,
+    blurred: GlesTexture,
+}
+
+fn upload(renderer: &mut GlesRenderer, image: &wallpaper::Image) -> Option<GlesTexture> {
+    renderer
+        .import_memory(
+            &image.data,
+            // ABGR8888 is little-endian A:B:G:R, which in memory is the byte
+            // order R,G,B,A that the decoder produces. Naming it the other way
+            // round swaps red and blue, and the mistake looks like an oddly
+            // tinted wallpaper rather than a format bug.
+            Fourcc::Abgr8888,
+            Size::from((image.width as i32, image.height as i32)),
+            false,
+        )
+        .ok()
+}
+
+impl Backdrop {
+    fn build(renderer: &mut GlesRenderer, key: &BackdropKey) -> Option<Self> {
+        let started = std::time::Instant::now();
+        let scaled = match wallpaper::load_scaled(
+            std::path::Path::new(&key.path),
+            (key.size.0.max(1) as u32, key.size.1.max(1) as u32),
+        ) {
+            Ok(image) => image,
+            // Reported once per change, not once per frame: the key is stored
+            // by the caller either way, so a broken path complains and then
+            // stays quiet.
+            Err(e) => {
+                tracing::warn!("wallpaper {}: {e}", key.path);
+                return None;
+            }
+        };
+        let sharp = upload(renderer, &scaled)?;
+        let blurred_image =
+            wallpaper::blurred_from(&scaled, key.radius.max(0) as u32, key.passes.max(1) as u32);
+        let blurred = upload(renderer, &blurred_image)?;
+
+        tracing::info!(
+            "wallpaper ready in {}ms ({}x{}, blur r{} x{})",
+            started.elapsed().as_millis(),
+            key.size.0,
+            key.size.1,
+            key.radius,
+            key.passes
+        );
+        Some(Backdrop {
+            source: (key.path.clone(), key.size),
+            blur: (key.radius, key.passes),
+            scaled,
+            sharp,
+            blurred,
+        })
+    }
+
+    /// Recompute only the blur, reusing the decoded and scaled image.
+    fn reblur(&mut self, renderer: &mut GlesRenderer, key: &BackdropKey) {
+        let started = std::time::Instant::now();
+        let image =
+            wallpaper::blurred_from(&self.scaled, key.radius.max(0) as u32, key.passes.max(1) as u32);
+        if let Some(texture) = upload(renderer, &image) {
+            self.blurred = texture;
+            self.blur = (key.radius, key.passes);
+            tracing::info!(
+                "reblurred in {}ms (r{} x{})",
+                started.elapsed().as_millis(),
+                key.radius,
+                key.passes
+            );
+        }
+    }
+}
+
+/// The backdrop the current configuration and output size call for, or `None`
+/// when no wallpaper is set.
+fn backdrop_key(cfg: &config::Config, size: Size<i32, Logical>) -> Option<BackdropKey> {
+    let path = cfg.wallpaper.trim();
+    if path.is_empty() {
+        return None;
+    }
+    Some(BackdropKey {
+        path: path.to_string(),
+        size: (size.w, size.h),
+        radius: cfg.blur_radius,
+        passes: cfg.blur_passes,
+    })
+}
+
+/// A logical rectangle in physical pixels.
+///
+/// Written out rather than assumed. cusk runs at scale 1, where the numbers
+/// are identical and the conversion looks pointless — which is exactly why it
+/// is spelled out: it stops being identity on the first HiDPI output, and a
+/// missing conversion there is invisible until it is everywhere.
+fn to_physical(rect: Rectangle<i32, Logical>) -> Rectangle<i32, Physical> {
+    Rectangle::new(
+        Point::from((rect.loc.x, rect.loc.y)),
+        Size::from((rect.size.w, rect.size.h)),
+    )
+}
+
+/// A logical rectangle as a texture source crop.
+///
+/// Only correct because both backdrop textures are built at exactly the output
+/// size — see `wallpaper::prepare`, which does that so this conversion can be
+/// the identity rather than a scale.
+fn texture_src(rect: Rectangle<i32, Logical>) -> Rectangle<f64, smithay::utils::Buffer> {
+    Rectangle::new(
+        Point::from((rect.loc.x as f64, rect.loc.y as f64)),
+        Size::from((rect.size.w as f64, rect.size.h as f64)),
+    )
+}
+
 fn send_frames(surface: &WlSurface, time: u32) {
     with_surface_tree_downward(
         surface,
@@ -926,6 +1062,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let keyboard = state.seat.add_keyboard(Default::default(), 200, 25)?;
     let pointer = state.seat.add_pointer();
 
+    let mut backdrop: Option<Backdrop> = None;
     let mut watcher = config::Watcher::new(config_path.clone());
     let mut current = cfg.clone();
 
@@ -1253,30 +1390,97 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         {
             let (renderer, mut framebuffer) = backend.bind()?;
 
-            // Positions come from the Space, not from the surface list. This is
-            // the line that makes tiling a change of policy rather than a
-            // rewrite.
-            let elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>> = state
-                .space
-                .elements()
-                .filter_map(|window| {
-                    let loc = state.space.element_location(window)?;
-                    let surface = window.toplevel()?.wl_surface().clone();
-                    Some(render_elements_from_surface_tree(
-                        renderer,
-                        &surface,
-                        (loc.x, loc.y),
-                        1.0,
-                        1.0,
-                        Kind::Unspecified,
-                    ))
-                })
-                .flatten()
-                .collect();
+            // Rebuild the backdrop only when something it depends on changes.
+            // Preparing costs a decode, two resizes and six blur passes, which
+            // is fine once and unacceptable per frame.
+            // Two levels, because decoding and scaling cost an order of
+            // magnitude more than blurring. Dragging the blur radius must not
+            // re-read the file.
+            match backdrop_key(&current, logical_size) {
+                None => backdrop = None,
+                Some(key) => match &mut backdrop {
+                    Some(existing) if existing.source == (key.path.clone(), key.size) => {
+                        if existing.blur != (key.radius, key.passes) {
+                            existing.reblur(renderer, &key);
+                        }
+                    }
+                    _ => backdrop = Backdrop::build(renderer, &key),
+                },
+            }
+
+            // Built before the frame, because constructing elements and
+            // uploading textures both need the renderer mutably and the frame
+            // borrows it for its whole life.
+            //
+            // Grouped per window rather than flattened, so each window's blur
+            // patch can be drawn immediately beneath it. A single flat list
+            // would force every patch to be drawn before every window, and the
+            // patch of an upper window would then sit on top of a lower one.
+            let mut layers: Vec<(Rectangle<i32, Logical>, Vec<WaylandSurfaceRenderElement<GlesRenderer>>)> =
+                Vec::new();
+            for window in state.space.elements() {
+                let Some(loc) = state.space.element_location(window) else { continue };
+                let Some(surface) = window.toplevel().map(|t| t.wl_surface().clone()) else {
+                    continue;
+                };
+                let elements = render_elements_from_surface_tree(
+                    renderer,
+                    &surface,
+                    (loc.x, loc.y),
+                    1.0,
+                    1.0,
+                    Kind::Unspecified,
+                );
+                layers.push((Rectangle::new(loc, window.geometry().size), elements));
+            }
 
             let mut frame = renderer.render(&mut framebuffer, size, Transform::Flipped180)?;
             frame.clear(Color32F::new(0.05, 0.06, 0.09, 1.0), &[damage])?;
-            draw_render_elements(&mut frame, 1.0, &elements, &[damage])?;
+
+            if let Some(backdrop) = &backdrop {
+                let whole = Rectangle::from_size(logical_size);
+                // Called through the trait explicitly: `GlesFrame` has an
+                // inherent method of the same name taking two extra shader
+                // arguments, and it shadows the trait one.
+                Frame::render_texture_from_to(
+                    &mut frame,
+                    &backdrop.sharp,
+                    texture_src(whole),
+                    Rectangle::from_size(size),
+                    &[damage],
+                    &[],
+                    Transform::Normal,
+                    1.0,
+                )?;
+            }
+
+            // Back to front. `Space::elements` yields bottom-first, which is
+            // the order to *draw* in — the opposite of what
+            // `draw_render_elements` expects for a combined list, and the
+            // reason the previous flattened version stacked windows upside
+            // down whenever two of them overlapped.
+            for (rect, elements) in &layers {
+                if let Some(backdrop) = &backdrop {
+                    if current.blur {
+                        // Both textures are output-sized, so a window's
+                        // rectangle is its own source crop with no conversion.
+                        if let Some(clipped) = rect.intersection(Rectangle::from_size(logical_size)) {
+                            Frame::render_texture_from_to(
+                                &mut frame,
+                                &backdrop.blurred,
+                                texture_src(clipped),
+                                to_physical(clipped),
+                                &[damage],
+                                &[],
+                                Transform::Normal,
+                                1.0,
+                            )?;
+                        }
+                    }
+                }
+                draw_render_elements(&mut frame, 1.0, elements, &[damage])?;
+            }
+
             let _sync = frame.finish()?;
 
             let now = start.elapsed().as_millis() as u32;

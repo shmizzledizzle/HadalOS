@@ -24,6 +24,8 @@ configured with KDE's discoverability and Hyprland's reach.
 | Settings GUI | iced, its own crate; controls generated from the schema | 2026-08-07 |
 | GUI ↔ compositor | the config file, via hot reload — no IPC, no apply button | 2026-08-07 |
 | Visual language | sampled from niri/KaOS: purple slate, periwinkle, no borders | 2026-08-07 |
+| Blur | CPU, on a static wallpaper, computed once — not a per-frame shader | 2026-08-07 |
+| Backdrop cache | split: decode+scale keyed apart from blur radius | 2026-08-07 |
 
 ## 1. This reverses ARCHITECTURE.md §0
 
@@ -739,3 +741,91 @@ Either compositor-side blur and window chrome — focus rings, rounded corners,
 borders, adopting `style.rs`'s tokens — or the workspace model. Blur is the
 larger and more visible of the two, and it is what makes the rest of the
 aesthetic land.
+
+---
+
+## Milestone 7: wallpaper and blur, 2026-08-07
+
+`src/cusk/src/wallpaper.rs`, plus a restructured render loop.
+
+**Blur needed something to blur.** cusk cleared to a flat colour, and a blurred
+flat colour is the same flat colour — the wallpaper is not a companion feature
+here, it is what makes blur visible at all.
+
+### Software blur, on purpose
+
+The textbook implementation is dual-Kawase in a fragment shader, ping-ponging
+framebuffers every frame. Wrong here twice over: the wallpaper is **static**,
+so re-blurring it sixty times a second produces nothing new; and cusk runs on
+**llvmpipe** (`failed to create dri2 screen` in its own logs), where a
+multi-pass per-frame blur would be the most expensive thing in the compositor.
+
+Doing it in software also makes the blur an ordinary pure function over a byte
+buffer — 13 tests, no GPU, no surface, no running compositor. The properties
+worth having are `a_uniform_image_is_unchanged_by_blur` (catches off-by-one
+windows, bad edges and integer truncation in one assertion) and
+`edges_do_not_darken` (clamping, not transparent-black, or a wallpaper grows a
+vignette nobody asked for).
+
+The honest cost: what shows through a window is the blurred **wallpaper**, not
+the blurred contents of a window behind it. Real per-frame blur needs the
+shader path and is a later milestone.
+
+### Measurement overturned the plan
+
+The first version re-prepared everything whenever anything changed: 2102ms per
+change, which would freeze the compositor for two seconds every time the blur
+slider was released. Timing the stages, on a 1920x1080 source in debug:
+
+| stage | |
+|---|---|
+| decode | 179ms |
+| **resize (Lanczos3)** | **1278ms** |
+| downscale | 190ms |
+| blur r20 x3 | 160ms |
+
+**The blur was never the expensive part.** The cache was split on the wrong
+axis. Decoding and scaling depend on the path and the output size; the blur
+depends on the radius and passes. Separating them, and switching Lanczos3 to
+CatmullRom, took a blur-radius change from 2102ms to **702ms**, measured live:
+
+```
+wallpaper ready in 1832ms (1280x800, blur r40 x3)
+reblurred in 702ms (r90 x3)
+```
+
+The blur itself is computed at half resolution and scaled back — blur is a
+low-pass filter, so the detail dropped is detail it would have destroyed, at a
+quarter of the pixels. That is the downsample step of a dual-Kawase shader,
+applied on the CPU.
+
+### A stacking bug found while reading the renderer
+
+`draw_render_elements` does `render_elements.insert(0, element)`, so its input
+must be **front-to-back**; smithay's own `space_render_elements` calls `.rev()`
+before rendering, and `elements_for_output` is documented "back to front".
+cusk passed `Space::elements()` — bottom-first — straight in, so **stacking
+order was inverted whenever two windows overlapped**. Cascade placement and
+tiling both avoid overlap, which is why nothing looked wrong.
+
+Fixed by the restructure rather than by a `.rev()`: windows are now drawn one
+at a time, back to front, each preceded by its own blur patch. A single
+flattened list would have forced every patch to be drawn before every window,
+putting an upper window's patch on top of a lower window.
+
+### Also
+
+- `Kind::Text` joins the schema, for the wallpaper path. Unvalidated beyond
+  being a string, because a wallpaper that does not exist yet is a normal thing
+  to have in a config you are still writing.
+- New settings: `appearance.wallpaper`, `appearance.blur`,
+  `appearance.blur-radius`, `appearance.blur-passes`, all live.
+- `to_physical` is written out rather than assumed. At scale 1 it is the
+  identity, which is exactly why it is spelled: it stops being so on the first
+  HiDPI output.
+
+### Next
+
+Window chrome — rounded corners and focus rings, adopting the settings app's
+`style.rs` tokens. That plus translucent clients is what makes the reference
+look land; blur only shows through a window that is not opaque.

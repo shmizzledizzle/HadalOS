@@ -60,6 +60,11 @@ pub enum Kind {
     Int { default: i32, min: i32, max: i32 },
     Float { default: f64, min: f64, max: f64 },
     Bool { default: bool },
+    /// Free text — a path, a command. Unvalidated beyond being a string,
+    /// because the set of valid values is not knowable here: a wallpaper that
+    /// does not exist yet is a normal thing to have in a config you are still
+    /// writing, and refusing it would be the editor arguing with the user.
+    Text { default: &'static str },
     /// A closed set of names. Modelled separately from `Text` because the GUI
     /// renders it as a picker and the validator can reject a typo, neither of
     /// which is possible for free text.
@@ -72,6 +77,7 @@ impl Kind {
             Kind::Int { .. } => "integer",
             Kind::Float { .. } => "number",
             Kind::Bool { .. } => "boolean",
+            Kind::Text { .. } => "text",
             Kind::Choice { .. } => "choice",
         }
     }
@@ -81,6 +87,7 @@ impl Kind {
             Kind::Int { default, .. } => Value::Int(*default),
             Kind::Float { default, .. } => Value::Float(*default),
             Kind::Bool { default } => Value::Bool(*default),
+            Kind::Text { default } => Value::Text((*default).to_string()),
             Kind::Choice { default, .. } => Value::Text((*default).to_string()),
         }
     }
@@ -91,6 +98,7 @@ impl Kind {
             Kind::Int { min, max, .. } => Some(format!("{min} to {max}")),
             Kind::Float { min, max, .. } => Some(format!("{min} to {max}")),
             Kind::Bool { .. } => None,
+            Kind::Text { .. } => None,
             Kind::Choice { options, .. } => Some(options.join(", ")),
         }
     }
@@ -131,6 +139,7 @@ impl Kind {
                 }
             }
             (Kind::Bool { .. }, Value::Bool(_)) => Ok(value.clone()),
+            (Kind::Text { .. }, Value::Text(_)) => Ok(value.clone()),
             (Kind::Choice { options, .. }, Value::Text(v)) => {
                 if options.contains(&v.as_str()) {
                     Ok(value.clone())
@@ -218,6 +227,7 @@ macro_rules! rust_type {
     (Int) => { i32 };
     (Float) => { f64 };
     (Bool) => { bool };
+    (Text) => { String };
     (Choice) => { String };
 }
 
@@ -225,6 +235,7 @@ macro_rules! from_value {
     (Int, $v:expr) => { match $v { Value::Int(x) => x, _ => unreachable!() } };
     (Float, $v:expr) => { match $v { Value::Float(x) => x, _ => unreachable!() } };
     (Bool, $v:expr) => { match $v { Value::Bool(x) => x, _ => unreachable!() } };
+    (Text, $v:expr) => { match $v { Value::Text(x) => x, _ => unreachable!() } };
     (Choice, $v:expr) => { match $v { Value::Text(x) => x, _ => unreachable!() } };
 }
 
@@ -232,6 +243,7 @@ macro_rules! to_value {
     (Int, $v:expr) => { Value::Int($v) };
     (Float, $v:expr) => { Value::Float($v) };
     (Bool, $v:expr) => { Value::Bool($v) };
+    (Text, $v:expr) => { Value::Text($v.clone()) };
     (Choice, $v:expr) => { Value::Text($v.clone()) };
 }
 
@@ -336,6 +348,30 @@ settings! {
         doc: "Whether hovering a window focuses it, without a click.",
         apply: Live,
         default: false
+    },
+    wallpaper: Text {
+        key: "appearance.wallpaper",
+        doc: "Image shown behind windows. Leave empty for a plain background.",
+        apply: Live,
+        default: ""
+    },
+    blur: Bool {
+        key: "appearance.blur",
+        doc: "Blur the wallpaper where it shows through a window.",
+        apply: Live,
+        default: true
+    },
+    blur_radius: Int {
+        key: "appearance.blur-radius",
+        doc: "How far the blur spreads, in pixels.",
+        apply: Live,
+        default: 24, min: 0, max: 120
+    },
+    blur_passes: Int {
+        key: "appearance.blur-passes",
+        doc: "Box-blur passes. Three approximates a Gaussian closely.",
+        apply: Live,
+        default: 3, min: 1, max: 5
     },
     terminal: Choice {
         key: "commands.terminal",
@@ -1061,7 +1097,7 @@ mod-key = \"alt\"
     #[test]
     fn sections_are_in_schema_order_and_unique() {
         let sections = sections();
-        assert_eq!(sections, vec!["layout", "input", "commands"]);
+        assert_eq!(sections, vec!["layout", "input", "appearance", "commands"]);
         let unique: std::collections::HashSet<_> = sections.iter().collect();
         assert_eq!(unique.len(), sections.len());
     }
