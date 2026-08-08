@@ -33,6 +33,7 @@ mod layout;
 mod panel;
 mod text;
 mod tiling;
+mod tty;
 mod wallpaper;
 mod workspace;
 
@@ -1289,6 +1290,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     let no_spawn = args.iter().any(|a| a == "--no-spawn");
+
+    // Reports what the tty backend would have to drive, and exits. Safe to run
+    // from inside a running desktop: it never takes DRM master.
+    if args.iter().any(|a| a == "--probe-drm") {
+        match tty::probe() {
+            Ok((access, cards)) => tty::report(&access, &cards),
+            Err(e) => {
+                println!("\n  {e}\n");
+                std::process::exit(1);
+            }
+        }
+        return Ok(());
+    }
     let requested: Option<String> =
         args.iter().find(|a| !a.starts_with('-')).cloned();
 

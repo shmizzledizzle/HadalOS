@@ -25,6 +25,15 @@ smithay = { version = "0.7", default-features = false, features = [
     "wayland_frontend",
     "desktop",
     "use_system_lib",
+    # The tty backend. Enabled ahead of the backend being finished so the
+    # dependency and permission story can be probed before any code depends on
+    # it — discovering a missing library after writing the session handling is
+    # the expensive order.
+    "backend_drm",
+    "backend_gbm",
+    "backend_libinput",
+    "backend_session_libseat",
+    "backend_udev",
 ] }
 winit = "0.30"
 tracing = "0.1"

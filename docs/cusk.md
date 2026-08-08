@@ -40,6 +40,8 @@ configured with KDE's discoverability and Hyprland's reach.
 | Panel | drawn by the compositor; iced cannot speak layer-shell | 2026-08-08 |
 | Reserved space | one `usable_area`, read by tiling, placement and maximise | 2026-08-08 |
 | Text | `fontdue`, no shaping; a system font, never bundled | 2026-08-08 |
+| tty backend | built in phases; phase one probes and never takes DRM master | 2026-08-08 |
+| Session control | exclusive per session — the tty backend is only testable from its own VT | 2026-08-08 |
 
 ## 1. This reverses ARCHITECTURE.md §0
 
@@ -1461,3 +1463,70 @@ A clock is the obvious next panel item and needs a date/time dependency for the
 local timezone, which `std` has no way to determine. Beyond that:
 `wlr-layer-shell` to make the panel a replaceable client, and the tty backend,
 which is what turns cusk from a window into a session.
+
+---
+
+## Milestone 17: the tty backend, phase one, 2026-08-08
+
+`src/cusk/src/tty.rs`, behind `--probe-drm`. Nothing is driven yet.
+
+Running on a virtual terminal is what turns cusk from a window inside someone
+else's session into a session of its own, and it is the largest single piece of
+work in the project: session management, DRM mode-setting, GBM buffers,
+libinput and udev hotplug. The failure mode is also unusually harsh — take DRM
+master, get the mode wrong, and the result is a black screen on a VT with no
+way back but a hard reset.
+
+So it is being built in phases, and phase one cannot hurt anything: it opens
+devices, reads what is connected, prints it, and exits. **It never becomes DRM
+master.** Master is exclusive and KWin holds it; asking would either fail or
+take the display away from the running desktop. Reading connectors and modes
+needs no master, which is exactly why this much is checkable from inside a
+working session.
+
+### Dependencies, checked before writing code that needs them
+
+Present on this machine: libseat 0.9.3 (linked against libsystemd, so the
+logind backend exists), libinput 1.31.3, libudev, libgbm, libdrm 2.4.134,
+`/dev/dri/card0`, and membership of `video`, `input` and `seat`. The five
+smithay features — `backend_drm`, `backend_gbm`, `backend_libinput`,
+`backend_session_libseat`, `backend_udev` — compile against them.
+
+### The finding: session control is exclusive
+
+Acquiring a session fails from inside the desktop, with `ENOSYS`. That is not a
+misconfiguration. logind grants `TakeControl` to **one process per session**,
+the running compositor holds it, and libseat — finding the logind backend
+unusable and `seatd` not running — reports that no backend worked. Two session
+controllers on one session would each believe they owned the input devices.
+
+Worth knowing now rather than after the mode-setting code exists: **the tty
+backend can only ever be tested from its own VT.** There is no arrangement that
+lets it come up beside a running desktop.
+
+So the probe falls back to opening the device directly, which needs only the
+`video` group, and says plainly why. From inside the KDE session:
+
+```
+  no session (Failed to open session: Function not implemented (os error 38))
+  reading devices directly instead — this is expected inside a
+  running desktop, because session control is held by one process
+  at a time and the compositor already running holds it.
+
+  /dev/dri/card0
+      EmbeddedDisplayPort-1 connected
+          preferred  1920x1080@60
+      HDMIA-1      disconnected
+      DisplayPort-1 disconnected
+```
+
+### Next, in order
+
+1. Run `--probe-drm` from a free VT, to exercise the session path that cannot
+   be reached from here.
+2. Mode-setting on eDP-1, rendering a single colour, with a hard timeout that
+   restores the VT — the first thing that can strand a screen, so it should be
+   unable to strand it for more than a few seconds.
+3. libinput, so there is a keyboard.
+4. The render loop, abstracted over winit and DRM.
+5. udev hotplug and VT switching.
