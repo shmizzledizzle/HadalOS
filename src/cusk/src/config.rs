@@ -373,6 +373,12 @@ settings! {
         apply: Live,
         default: 24, min: 0, max: 120
     },
+    font: Text {
+        key: "appearance.font",
+        doc: "Path to a font file. Empty finds one on the system.",
+        apply: Restart,
+        default: ""
+    },
     panel_height: Int {
         key: "appearance.panel-height",
         doc: "Height of the workspace bar along the top edge. Zero hides it.",

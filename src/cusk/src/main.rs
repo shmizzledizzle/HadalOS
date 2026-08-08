@@ -31,6 +31,7 @@ mod geometry;
 mod gpublur;
 mod layout;
 mod panel;
+mod text;
 mod tiling;
 mod wallpaper;
 mod workspace;
@@ -693,6 +694,19 @@ impl Cusk {
         self.focus(window);
         self.relayout();
         tracing::info!("overlay {OVERLAY_APP_ID} centred at {location:?} ({}x{})", size.w, size.h);
+    }
+
+    /// The focused window's title, as the client last set it.
+    fn focused_title(&self) -> Option<String> {
+        let window = self.focused()?;
+        let toplevel = window.toplevel()?;
+        smithay::wayland::compositor::with_states(toplevel.wl_surface(), |states| {
+            states
+                .data_map
+                .get::<smithay::wayland::shell::xdg::XdgToplevelSurfaceData>()
+                .and_then(|data| data.lock().ok().and_then(|data| data.title.clone()))
+        })
+        .filter(|title| !title.trim().is_empty())
     }
 
     /// A click on the panel, if it landed on one.
@@ -1367,6 +1381,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut refused: Option<BackdropKey> = None;
     let mut chrome: Option<chrome::Chrome> = None;
     let mut blur: Option<gpublur::GpuBlur> = None;
+    let mut face = text::find_font(&cfg.font).and_then(|path| {
+        let loaded = text::Face::load(&path);
+        match &loaded {
+            Some(_) => tracing::info!("font {}", path.display()),
+            None => tracing::warn!("could not load font {}", path.display()),
+        }
+        loaded
+    });
+    if face.is_none() {
+        tracing::warn!("no usable font; the panel will show no title");
+    }
+    let mut title_texture: Option<(String, GlesTexture)> = None;
     let pointer_image = cursor::arrow(24);
     let mut pointer_texture: Option<GlesTexture> = None;
     let mut warned_square_corners = false;
@@ -1936,6 +1962,57 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     _ => None,
                 };
 
+            // The focused window's title, prepared here because rasterising
+            // and uploading both need the renderer and the frame borrows it.
+            let title: Option<(Rectangle<i32, Logical>, (u32, u32), GlesTexture)> = (|| {
+                if state.panel_height <= 0 {
+                    return None;
+                }
+                let face = face.as_mut()?;
+                let output = Size::from((logical_size.w, logical_size.h));
+                let pills_end = panel::pills(
+                    output,
+                    state.panel_height,
+                    state.workspaces.len(),
+                    state.workspaces.active_index(),
+                )
+                .last()
+                .map(|p| p.loc.x + p.size.w)
+                .unwrap_or(0);
+
+                let size = (state.panel_height as f32 * 0.5).clamp(9.0, 20.0);
+                // Kept clear of the pills on *both* sides, so a centred title
+                // cannot slide under them on a narrow screen.
+                let budget = logical_size.w - (pills_end + 16) * 2;
+                let text = face.truncate(&state.focused_title()?, size, budget);
+                if text.is_empty() {
+                    return None;
+                }
+                let width = face.measure(&text, size);
+                let image = face.render(&text, size, cusk::theme::TEXT)?;
+                let dimensions = (image.width, image.height);
+
+                // Re-uploaded only when the string changes. A title is drawn
+                // every frame and changes rarely; uploading per frame would be
+                // the launcher icon's mistake a third time.
+                let stale = title_texture
+                    .as_ref()
+                    .map(|(cached, _)| cached != &text)
+                    .unwrap_or(true);
+                if stale {
+                    title_texture = upload(renderer, image).map(|t| (text.clone(), t));
+                }
+                let (_, texture) = title_texture.as_ref()?;
+                let rect = Rectangle::<i32, Logical>::new(
+                    Point::from((
+                        (logical_size.w - width) / 2,
+                        (state.panel_height - dimensions.1 as i32) / 2,
+                    )),
+                    Size::from((width, dimensions.1 as i32)),
+                );
+                Some((rect, dimensions, texture.clone()))
+            })();
+
             // Uploaded once. The arrow never changes, so rebuilding it per
             // frame would be a texture upload per frame for a 24x24 image.
             if pointer_texture.is_none() {
@@ -2204,6 +2281,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         to_physical(pill),
                         &[damage],
                         Color32F::new(c[0], c[1], c[2], c[3]),
+                    )?;
+                }
+
+                // The title, prepared before the frame — see `title` above.
+                if let Some((rect, image_size, texture)) = &title {
+                    Frame::render_texture_from_to(
+                        &mut frame,
+                        texture,
+                        Rectangle::<f64, smithay::utils::Buffer>::from_size(Size::from((
+                            image_size.0 as f64,
+                            image_size.1 as f64,
+                        ))),
+                        to_physical(*rect),
+                        &[damage],
+                        &[],
+                        Transform::Normal,
+                        1.0,
                     )?;
                 }
             }

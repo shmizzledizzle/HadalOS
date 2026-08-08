@@ -39,6 +39,7 @@ configured with KDE's discoverability and Hyprland's reach.
 | Window blur | scene built back to front offscreen; each window blurs what precedes it | 2026-08-07 |
 | Panel | drawn by the compositor; iced cannot speak layer-shell | 2026-08-08 |
 | Reserved space | one `usable_area`, read by tiling, placement and maximise | 2026-08-08 |
+| Text | `fontdue`, no shaping; a system font, never bundled | 2026-08-08 |
 
 ## 1. This reverses ARCHITECTURE.md §0
 
@@ -1402,3 +1403,61 @@ A font rasteriser is the gate on everything else a panel wants — window title,
 clock, workspace names — and on the launcher showing anything but its own list.
 Beyond that, `wlr-layer-shell` would let the panel become a replaceable client,
 and the tty backend is what makes cusk a session rather than a window.
+
+---
+
+## Milestone 16: text, 2026-08-08
+
+`src/cusk/src/text.rs`. The panel shows the focused window's title.
+
+`fontdue` rather than a shaping engine: it rasterises a glyph to a coverage
+bitmap and reports its metrics, which is the job here and no more.
+
+**What it does not do, stated rather than discovered:** no shaping. No
+ligatures, no cursive joining, no reordering. Latin, Greek and Cyrillic come
+out right; Arabic and Devanagari do not. A title in a script that needs shaping
+will be visibly wrong rather than absent, which is the honest failure and still
+a failure. `cosmic-text` is the upgrade path when it matters.
+
+**Nothing is bundled.** A font is found on the system, because shipping one
+means a licence decision and a few hundred kilobytes to repeat what
+`/usr/share/fonts` already says. A *configured* font that does not exist is not
+silently replaced — the user asked for that file, and falling back would leave
+them looking at the wrong typeface with nothing said.
+
+### The tests that matter
+
+- **Descenders sit below the baseline of round letters.** `ymin` is the offset
+  of a bitmap's *bottom* edge from the baseline; applying it with the wrong
+  sign flips every glyph about its own baseline, and that reads as a broken
+  font rather than a sign error. Comparing the lowest inked row of "g" against
+  "o" catches it in one assertion.
+- **Truncated text actually fits its budget.** Cutting by character count
+  instead of measured width is the obvious shortcut and is wrong in both
+  directions in a proportional font.
+- **Ink somewhere, but not everywhere.** All-transparent means nothing drew;
+  all-opaque means glyph bitmaps were pasted as blocks.
+- **Premultiplied**, like every other texture cusk uploads, or the text haloes
+  against the panel.
+
+Advances are summed as floats and rounded once at the end. Rounding per glyph
+accumulates up to half a pixel per character, and the measurement is what
+truncation and centring depend on.
+
+### Uploaded when the string changes, not per frame
+
+A title is drawn every frame and changes rarely. This is the third place that
+mistake could have been made — after the launcher icon and the cursor — so it
+is cached by string, and the rasterised image is cached inside `Face` as well.
+
+### Also
+
+The title is centred, kept clear of the pills on **both** sides so it cannot
+slide underneath them on a narrow screen, and truncated to what is left.
+
+### Next
+
+A clock is the obvious next panel item and needs a date/time dependency for the
+local timezone, which `std` has no way to determine. Beyond that:
+`wlr-layer-shell` to make the panel a replaceable client, and the tty backend,
+which is what turns cusk from a window into a session.

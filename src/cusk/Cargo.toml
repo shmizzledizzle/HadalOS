@@ -31,6 +31,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 toml_edit = "0.25.13"
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
+fontdue = "0.9.4"
 
 [profile.release]
 lto = true
