@@ -175,29 +175,39 @@ impl App {
     fn view(&self) -> Element<'_, Message> {
         let sections = config::sections();
 
-        let nav = column(sections.iter().enumerate().map(|(index, name)| {
-            button(text(heading(name)).size(15))
-                .width(Fill)
-                .padding([9, 12])
-                .style(style::nav_entry(index == self.section))
-                .on_press(Message::Section(index))
-                .into()
+        // A top tab row with an accent underline, not a sidebar. Both
+        // reference shells mark the active section with one thin line and
+        // nothing else — no box, no chevron, no filled panel.
+        let tabs = row(sections.iter().enumerate().map(|(index, name)| {
+            let active = index == self.section;
+            column![
+                button(text(heading(name)).size(14))
+                    .width(Fill)
+                    .padding([8, 4])
+                    .style(style::tab(active))
+                    .on_press(Message::Section(index)),
+                container(space())
+                    .height(Length::Fixed(2.0))
+                    .width(Fill)
+                    .style(style::tab_underline(active)),
+            ]
+            .spacing(6)
+            .width(Length::Fixed(118.0))
+            .into()
         }))
         .spacing(4);
 
-        let sidebar = container(
+        let header = row![
             column![
-                text("cusk").size(22),
-                text("settings").size(13).color(style::TEXT_DIM),
-                space().height(Length::Fixed(14.0)),
-                nav,
+                text("cusk").size(21),
+                text("settings").size(12).color(style::TEXT_DIM),
             ]
-            .spacing(2),
-        )
-        .padding(style::PAD)
-        .width(Length::Fixed(190.0))
-        .height(Fill)
-        .style(style::sidebar);
+            .spacing(1),
+            space().width(Fill),
+            tabs,
+        ]
+        .align_y(iced::Bottom)
+        .spacing(style::GAP);
 
         let current = sections.get(self.section).copied().unwrap_or("layout");
         let cards = column(
@@ -211,10 +221,8 @@ impl App {
             .height(Fill)
             .style(style::scroller);
 
-        let content = column![body, self.footer()].spacing(style::GAP).width(Fill);
-
         container(
-            row![sidebar, content]
+            column![header, body, self.footer()]
                 .spacing(style::GAP)
                 .height(Fill),
         )

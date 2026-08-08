@@ -21,6 +21,9 @@ configured with KDE's discoverability and Hyprland's reach.
 | Schema | one macro declaration; struct and table cannot drift | 2026-08-07 |
 | Bad values | rejected and reported, never clamped or defaulted | 2026-08-07 |
 | Config watching | poll the path; inotify dies on rename-based saves | 2026-08-07 |
+| Settings GUI | iced, its own crate; controls generated from the schema | 2026-08-07 |
+| GUI ↔ compositor | the config file, via hot reload — no IPC, no apply button | 2026-08-07 |
+| Visual language | sampled from niri/KaOS: purple slate, periwinkle, no borders | 2026-08-07 |
 
 ## 1. This reverses ARCHITECTURE.md §0
 
@@ -655,3 +658,84 @@ The settings GUI, which is the half of §4 that is actually hard.
 `set_in_document` and `Config::get` are its foundation: tested, and currently
 with no in-compositor caller. The schema already carries everything a generated
 UI needs — type, default, range, description, and when the change takes effect.
+
+---
+
+## Milestone 6: the settings editor, 2026-08-07
+
+`src/cusk-settings` — iced 0.14, a separate crate so the compositor does not
+link a GUI toolkit.
+
+**It has no model of its own.** Every control is generated from
+`cusk::config::SCHEMA` — slider for `Int`/`Float` at the declared range,
+toggler for `Bool`, picker for `Choice`, description from `doc`, and a
+"Takes effect on restart" line straight from `Apply`. There is no widget list
+to keep in step, so a setting added to the compositor appears here with no
+work. That required `cusk` to grow a lib target: an editor validating against
+its *own copy* of the ranges would be the two-lists failure §4 exists to
+prevent, one process further out.
+
+**Writing the file is the entire mechanism.** No apply button, no IPC. cusk is
+already watching, so a change reaches the running compositor within half a
+second by exactly the path a hand edit takes. The editor watches the file too,
+because a GUI that goes stale the moment you touch the file in an editor is one
+you stop trusting — which is the whole of "without fighting".
+
+- `Watcher::resync` exists because a program that writes the file it watches
+  otherwise reads back its own save as an external edit and rebuilds state on
+  top of whatever the user is dragging.
+- Sliders write on release; toggles and pickers write immediately. Committing
+  every pixel of a drag would hammer the disk and relayout the compositor
+  dozens of times per gesture.
+
+### The aesthetic, sampled rather than guessed
+
+Reference screenshots supplied 2026-08-07. Two were niri, two were KaOS — a
+different shell, but the dark one shares a language, and both were kept as
+references.
+
+| sampled | |
+|---|---|
+| KaOS panel | `#303243` |
+| KaOS deepest surface | `#1D1D2D` |
+| KaOS accent | `#8189B9` |
+| niri accent | `#A3C9FD` |
+| niri panels | vary from `#222226` to `#483040` |
+
+That last row is the important one. The panels vary that much because they are
+**translucent over the wallpaper**, which is the defining feature of the look
+and the one thing a GUI toolkit cannot supply.
+
+What was adopted: a desaturated blue-purple slate rather than blue-black, a
+periwinkle accent between the two references, **no borders anywhere** —
+surfaces separate by fill lightness alone, and a hairline around a rounded card
+is the difference between a shell and a dialog box — larger radii, and low
+contrast on secondary text. Raising that contrast "for legibility" is the
+single change that would most make this stop looking like what it copies.
+
+Structure follows the references too: a top tab row with a thin accent
+underline, not a sidebar. Both mark the active section with one line and
+nothing else.
+
+Everything visual is in `style.rs`, because the compositor's own chrome is
+meant to adopt the same tokens and a palette scattered through view code cannot
+be adopted by anything.
+
+### What the GUI cannot do: blur
+
+The translucency-and-blur that defines the niri screenshot is **compositor
+work, not application work**. A Wayland client cannot sample what is behind its
+own window; the compositor has to blur the background and composite the window
+over it. niri implements exactly this — `niri/src/render_helpers/blur.rs` is
+visible in the reference screenshot's own file listing.
+
+So it is a cusk milestone, not a settings-app one, and it is deliberately not
+faked here: a transparent window without compositor blur is not the look, it is
+just a window you can see through.
+
+### Next
+
+Either compositor-side blur and window chrome — focus rings, rounded corners,
+borders, adopting `style.rs`'s tokens — or the workspace model. Blur is the
+larger and more visible of the two, and it is what makes the rest of the
+aesthetic land.

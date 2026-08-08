@@ -1,8 +1,16 @@
 //! The look, in one file.
 //!
-//! Modelled on niri's visual language: a near-black background with a faint
-//! blue cast, generously rounded surfaces that read as cards rather than
-//! panels, a single vivid accent doing all the emphasis, and a lot of space.
+//! Sampled from the reference screenshots rather than guessed at. niri's own
+//! panels and KaOS's dark shell share a language: a desaturated **blue-purple
+//! slate** (KaOS's panel measures `#303243`, its deepest surface `#1D1D2D`), a
+//! periwinkle accent (niri `#A3C9FD`, KaOS `#8189B9`), and — the part that is
+//! easy to miss — **no borders anywhere**. Both separate surfaces purely by
+//! fill lightness. A hairline around a rounded card is what makes a design
+//! read as a toolkit dialog instead of a shell.
+//!
+//! Contrast is deliberately low. The references keep secondary text close to
+//! its background, and raising it "for legibility" is the single change that
+//! would most make this stop looking like the thing it is copying.
 //!
 //! Everything visual lives here on purpose. The compositor's own chrome —
 //! focus rings, borders, corner radii — is meant to adopt the same tokens
@@ -16,23 +24,26 @@ use iced::{Background, Border, Color, Shadow, Theme, Vector};
 
 // ── palette ──────────────────────────────────────────────────────────────
 
-/// Window background. Near-black, very slightly blue — flat black reads as a
-/// terminal, and a neutral grey reads as a stock toolkit.
-pub const BG: Color = rgb(0x13, 0x13, 0x18);
+/// Window background. Near-black with a purple cast — flat black reads as a
+/// terminal, and neutral grey reads as a stock toolkit.
+pub const BG: Color = rgb(0x17, 0x17, 0x1F);
 /// Cards and controls sitting on the background.
-pub const SURFACE: Color = rgb(0x1C, 0x1C, 0x23);
+pub const SURFACE: Color = rgb(0x23, 0x23, 0x31);
 /// Hover and selected states.
-pub const SURFACE_HI: Color = rgb(0x26, 0x26, 0x30);
-/// Hairlines. Barely visible by design: the rounding does the separating, and
-/// a strong border on a rounded card makes it look like a dialog box.
-pub const BORDER: Color = rgb(0x2E, 0x2E, 0x3A);
-pub const TEXT: Color = rgb(0xE8, 0xE8, 0xF0);
+pub const SURFACE_HI: Color = rgb(0x2E, 0x2E, 0x40);
+/// Recessed fills — pickers, menus, anything that should read as *into* the
+/// surface rather than on top of it. Darker than the card, which is how both
+/// references indicate an input.
+pub const INSET: Color = rgb(0x1E, 0x1E, 0x2A);
+pub const TEXT: Color = rgb(0xE6, 0xE5, 0xF2);
 /// Descriptions and units. Muted enough to recede, light enough to read.
-pub const TEXT_DIM: Color = rgb(0x92, 0x92, 0xA6);
-/// The one accent. niri's focus ring is the obvious reference point.
-pub const ACCENT: Color = rgb(0x7F, 0xC8, 0xFF);
-pub const DANGER: Color = rgb(0xFF, 0x6B, 0x6B);
-pub const WARNING: Color = rgb(0xFF, 0xC1, 0x4E);
+pub const TEXT_DIM: Color = rgb(0x9B, 0x9A, 0xB8);
+/// Periwinkle, between niri's `#A3C9FD` and KaOS's `#8189B9`. One accent
+/// carries every piece of emphasis in both references; a second colour would
+/// immediately read as a different design.
+pub const ACCENT: Color = rgb(0xA3, 0xB4, 0xE8);
+pub const DANGER: Color = rgb(0xE8, 0x89, 0x9B);
+pub const WARNING: Color = rgb(0xE8, 0xC0, 0x8A);
 
 const fn rgb(r: u8, g: u8, b: u8) -> Color {
     Color {
@@ -51,12 +62,12 @@ fn alpha(color: Color, a: f32) -> Color {
 
 /// Card corners. Large enough to be the defining feature rather than a
 /// softened edge — this is the single most recognisable thing about the look.
-pub const RADIUS_CARD: f32 = 14.0;
-pub const RADIUS_CONTROL: f32 = 10.0;
+pub const RADIUS_CARD: f32 = 16.0;
+pub const RADIUS_CONTROL: f32 = 12.0;
 /// Fully round, for pills and slider handles.
 pub const RADIUS_PILL: f32 = 999.0;
-pub const GAP: f32 = 12.0;
-pub const PAD: f32 = 16.0;
+pub const GAP: f32 = 10.0;
+pub const PAD: f32 = 18.0;
 
 pub fn theme() -> Theme {
     Theme::custom(
@@ -87,32 +98,57 @@ pub fn card(_theme: &Theme) -> container::Style {
     container::Style {
         background: Some(Background::Color(SURFACE)),
         text_color: Some(TEXT),
+        // No border. Both references separate surfaces by fill alone, and a
+        // hairline here is the difference between a shell and a dialog box.
         border: Border {
-            color: BORDER,
-            width: 1.0,
+            color: Color::TRANSPARENT,
+            width: 0.0,
             radius: border::Radius::new(RADIUS_CARD),
         },
-        // Barely-there lift. A heavy shadow on a dark theme turns into a smear;
-        // this only has to separate the card from the background.
+        // A heavy shadow on a dark theme turns into a smear; this only has to
+        // lift the card off the background by a hair.
         shadow: Shadow {
-            color: alpha(Color::BLACK, 0.35),
-            offset: Vector::new(0.0, 2.0),
-            blur_radius: 12.0,
+            color: alpha(Color::BLACK, 0.25),
+            offset: Vector::new(0.0, 1.0),
+            blur_radius: 8.0,
         },
         ..Default::default()
     }
 }
 
-pub fn sidebar(_theme: &Theme) -> container::Style {
-    container::Style {
-        background: Some(Background::Color(alpha(SURFACE, 0.5))),
-        text_color: Some(TEXT),
+/// The active tab's underline. The whole tab indicator, deliberately — both
+/// references mark selection with one thin accent line or a filled pill, never
+/// with a box.
+pub fn tab_underline(active: bool) -> impl Fn(&Theme) -> container::Style {
+    move |_theme| container::Style {
+        background: Some(Background::Color(if active {
+            ACCENT
+        } else {
+            Color::TRANSPARENT
+        })),
         border: Border {
-            color: BORDER,
-            width: 1.0,
-            radius: border::Radius::new(RADIUS_CARD),
+            radius: border::Radius::new(RADIUS_PILL),
+            ..Default::default()
         },
         ..Default::default()
+    }
+}
+
+pub fn tab(active: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |_theme, status| {
+        let hovered = matches!(status, button::Status::Hovered);
+        button::Style {
+            background: Some(Background::Color(Color::TRANSPARENT)),
+            text_color: if active {
+                ACCENT
+            } else if hovered {
+                TEXT
+            } else {
+                TEXT_DIM
+            },
+            border: Border::default(),
+            ..Default::default()
+        }
     }
 }
 
@@ -127,8 +163,8 @@ pub fn notice(kind: Notice) -> impl Fn(&Theme) -> container::Style {
             background: Some(Background::Color(alpha(tint, 0.12))),
             text_color: Some(tint),
             border: Border {
-                color: alpha(tint, 0.35),
-                width: 1.0,
+                color: Color::TRANSPARENT,
+                width: 0.0,
                 radius: border::Radius::new(RADIUS_CONTROL),
             },
             ..Default::default()
@@ -144,39 +180,15 @@ pub enum Notice {
 
 // ── controls ─────────────────────────────────────────────────────────────
 
-/// Sidebar entries. Selection is a filled pill, which is the niri-ish move —
-/// no underline, no chevron, just the shape.
-pub fn nav_entry(selected: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
-    move |_theme, status| {
-        let hovered = matches!(status, button::Status::Hovered);
-        button::Style {
-            background: Some(Background::Color(if selected {
-                alpha(ACCENT, 0.16)
-            } else if hovered {
-                SURFACE_HI
-            } else {
-                Color::TRANSPARENT
-            })),
-            text_color: if selected { ACCENT } else { TEXT },
-            border: Border {
-                color: Color::TRANSPARENT,
-                width: 0.0,
-                radius: border::Radius::new(RADIUS_CONTROL),
-            },
-            ..Default::default()
-        }
-    }
-}
-
 pub fn quiet_button(_theme: &Theme, status: button::Status) -> button::Style {
     let hovered = matches!(status, button::Status::Hovered);
     button::Style {
-        background: Some(Background::Color(if hovered { SURFACE_HI } else { SURFACE })),
+        background: Some(Background::Color(if hovered { SURFACE_HI } else { INSET })),
         text_color: if hovered { TEXT } else { TEXT_DIM },
         border: Border {
-            color: BORDER,
-            width: 1.0,
-            radius: border::Radius::new(RADIUS_CONTROL),
+            color: Color::TRANSPARENT,
+            width: 0.0,
+            radius: border::Radius::new(RADIUS_PILL),
         },
         ..Default::default()
     }
@@ -231,10 +243,10 @@ pub fn pick_style(_theme: &Theme, status: pick_list::Status) -> pick_list::Style
         text_color: TEXT,
         placeholder_color: TEXT_DIM,
         handle_color: if hovered { ACCENT } else { TEXT_DIM },
-        background: Background::Color(if hovered { SURFACE_HI } else { BG }),
+        background: Background::Color(if hovered { SURFACE_HI } else { INSET }),
         border: Border {
-            color: if hovered { alpha(ACCENT, 0.5) } else { BORDER },
-            width: 1.0,
+            color: Color::TRANSPARENT,
+            width: 0.0,
             radius: border::Radius::new(RADIUS_CONTROL),
         },
     }
@@ -243,10 +255,10 @@ pub fn pick_style(_theme: &Theme, status: pick_list::Status) -> pick_list::Style
 pub fn menu_style(theme: &Theme) -> iced::overlay::menu::Style {
     let base = iced::overlay::menu::default(theme);
     iced::overlay::menu::Style {
-        background: Background::Color(SURFACE),
+        background: Background::Color(SURFACE_HI),
         border: Border {
-            color: BORDER,
-            width: 1.0,
+            color: Color::TRANSPARENT,
+            width: 0.0,
             radius: border::Radius::new(RADIUS_CONTROL),
         },
         text_color: TEXT,
