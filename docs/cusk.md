@@ -35,6 +35,7 @@ configured with KDE's discoverability and Hyprland's reach.
 | Launcher | a separate client, not part of the compositor | 2026-08-07 |
 | Overlay windows | recognised by app id, classified on first commit not on create | 2026-08-07 |
 | Cursor | drawn in code, not loaded from an XCursor theme | 2026-08-07 |
+| dmabuf | v4 with feedback — v3 alone leaves clients unable to find a GPU | 2026-08-07 |
 
 ## 1. This reverses ARCHITECTURE.md §0
 
@@ -1169,3 +1170,78 @@ a game — has a reason to.
 `zwp_linux_dmabuf`, so clients stop falling back to shared memory — the last
 gap carried from milestone 1. Then per-frame blur of real window content, and a
 panel to hold the workspace indicator.
+
+---
+
+## Milestone 12: dmabuf, 2026-08-07
+
+The last gap carried from milestone 1. Clients now get GPU buffers.
+
+```
+INFO  dmabuf advertised with 133 formats on /dev/dri/renderD128
+```
+
+Client stderr, before and after: **4 `libEGL` warnings → 0.**
+
+### Milestone 1's attribution was right; a later inference from it was wrong
+
+Milestone 1 said the `failed to create dri2 screen` warnings appeared only
+inside cusk because cusk did not advertise `zwp_linux_dmabuf`. That was
+correct. But `wallpaper.rs` later used the same warnings as evidence that
+**cusk itself** ran on llvmpipe, and used that to justify blurring on the CPU.
+
+Probing before writing any code: cusk's EGL reports **240 texture formats and
+133 render formats, with I915 modifiers**. It has been hardware-accelerated the
+whole time. The warnings were always the clients', never cusk's.
+
+The CPU-blur decision survives on its remaining reason — the wallpaper is
+static, so a per-frame shader recomputes an unchanging image — and the comment
+has been corrected in place rather than deleted, because the wrong reason was
+load-bearing when the decision was made.
+
+### Version 3 was not enough, and that was measurable
+
+The first attempt advertised a v3 global with the format list, reasoning that
+v4's feedback was "an optimisation for multi-GPU systems". Advertising it
+changed nothing: the client still emitted all four warnings and still fell
+back.
+
+**Mesa's Wayland EGL learns which render node to open from the feedback's main
+device.** A v3 global carries formats but no device, so a client cannot find a
+GPU, reports `failed to get driver name for fd -1`, and uses software. Feedback
+is not an optimisation here; it is the mechanism.
+
+The device is resolved from `EGLDevice::render_device_path` and `stat`'s
+`rdev`, which needs no `backend_drm` feature. If it cannot be resolved, cusk
+falls back to a v3 global rather than to nothing — a client that already knows
+its device can still use the format list.
+
+### Imports are answered on the next frame
+
+`dmabuf_imported` arrives on the Wayland dispatch, where the renderer is not
+reachable — it lives in the winit backend the event loop owns. The dmabuf and
+its `ImportNotifier` are queued and drained in the render loop.
+
+Dropping a notifier without a verdict does not make the client fall back: **it
+leaves the client waiting for a reply that never comes**, which looks like the
+application froze rather than like the compositor failed to answer. Every
+queued import is answered, successfully or with `failed`.
+
+### A retry loop found by reading its own output
+
+The verification log had **1020 identical wallpaper warnings in a seventeen
+second run**. `Backdrop::build` returning `None` left `backdrop` as `None`, so
+every frame tried the same missing file again — and the comment above it
+claimed the opposite, that a failure was reported once per change "because the
+key is stored either way". It was not stored on failure. A refused key is now
+remembered and not retried until it changes.
+
+That is the second comment in two milestones that confidently described
+behaviour the code did not have, after the launcher's image handle. Both were
+found by running the thing and reading the output, not by re-reading the code.
+
+### Next
+
+Per-frame blur of real window content is now genuinely available — the GPU was
+never the obstacle it was assumed to be. Also outstanding: a panel for the
+workspace indicator, and translucent-client handling.

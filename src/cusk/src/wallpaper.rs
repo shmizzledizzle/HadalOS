@@ -13,10 +13,16 @@
 //! here, twice over:
 //!
 //! - **The wallpaper is static.** Re-blurring an unchanging image 60 times a
-//!   second is work with no output.
-//! - **This runs on llvmpipe.** cusk's own logs report `failed to create dri2
-//!   screen`, so EGL is software-rasterised. A multi-pass blur per frame would
-//!   be the most expensive thing in the compositor by a wide margin.
+//!   second is work with no output. This is the whole of the argument.
+//!
+//! A second reason given here originally was that cusk ran on llvmpipe, on the
+//! evidence of `failed to create dri2 screen` in its logs. **That was wrong.**
+//! Those warnings came from *clients*, which were software-rendering because
+//! cusk did not advertise `zwp_linux_dmabuf`; cusk's own EGL context reports
+//! 240 texture and 133 render formats with I915 modifiers, and has been
+//! hardware-accelerated throughout. Corrected here rather than deleted,
+//! because the wrong reason was load-bearing in the original decision and the
+//! remaining one has to stand on its own — which it does.
 //!
 //! The honest cost of the choice: what shows through a window is the blurred
 //! *wallpaper*, not the blurred contents of whatever window is behind it. Real

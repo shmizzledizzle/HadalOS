@@ -90,9 +90,13 @@ use smithay::wayland::selection::SelectionHandler;
 use smithay::wayland::shell::xdg::{
     PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
 };
+use smithay::wayland::dmabuf::{
+    DmabufFeedbackBuilder, DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier,
+};
 use smithay::wayland::shm::{ShmHandler, ShmState};
 use smithay::{
-    delegate_compositor, delegate_data_device, delegate_seat, delegate_shm, delegate_xdg_shell,
+    delegate_compositor, delegate_data_device, delegate_dmabuf, delegate_seat, delegate_shm,
+    delegate_xdg_shell,
 };
 // `::winit` — smithay re-exports a module of the same name, which shadows it.
 use ::winit::platform::pump_events::PumpStatus;
@@ -182,6 +186,7 @@ struct Cusk {
     compositor_state: CompositorState,
     xdg_shell_state: XdgShellState,
     shm_state: ShmState,
+    dmabuf_state: DmabufState,
     seat_state: SeatState<Self>,
     data_device_state: DataDeviceState,
     seat: Seat<Self>,
@@ -198,6 +203,12 @@ struct Cusk {
 
     /// Whether hovering a window focuses it.
     focus_follows_mouse: bool,
+    /// Dmabufs a client has offered but that have not been tested against the
+    /// renderer yet. Drained every frame, where the renderer is reachable.
+    pending_dmabufs: Vec<(
+        smithay::backend::allocator::dmabuf::Dmabuf,
+        smithay::wayland::dmabuf::ImportNotifier,
+    )>,
     /// What the pointer should look like right now, as clients request it.
     cursor: smithay::input::pointer::CursorImageStatus,
     /// Every workspace, and which one is on screen.
@@ -410,6 +421,27 @@ impl DataDeviceHandler for Cusk {
 }
 impl ClientDndGrabHandler for Cusk {}
 impl ServerDndGrabHandler for Cusk {}
+
+impl DmabufHandler for Cusk {
+    fn dmabuf_state(&mut self) -> &mut DmabufState {
+        &mut self.dmabuf_state
+    }
+
+    fn dmabuf_imported(
+        &mut self,
+        _global: &DmabufGlobal,
+        dmabuf: smithay::backend::allocator::dmabuf::Dmabuf,
+        notifier: ImportNotifier,
+    ) {
+        // The renderer lives in the winit backend, which the event loop owns,
+        // so the import cannot happen here. Queued instead, and answered on the
+        // next frame — the notifier is what tells the client whether its buffer
+        // was accepted, and dropping one without answering leaves the client
+        // waiting forever for a reply that never comes.
+        self.pending_dmabufs.push((dmabuf, notifier));
+    }
+}
+delegate_dmabuf!(Cusk);
 
 impl ShmHandler for Cusk {
     fn shm_state(&self) -> &ShmState {
@@ -1244,6 +1276,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let compositor_state = CompositorState::new::<Cusk>(&dh);
     let shm_state = ShmState::new::<Cusk>(&dh, vec![]);
+    let dmabuf_state = DmabufState::new();
     let mut seat_state = SeatState::new();
     let seat = seat_state.new_wl_seat(&dh, "cusk");
 
@@ -1251,6 +1284,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         compositor_state,
         xdg_shell_state: XdgShellState::new::<Cusk>(&dh),
         shm_state,
+        dmabuf_state,
         data_device_state: DataDeviceState::new::<Cusk>(&dh),
         seat_state,
         seat,
@@ -1268,6 +1302,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ),
         gaps: layout::Gaps { inner: cfg.inner_gap, outer: cfg.outer_gap },
         focus_follows_mouse: cfg.focus_follows_mouse,
+        pending_dmabufs: Vec::new(),
         cursor: smithay::input::pointer::CursorImageStatus::default_named(),
         output_size: (1280, 800),
     };
@@ -1287,6 +1322,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pointer = state.seat.add_pointer();
 
     let mut backdrop: Option<Backdrop> = None;
+    // The last backdrop key that failed to build, so it is not retried every frame.
+    let mut refused: Option<BackdropKey> = None;
     let mut chrome: Option<chrome::Chrome> = None;
     let pointer_image = cursor::arrow(24);
     let mut pointer_texture: Option<GlesTexture> = None;
@@ -1295,6 +1332,67 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut current = cfg.clone();
 
     let (mut backend, mut winit_loop) = winit::init::<GlesRenderer>()?;
+
+    // Advertised only if the renderer can actually import. A dmabuf global that
+    // rejects every buffer is worse than none: clients see the protocol, try
+    // it, fail, and fall back — having paid for the round trip and, for some,
+    // having already given up on shared memory.
+    {
+        let formats: Vec<_> = backend
+            .renderer()
+            .egl_context()
+            .dmabuf_render_formats()
+            .iter()
+            .copied()
+            .collect();
+        if formats.is_empty() {
+            tracing::warn!(
+                "no dmabuf render formats; clients will keep falling back to shared memory"
+            );
+        } else {
+            let count = formats.len();
+
+            // Version 4, with default feedback, and the feedback is the point.
+            // A v3 global carries formats but no device, and Mesa's Wayland EGL
+            // learns *which render node to open* from the feedback's main
+            // device. Without it a client cannot find a GPU, reports
+            // `failed to get driver name for fd -1`, and falls back to software
+            // — which is the exact symptom this milestone exists to remove.
+            // Advertising v3 alone was measured to change nothing.
+            let device = smithay::backend::egl::EGLDevice::device_for_display(
+                backend.renderer().egl_context().display(),
+            )
+            .ok()
+            .and_then(|device| device.render_device_path().ok())
+            .and_then(|path| {
+                use std::os::unix::fs::MetadataExt;
+                std::fs::metadata(&path).ok().map(|meta| (path, meta.rdev()))
+            });
+
+            match device {
+                Some((path, dev)) => {
+                    let feedback = DmabufFeedbackBuilder::new(dev, formats).build()?;
+                    let _global = state
+                        .dmabuf_state
+                        .create_global_with_default_feedback::<Cusk>(&dh, &feedback);
+                    tracing::info!(
+                        "dmabuf advertised with {count} formats on {}",
+                        path.display()
+                    );
+                }
+                None => {
+                    // Falling back to v3 rather than to nothing: a client that
+                    // already knows its device can still use the format list.
+                    let _global = state.dmabuf_state.create_global::<Cusk>(&dh, formats);
+                    tracing::warn!(
+                        "dmabuf advertised with {count} formats but no device node; \
+                         clients that cannot guess a render node will use shared memory"
+                    );
+                }
+            }
+        }
+    }
+
     let start = std::time::Instant::now();
 
     // Resolved once, outside the startup branch, because the spawn keybinding
@@ -1673,13 +1771,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // re-read the file.
             match backdrop_key(&current, logical_size) {
                 None => backdrop = None,
+                // A key that has already failed is not retried. The comment
+                // here used to claim a failure was "reported once per change,
+                // because the key is stored either way" — it was not: a failed
+                // build leaves `backdrop` as `None`, so the next frame tried
+                // again, and a missing wallpaper produced 1020 identical
+                // warnings in a seventeen-second run.
+                Some(key) if refused.as_ref() == Some(&key) => {}
                 Some(key) => match &mut backdrop {
                     Some(existing) if existing.source == (key.path.clone(), key.size) => {
                         if existing.blur != (key.radius, key.passes) {
                             existing.reblur(renderer, &key);
                         }
                     }
-                    _ => backdrop = Backdrop::build(renderer, &key),
+                    _ => {
+                        backdrop = Backdrop::build(renderer, &key);
+                        refused = backdrop.is_none().then_some(key);
+                    }
                 },
             }
 
@@ -1711,6 +1819,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
                 let focused = state.focused().as_ref() == Some(window);
                 layers.push((Rectangle::new(loc, window.geometry().size), focused, elements));
+            }
+
+            // Answered here because this is where the renderer is reachable.
+            // A notifier dropped without a verdict leaves the client waiting
+            // for a reply that never comes — it does not fall back, it hangs,
+            // which looks like the client froze rather than like the compositor
+            // failed to answer.
+            for (dmabuf, notifier) in state.pending_dmabufs.drain(..) {
+                use smithay::backend::renderer::ImportDma;
+                match renderer.import_dmabuf(&dmabuf, None) {
+                    Ok(_) => {
+                        let _ = notifier.successful::<Cusk>();
+                    }
+                    Err(e) => {
+                        tracing::warn!("rejected a dmabuf: {e}");
+                        notifier.failed();
+                    }
+                }
             }
 
             // Built before the frame for the same reason the window layers are:
