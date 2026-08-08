@@ -1619,9 +1619,42 @@ choose. The watchdog is still the guarantee; this is the door beside it.
 - **The keys seen are reported, not just "input works".** Those are different
   claims and only the second is worth making.
 
+### Confirmed from a VT, 2026-08-08
+
+Escape ended the test early and the key codes were reported. Input reaches the
+compositor from a tty.
+
+---
+
+## Milestone 20: the GPU path, 2026-08-08
+
+`--probe-render`. The unknown standing in front of phase four, removed before
+it could surface in the middle of a refactor.
+
+Everything on the tty so far has used a **dumb buffer** — CPU memory the
+display controller scans out — which says nothing about whether the GPU path
+works there. The render loop needs GBM to allocate, EGL on the DRM node for a
+context, and a `GlesRenderer` on top. Any of those failing during the
+restructure of `main.rs` would be expensive to diagnose; failing here costs
+twenty lines.
+
+It uses the **render node**, so it needs neither a session nor DRM master and
+runs from inside a desktop. Scanout is the part that needs the card node, and
+scanout is already proven by the mode-set test.
+
+```
+  /dev/dri/renderD128 — GBM, EGL and GlesRenderer all work, and the pixels are right
+```
+
+**It reads the pixels back rather than trusting the return values.** A context
+on the wrong device can succeed at every call and render nothing; "the calls
+returned Ok" and "the picture is right" are different claims and only the
+second is worth making. The colour has three distinct channels, so a channel
+swap shows up as a wrong answer rather than as the same number twice.
+
 ### Next, in order
 
-1. ~~Mode-setting~~ and ~~libinput~~ — done. on eDP-1, rendering a single colour, with a hard timeout that
+1. ~~Mode-setting~~, ~~libinput~~ and ~~the GPU path~~ — done. on eDP-1, rendering a single colour, with a hard timeout that
    restores the VT — the first thing that can strand a screen, so it should be
    unable to strand it for more than a few seconds.
 2. libinput, so there is a keyboard.

@@ -533,3 +533,101 @@ fn pump(libinput: &mut input::Libinput, keys: &mut Vec<u32>) -> bool {
     }
     escape
 }
+
+// ── phase three and a half: GL on the GPU cusk will actually use ─────────
+
+/// Prove a `GlesRenderer` can be built on the DRM device through GBM, and that
+/// it draws what it is told to.
+///
+/// The unknown standing in front of phase four. Everything on the tty so far
+/// has used a **dumb buffer** — CPU memory the display controller scans out —
+/// which says nothing about whether the GPU path works there. The render loop
+/// needs GBM for allocation, EGL on the DRM node for a context, and a
+/// `GlesRenderer` on top. If any of that fails it should fail here, in twenty
+/// lines that can be run from a desktop, rather than in the middle of
+/// restructuring the compositor's render loop.
+///
+/// Deliberately uses the **render node** (`renderD128`), which needs neither a
+/// session nor DRM master — so unlike everything else in this module it runs
+/// anywhere. Scanout is the part that needs the card node, and scanout is
+/// already proven by the mode-set test.
+pub fn probe_render() -> Result<String, String> {
+    use smithay::backend::allocator::gbm::GbmDevice;
+    use smithay::backend::egl::{EGLContext, EGLDisplay};
+    use smithay::backend::renderer::gles::GlesRenderer;
+    use smithay::backend::renderer::{Bind, Color32F, ExportMem, Frame, Offscreen, Renderer};
+    use smithay::utils::{Rectangle, Size, Transform};
+
+    let path = std::path::Path::new("/dev/dri/renderD128");
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|e| format!("could not open {}: {e}", path.display()))?;
+
+    let gbm = GbmDevice::new(file).map_err(|e| format!("no GBM device: {e}"))?;
+    let display =
+        unsafe { EGLDisplay::new(gbm) }.map_err(|e| format!("no EGL display on the GPU: {e}"))?;
+    let context = EGLContext::new(&display).map_err(|e| format!("no EGL context: {e}"))?;
+    let mut renderer =
+        unsafe { GlesRenderer::new(context) }.map_err(|e| format!("no GL renderer: {e}"))?;
+
+    // Small on purpose: this is a correctness check, not a benchmark. Two
+    // sizes because allocation is in buffer coordinates and rendering is in
+    // physical ones — the same numbers, different meanings, and smithay makes
+    // the distinction in the type so it cannot be conflated by accident.
+    let size = Size::<i32, smithay::utils::Buffer>::from((64, 64));
+    let physical = Size::<i32, smithay::utils::Physical>::from((64, 64));
+    let mut target: smithay::backend::renderer::gles::GlesTexture =
+        Offscreen::create_buffer(&mut renderer, DrmFourcc::Abgr8888, size)
+            .map_err(|e| format!("could not allocate a render target: {e}"))?;
+
+    // A colour with all three channels distinct, so a channel swap shows up as
+    // a wrong answer rather than as the same number twice.
+    let expected = [0x11u8, 0x99, 0x33];
+    {
+        let mut framebuffer = renderer
+            .bind(&mut target)
+            .map_err(|e| format!("could not bind the target: {e}"))?;
+        let mut frame = renderer
+            .render(&mut framebuffer, physical, Transform::Normal)
+            .map_err(|e| format!("could not start a frame: {e}"))?;
+        frame
+            .clear(
+                Color32F::new(
+                    expected[0] as f32 / 255.0,
+                    expected[1] as f32 / 255.0,
+                    expected[2] as f32 / 255.0,
+                    1.0,
+                ),
+                &[Rectangle::from_size(physical)],
+            )
+            .map_err(|e| format!("could not clear: {e}"))?;
+        let _ = frame.finish();
+    }
+
+    // Read it back. "The calls returned Ok" is not the same claim as "the
+    // pixels are right", and only the second one is worth making — a context
+    // on the wrong device can succeed at every call and render nothing.
+    let framebuffer = renderer
+        .bind(&mut target)
+        .map_err(|e| format!("could not re-bind for readback: {e}"))?;
+    let mapping = renderer
+        .copy_framebuffer(&framebuffer, Rectangle::from_size(size), DrmFourcc::Abgr8888)
+        .map_err(|e| format!("could not copy the framebuffer: {e}"))?;
+    let pixels = renderer
+        .map_texture(&mapping)
+        .map_err(|e| format!("could not map the copy: {e}"))?;
+
+    let got = pixels.get(0..3).ok_or("readback was empty")?;
+    if got != expected {
+        return Err(format!(
+            "rendered the wrong colour: expected {expected:02X?}, got {got:02X?}"
+        ));
+    }
+
+    Ok(format!(
+        "{} — GBM, EGL and GlesRenderer all work, and the pixels are right",
+        path.display()
+    ))
+}

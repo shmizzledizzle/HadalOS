@@ -1304,6 +1304,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    // Proves the GPU path the tty render loop will need. Uses the render node,
+    // so it needs no session and runs anywhere.
+    if args.iter().any(|a| a == "--probe-render") {
+        match tty::probe_render() {
+            Ok(message) => println!("\n  {message}\n"),
+            Err(e) => {
+                println!("\n  {e}\n");
+                std::process::exit(1);
+            }
+        }
+        return Ok(());
+    }
+
     // Sets a real mode and takes DRM master, so it cannot run beside another
     // compositor. Bounded by a watchdog that restores the display and exits
     // whatever the main thread is doing.
