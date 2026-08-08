@@ -43,10 +43,13 @@
 //! out here costs nothing.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use smithay::backend::session::libseat::LibSeatSession;
 use smithay::backend::session::Session;
-use smithay::reexports::drm::control::{connector, Device as ControlDevice};
+use smithay::reexports::drm::buffer::DrmFourcc;
+use smithay::reexports::drm::control::{connector, crtc, framebuffer, Device as ControlDevice};
+use smithay::reexports::drm::{self, Device as DrmDevice};
 use smithay::reexports::rustix;
 
 /// A DRM device as found, with whatever could be read from it.
@@ -76,7 +79,7 @@ impl std::os::fd::AsFd for Opened {
         std::os::fd::AsFd::as_fd(&self.file)
     }
 }
-impl smithay::reexports::drm::Device for Opened {}
+impl DrmDevice for Opened {}
 impl ControlDevice for Opened {}
 
 /// How the devices were reached.
@@ -246,4 +249,180 @@ pub fn report(access: &Access, cards: &[Card]) {
         println!("  (ctrl+alt+F3, log in, then run cusk --probe-drm).");
     }
     println!();
+}
+
+// ── phase two: setting a mode ────────────────────────────────────────────
+
+/// What the CRTC was doing before we touched it.
+///
+/// Saved so it can be put back. Restoring is not a courtesy — a compositor
+/// that takes DRM master, sets a mode and exits leaves the display showing
+/// whatever was last scanned out, with no text console to type into.
+#[derive(Debug, Clone, Copy)]
+struct Previous {
+    crtc: crtc::Handle,
+    mode: Option<drm::control::Mode>,
+    framebuffer: Option<framebuffer::Handle>,
+    position: (u32, u32),
+    connector: connector::Handle,
+}
+
+impl Previous {
+    fn restore(&self, card: &Opened) {
+        // Errors are reported and not propagated. This runs on the way out,
+        // including from the watchdog, and there is nothing above it that
+        // could do anything more useful than say so.
+        if let Err(e) = card.set_crtc(
+            self.crtc,
+            self.framebuffer,
+            self.position,
+            &[self.connector],
+            self.mode,
+        ) {
+            eprintln!("  could not restore the previous mode: {e}");
+        }
+    }
+}
+
+/// Set a mode on the first connected output, show a colour, and put it back.
+///
+/// `seconds` is how long the colour stays up. The whole point of this phase is
+/// that it cannot outstay it: a watchdog thread restores the mode and kills the
+/// process regardless of what the main thread is doing, and it is armed
+/// **before** master is taken so a hang inside mode-setting cannot escape it.
+pub fn modeset(seconds: u64) -> Result<(), String> {
+    let (mut session, _notifier) =
+        LibSeatSession::new().map_err(|e| format!("could not join a session: {e}\n  \
+             This needs its own VT — see --probe-drm."))?;
+
+    let path = drm_devices()
+        .into_iter()
+        .next()
+        .ok_or("no DRM device under /dev/dri")?;
+    let fd = session
+        .open(
+            &path,
+            rustix::fs::OFlags::RDWR | rustix::fs::OFlags::CLOEXEC | rustix::fs::OFlags::NONBLOCK,
+        )
+        .map_err(|e| format!("session refused {}: {e}", path.display()))?;
+    let card = Arc::new(Opened { file: std::fs::File::from(fd) });
+
+    // Pick the target before touching anything, so a machine with nothing
+    // connected fails having changed no state at all.
+    let resources = card
+        .resource_handles()
+        .map_err(|e| format!("could not read resources: {e}"))?;
+    let (connector_handle, mode) = resources
+        .connectors()
+        .iter()
+        .filter_map(|handle| card.get_connector(*handle, true).ok())
+        .filter(|info| info.state() == connector::State::Connected)
+        .find_map(|info| info.modes().first().copied().map(|mode| (info.handle(), mode)))
+        .ok_or("no connected output with a mode")?;
+
+    let connector_info = card
+        .get_connector(connector_handle, false)
+        .map_err(|e| format!("could not re-read the connector: {e}"))?;
+    let name = format!("{:?}-{}", connector_info.interface(), connector_info.interface_id());
+
+    // The CRTC currently driving this connector, via its encoder. Reusing the
+    // existing one rather than picking any free CRTC is what makes the saved
+    // state and the restore refer to the same hardware.
+    let crtc_handle = connector_info
+        .current_encoder()
+        .and_then(|handle| card.get_encoder(handle).ok())
+        .and_then(|encoder| encoder.crtc())
+        .or_else(|| resources.crtcs().first().copied())
+        .ok_or("no CRTC available for that connector")?;
+
+    let info = card
+        .get_crtc(crtc_handle)
+        .map_err(|e| format!("could not read the CRTC: {e}"))?;
+    let previous = Previous {
+        crtc: crtc_handle,
+        mode: info.mode(),
+        framebuffer: info.framebuffer(),
+        position: info.position(),
+        connector: connector_handle,
+    };
+
+    let (width, height) = mode.size();
+    println!();
+    println!("  {name}  {width}x{height}@{}", mode.vrefresh());
+    println!("  showing a colour for {seconds}s, then restoring");
+    println!();
+
+    // Armed before master is taken. Everything after this point is inside the
+    // watchdog's window, including the mode-set itself — which is the only
+    // arrangement where a hang in mode-setting cannot strand the screen.
+    let watchdog_card = Arc::clone(&card);
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(seconds + 2));
+        eprintln!("  watchdog fired — restoring and exiting");
+        previous.restore(&watchdog_card);
+        let _ = watchdog_card.release_master_lock();
+        // Hard exit. The main thread is by definition not answering, so
+        // unwinding would wait on the thing that is stuck.
+        std::process::exit(2);
+    });
+
+    let result = show_colour(&card, &previous, connector_handle, crtc_handle, mode, seconds);
+
+    // The ordinary path out. The watchdog will also do this if it gets there
+    // first; `set_crtc` twice with the same arguments is harmless.
+    previous.restore(&card);
+    let _ = card.release_master_lock();
+    result
+}
+
+fn show_colour(
+    card: &Opened,
+    previous: &Previous,
+    connector: connector::Handle,
+    crtc: crtc::Handle,
+    mode: drm::control::Mode,
+    seconds: u64,
+) -> Result<(), String> {
+    card.acquire_master_lock()
+        .map_err(|e| format!("could not become DRM master: {e}\n  \
+             Another compositor holds it — this needs its own VT."))?;
+
+    let (width, height) = mode.size();
+    let mut buffer = card
+        .create_dumb_buffer((width as u32, height as u32), DrmFourcc::Xrgb8888, 32)
+        .map_err(|e| format!("could not allocate a buffer: {e}"))?;
+
+    {
+        let mut mapping = card
+            .map_dumb_buffer(&mut buffer)
+            .map_err(|e| format!("could not map the buffer: {e}"))?;
+        // HadalOS's own blue, so what appears on screen is unmistakably cusk
+        // and not a leftover framebuffer. XRGB8888 is little-endian, so the
+        // bytes go B, G, R, X.
+        for pixel in mapping.as_mut().chunks_exact_mut(4) {
+            pixel[0] = 0x1A;
+            pixel[1] = 0x11;
+            pixel[2] = 0x08;
+            pixel[3] = 0x00;
+        }
+    }
+
+    let fb = card
+        .add_framebuffer(&buffer, 24, 32)
+        .map_err(|e| format!("could not add a framebuffer: {e}"))?;
+
+    let outcome = card
+        .set_crtc(crtc, Some(fb), (0, 0), &[connector], Some(mode))
+        .map_err(|e| format!("could not set the mode: {e}"));
+
+    if outcome.is_ok() {
+        std::thread::sleep(std::time::Duration::from_secs(seconds));
+    }
+
+    // Put the old mode back before tearing down the buffer it might otherwise
+    // still be scanning out of.
+    previous.restore(card);
+    let _ = card.destroy_framebuffer(fb);
+    let _ = card.destroy_dumb_buffer(buffer);
+    outcome
 }

@@ -1536,6 +1536,55 @@ prerequisite for phase two is now verified rather than assumed: the libraries
 link, the session is obtainable, the device opens through it, and the target is
 eDP-1 at 1920x1080@60.
 
+---
+
+## Milestone 18: the tty backend, phase two — setting a mode, 2026-08-08
+
+`cusk --modeset-test [--seconds=N]`. Sets a real mode on the first connected
+output, fills it with HadalOS blue, and puts the display back.
+
+The first step that can strand a screen, so the safety design matters more than
+the mode-setting.
+
+### The watchdog is armed before master is taken
+
+A thread sleeps, restores the saved CRTC, drops master and hard-exits — and it
+is started **before** `acquire_master_lock`, so the mode-set itself is inside
+its window. Arming it afterwards would leave the one operation most likely to
+hang as the one operation it could not rescue.
+
+It exits with `process::exit` rather than unwinding, because by the time it
+fires the main thread is by definition not answering, and unwinding would wait
+on the thing that is stuck.
+
+### Restoring is not a courtesy
+
+The previous CRTC — mode, framebuffer and position — is read before anything is
+touched and put back on every path out: the normal one, the watchdog, and
+before the buffer is destroyed. A compositor that takes master, sets a mode and
+exits leaves the display scanning out whatever was last there, with no text
+console to type into.
+
+The target CRTC is the one already driving that connector, via its encoder,
+rather than any free one — so the saved state and the restore refer to the same
+hardware.
+
+### A dumb buffer, not GBM
+
+Phase two only has to prove a mode can be set and something appears. A DRM dumb
+buffer is allocated, mapped, and filled with a colour, which skips GBM and EGL
+entirely. Those arrive with the render loop, where they are actually needed.
+
+### It refuses rather than fights
+
+Run inside the desktop it stops at session acquisition and says so, never
+reaching DRM master:
+
+```
+  could not join a session: Failed to open session: Function not implemented
+  This needs its own VT — see --probe-drm.
+```
+
 ### Next, in order
 
 1. Mode-setting on eDP-1, rendering a single colour, with a hard timeout that

@@ -1303,6 +1303,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         return Ok(());
     }
+
+    // Sets a real mode and takes DRM master, so it cannot run beside another
+    // compositor. Bounded by a watchdog that restores the display and exits
+    // whatever the main thread is doing.
+    if args.iter().any(|a| a == "--modeset-test") {
+        let seconds = args
+            .iter()
+            .find_map(|a| a.strip_prefix("--seconds="))
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(5);
+        match tty::modeset(seconds) {
+            Ok(()) => println!("\n  mode set and restored cleanly.\n"),
+            Err(e) => {
+                println!("\n  {e}\n");
+                std::process::exit(1);
+            }
+        }
+        return Ok(());
+    }
     let requested: Option<String> =
         args.iter().find(|a| !a.starts_with('-')).cloned();
 
