@@ -1520,13 +1520,27 @@ So the probe falls back to opening the device directly, which needs only the
       DisplayPort-1 disconnected
 ```
 
+### Confirmed from a VT, 2026-08-08
+
+```
+  session acquired, seat: seat0
+
+  /dev/dri/card0
+      EmbeddedDisplayPort-1 connected
+          preferred  1920x1080@60
+```
+
+The fallback message is gone, so libseat's logind backend granted
+`TakeControl` once no other compositor held it — **without root**. Every
+prerequisite for phase two is now verified rather than assumed: the libraries
+link, the session is obtainable, the device opens through it, and the target is
+eDP-1 at 1920x1080@60.
+
 ### Next, in order
 
-1. Run `--probe-drm` from a free VT, to exercise the session path that cannot
-   be reached from here.
-2. Mode-setting on eDP-1, rendering a single colour, with a hard timeout that
+1. Mode-setting on eDP-1, rendering a single colour, with a hard timeout that
    restores the VT — the first thing that can strand a screen, so it should be
    unable to strand it for more than a few seconds.
-3. libinput, so there is a keyboard.
-4. The render loop, abstracted over winit and DRM.
-5. udev hotplug and VT switching.
+2. libinput, so there is a keyboard.
+3. The render loop, abstracted over winit and DRM.
+4. udev hotplug and VT switching.
