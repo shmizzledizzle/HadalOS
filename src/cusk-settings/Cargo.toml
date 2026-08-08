@@ -1,0 +1,17 @@
+[package]
+name = "cusk-settings"
+version = "0.1.0"
+edition = "2021"
+description = "Settings editor for the cusk window manager"
+license = "GPL-2.0-only"
+
+[[bin]]
+name = "cusk-settings"
+path = "src/main.rs"
+
+[dependencies]
+# The schema comes from the compositor's own crate rather than being restated
+# here. A settings editor with its own idea of the ranges is the two-lists
+# failure `cusk::config` exists to prevent, one process further out.
+cusk = { path = "../cusk" }
+iced = { version = "0.14.0", features = ["tokio"] }

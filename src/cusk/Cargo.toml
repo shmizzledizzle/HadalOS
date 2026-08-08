@@ -5,6 +5,10 @@ edition = "2021"
 description = "The HadalOS window manager — Wayland, floating and dynamic tiling"
 license = "GPL-2.0-only"
 
+[lib]
+name = "cusk"
+path = "src/lib.rs"
+
 [[bin]]
 name = "cusk"
 path = "src/main.rs"

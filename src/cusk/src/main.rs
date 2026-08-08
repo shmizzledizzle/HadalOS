@@ -22,10 +22,8 @@
 //! never run is not a compositor that works, and finding that out from a TTY
 //! costs a reboot.
 
-#[allow(dead_code)] // `get` and `set_in_document` are the GUI and broker
-// surfaces from §4: covered by tests, with no in-compositor caller until the
-// settings editor and the SetSetting action land.
-mod config;
+use cusk::config;
+
 mod floating;
 mod geometry;
 mod layout;

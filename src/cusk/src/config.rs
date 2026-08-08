@@ -531,6 +531,38 @@ pub fn set_in_document(
 }
 
 
+/// The sections settings are grouped under, in the order the schema declares
+/// them.
+///
+/// First-appearance order rather than alphabetical: the schema's order is a
+/// deliberate editorial choice about what a reader meets first, and sorting it
+/// would throw that away and put "commands" before "layout".
+pub fn sections() -> Vec<&'static str> {
+    let mut out: Vec<&'static str> = Vec::new();
+    for setting in SCHEMA {
+        let (table, _) = setting.path();
+        if !out.contains(&table) {
+            out.push(table);
+        }
+    }
+    out
+}
+
+/// The settings in one section, in schema order.
+pub fn settings_in(section: &str) -> Vec<&'static Setting> {
+    SCHEMA.iter().filter(|s| s.path().0 == section).collect()
+}
+
+/// The leaf name, formatted for display: `master-ratio` becomes `Master ratio`.
+pub fn label_of(setting: &Setting) -> String {
+    let (_, leaf) = setting.path();
+    let mut chars = leaf.replace('-', " ");
+    if let Some(first) = chars.get_mut(0..1) {
+        first.make_ascii_uppercase();
+    }
+    chars
+}
+
 // ── hot reload ───────────────────────────────────────────────────────────
 
 /// A cheap fingerprint of the file, for detecting edits.
@@ -613,6 +645,16 @@ impl Watcher {
         }
         self.last_checked = std::time::Instant::now();
         self.check_now()
+    }
+
+    /// Accept the file as it is now, without reporting it as a change.
+    ///
+    /// For a program that writes the file it is watching. Without this the
+    /// settings GUI reads back its own save as an external edit and rebuilds
+    /// its state from disk mid-interaction, which lands on top of whatever the
+    /// user is currently dragging.
+    pub fn resync(&mut self) {
+        self.stamp = Stamp::of(&self.path);
     }
 
     /// The same check without the rate limit, so tests do not sleep.
@@ -975,6 +1017,19 @@ mod-key = \"alt\"
         assert!(matches!(watcher.check_now(), Reload::Unchanged));
     }
 
+    /// A program that writes the file it watches must not see its own save.
+    #[test]
+    fn resync_swallows_our_own_write() {
+        let path = temp_config("selfwrite.toml", "[layout]\ninner-gap = 3\n");
+        let mut watcher = Watcher::new(path.clone());
+        std::fs::write(&path, "[layout]\ninner-gap = 9\n").unwrap();
+        watcher.resync();
+        assert!(
+            matches!(watcher.check_now(), Reload::Unchanged),
+            "our own write must not come back as an external edit"
+        );
+    }
+
     #[test]
     fn restart_only_settings_are_named_not_silently_skipped() {
         let old = Config::default();
@@ -1001,5 +1056,31 @@ mod-key = \"alt\"
                 setting.key
             );
         }
+    }
+
+    #[test]
+    fn sections_are_in_schema_order_and_unique() {
+        let sections = sections();
+        assert_eq!(sections, vec!["layout", "input", "commands"]);
+        let unique: std::collections::HashSet<_> = sections.iter().collect();
+        assert_eq!(unique.len(), sections.len());
+    }
+
+    /// Every setting must reach exactly one section, or the GUI silently drops
+    /// it — a setting that exists, validates, and is unreachable from the
+    /// editor is worse than one that is missing.
+    #[test]
+    fn every_setting_appears_in_exactly_one_section() {
+        let mut seen = 0;
+        for section in sections() {
+            seen += settings_in(section).len();
+        }
+        assert_eq!(seen, SCHEMA.len());
+    }
+
+    #[test]
+    fn labels_are_readable() {
+        let setting = Config::setting("layout.master-ratio").unwrap();
+        assert_eq!(label_of(setting), "Master ratio");
     }
 }
