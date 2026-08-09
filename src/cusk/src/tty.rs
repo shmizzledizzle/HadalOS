@@ -274,6 +274,10 @@ impl Previous {
         // Errors are reported and not propagated. This runs on the way out,
         // including from the watchdog, and there is nothing above it that
         // could do anything more useful than say so.
+        //
+        // Except a revoked device, which is not a failure: it means another VT
+        // owns the display, so there is no mode of ours left to put back, and
+        // saying "could not restore" there is alarming and wrong.
         if let Err(e) = card.set_crtc(
             self.crtc,
             self.framebuffer,
@@ -281,7 +285,11 @@ impl Previous {
             &[self.connector],
             self.mode,
         ) {
-            eprintln!("  could not restore the previous mode: {e}");
+            if Drm::is_revoked(&e) {
+                tracing::debug!("no mode to restore; another VT owns the display");
+            } else {
+                eprintln!("  could not restore the previous mode: {e}");
+            }
         }
     }
 }
@@ -1051,19 +1059,33 @@ impl Drm {
     /// driver does not have yet. `set_crtc` is synchronous and tears, which is
     /// visible and honest, where a flip queued twice without draining silently
     /// returns `EBUSY` and the screen simply stops updating.
-    pub fn present(&mut self) -> Result<(), String> {
+    /// Returns the raw error, because the caller must distinguish *this is not
+    /// our display right now* from *this is broken*. Collapsing both to a
+    /// string made a VT switch look like a fatal fault, and cusk exited on it.
+    pub fn present(&mut self) -> std::io::Result<()> {
         let back = 1 - self.front;
-        self.card
-            .set_crtc(
-                self.crtc,
-                Some(self.surfaces[back].framebuffer),
-                (0, 0),
-                &[self.connector],
-                Some(self.mode),
-            )
-            .map_err(|e| format!("could not present: {e}"))?;
+        self.card.set_crtc(
+            self.crtc,
+            Some(self.surfaces[back].framebuffer),
+            (0, 0),
+            &[self.connector],
+            Some(self.mode),
+        )?;
         self.front = back;
         Ok(())
+    }
+
+    /// Whether an error means the session simply does not own the hardware.
+    ///
+    /// logind revokes device access the instant a VT switch begins, but
+    /// `PauseSession` only arrives on the next notifier dispatch. Every frame
+    /// in that window fails with `EACCES`, and it is not a fault — it is the
+    /// switch, observed before the notification.
+    pub fn is_revoked(error: &std::io::Error) -> bool {
+        matches!(
+            error.kind(),
+            std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::NotConnected
+        )
     }
 
     pub fn restore(&self) {
@@ -1331,6 +1353,24 @@ mod tests {
     /// F11 and F12 are not adjacent to F1..F10 in evdev, so a single
     /// subtraction gets them wrong — and the symptom is switching to the wrong
     /// terminal, which looks like a broken keyboard.
+    /// The distinction that keeps a VT switch from looking like a crash.
+    #[test]
+    fn a_revoked_device_is_not_a_fault() {
+        use std::io::{Error, ErrorKind};
+        assert!(super::Drm::is_revoked(&Error::from(ErrorKind::PermissionDenied)));
+        assert!(super::Drm::is_revoked(&Error::from(ErrorKind::NotConnected)));
+    }
+
+    /// A real failure must still be one, or a broken device would look like a
+    /// VT switch and cusk would spin forever pretending to be paused.
+    #[test]
+    fn other_errors_are_still_faults() {
+        use std::io::{Error, ErrorKind};
+        for kind in [ErrorKind::NotFound, ErrorKind::InvalidInput, ErrorKind::Other] {
+            assert!(!super::Drm::is_revoked(&Error::from(kind)), "{kind:?}");
+        }
+    }
+
     #[test]
     fn function_keys_map_to_the_terminal_they_name() {
         assert_eq!(super::vt_for_key(59), Some(1));

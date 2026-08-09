@@ -1946,6 +1946,28 @@ The trap worth a test: **F11 and F12 are not adjacent to F1..F10 in evdev**
 (87 and 88, against 59..68), so one subtraction gets them wrong and the symptom
 is landing on the wrong terminal.
 
+### Switching away killed it, and that was a race
+
+The switch worked; cusk then exited with `could not restore previous mode:
+permission denied`.
+
+logind revokes device access **the instant the switch begins**, but
+`PauseSession` only arrives on the next notifier dispatch. One `present` runs in
+that window, `set_crtc` returns `EACCES`, and it was propagated straight out of
+the loop as a fatal error.
+
+Two fixes, both about not collapsing a distinction:
+
+- `present` returns the raw `io::Error` instead of a string, so the caller can
+  tell *this is not our display right now* from *this is broken*. `EACCES` and
+  `ENOTCONN` are treated as a pause — the notifier confirms it a moment later,
+  and `just_resumed` still fires on the way back. Any other error is still
+  fatal, or a genuinely broken device would look like a VT switch and cusk
+  would spin forever pretending to be paused.
+- Restoring the mode on exit no longer complains when the device is revoked.
+  Another VT owns the display, so there is no mode of ours to put back, and
+  "could not restore" there is alarming and wrong.
+
 ### The time box was load-bearing until now
 
 An unbounded run could previously hold the display forever, which is why every

@@ -1436,7 +1436,19 @@ fn run_on_tty(
                     start,
                 )
             })??;
-            drm.present()?;
+
+            // A revoked device is a VT switch seen before the notification,
+            // not a fault. Treated as a pause here; the notifier confirms it a
+            // moment later and `just_resumed` still fires on the way back.
+            // Propagating it is what made cusk exit on the first switch.
+            if let Err(e) = drm.present() {
+                if tty::Drm::is_revoked(&e) {
+                    tracing::debug!("display revoked mid-frame; pausing");
+                    active.active = false;
+                    continue;
+                }
+                return Err(e.into());
+            }
 
             if let Some(stream) = listener.accept()? {
                 clients.push(dh.insert_client(stream, Arc::new(ClientState::default()))?);
