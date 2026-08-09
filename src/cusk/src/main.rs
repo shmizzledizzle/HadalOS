@@ -363,6 +363,11 @@ impl XdgShellHandler for Cusk {
             .elements()
             .find(|w| w.toplevel().map(|t| t.wl_surface()) == Some(surface.wl_surface()))
             .cloned();
+        // The counterpart of the log in `move_request`, and the one that
+        // separates "cusk ran the wrong grab" from "the client asked for a
+        // resize". A titlebar drag that resizes vertically is what a Bottom
+        // edge does, and only the client knows which edge it decided on.
+        tracing::info!("client requested a resize, edge {edges:?}");
         if let Some(window) = found {
             self.start_resize(window, floating::BTN_LEFT, edges);
         }
