@@ -1975,11 +1975,47 @@ phase carried `--seconds` and a watchdog. With a VT switch releasing the screen
 there is always a way out, so `--seconds=0` is now safe — and the watchdog is
 skipped in that mode rather than firing on a session someone is using.
 
+---
+
+## Milestone 27: one binding table, 2026-08-09
+
+The tty driver shipped **with none of the compositor bindings**. It forwarded
+every key straight to the client: no Super+Return, no launcher, no workspace
+switching, no tiling toggles. A session with a wallpaper, a panel, a cursor —
+and no way to open a terminal.
+
+Not a subtle bug, and the same shape as the two before it. The whole table
+lived inside the winit event handler, so the second driver could not reach it,
+exactly as `draw_frame` and `build_compositor` could not be reached before they
+were lifted out.
+
+- **`binding_for(sym, shift)`** is a pure function, so both drivers agree by
+  construction rather than by diligence. Three tests, including one asserting
+  that *every binding the banner advertises actually resolves* — a table this
+  long is where an entry goes missing, and the symptom is one dead key among a
+  dozen working ones.
+- **`apply_binding`** is a method for the same reason `draw_frame` is a
+  function: two drivers, one behaviour. The socket name and the configured
+  programs are arguments rather than fields, because they belong to the session
+  rather than to the compositor.
+- Unbound keys must forward. Claiming them would make ordinary typing vanish
+  whenever the modifier happened to be down, which is tested too.
+
+### Verified
+
+winit unchanged: wallpaper, blur, opacity, corners, panel, title, three
+windows, no errors and no warnings. 122 tests.
+
+That check had to be run twice. The first attempt reported clean — and had
+silently exercised nothing, because the scratchpad wallpaper had been cleaned
+away again. **A run that does nothing produces the same output as a run that
+does everything**, so the check now counts the `wallpaper ready` line rather
+than trusting the absence of warnings. Second time this session.
+
 ### Next
 
-The remaining gaps are hotplug (a monitor appearing or leaving), DRM page-flip
-timing to replace the tearing `set_crtc`, and the winit driver sharing this
-loop's structure. None of them block using cusk on a tty. on eDP-1, rendering a single colour, with a hard timeout that
+Hotplug, page-flip timing to replace the tearing `set_crtc`, and the winit
+driver adopting this loop's structure. None block using cusk on a tty. on eDP-1, rendering a single colour, with a hard timeout that
    restores the VT — the first thing that can strand a screen, so it should be
    unable to strand it for more than a few seconds.
 2. libinput, so there is a keyboard.

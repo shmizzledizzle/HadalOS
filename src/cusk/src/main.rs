@@ -59,7 +59,7 @@ use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 
 /// A compositor-level binding, returned from the keyboard filter so the event
 /// loop can act on it after the borrow of the seat ends.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 enum Binding {
     ToggleMaximize,
     ToggleTiling,
@@ -1298,6 +1298,12 @@ fn run_on_tty(
         pointer_texture: None,
         warned_square_corners: false,
     };
+    // Resolved once, as the winit driver does, so Super+Return has something
+    // to spawn.
+    let terminal: Option<String> = match cfg.terminal.as_str() {
+        "auto" => pick_terminal().map(str::to_owned),
+        named => Some(named.to_string()),
+    };
     let mut clients = Vec::new();
     let mut chord = tty::Chord::default();
     let start = std::time::Instant::now();
@@ -1353,7 +1359,10 @@ fn run_on_tty(
                     continue;
                 }
 
-                keyboard.input::<(), _>(
+                // The same table the winit driver uses, so a binding cannot
+                // work on one backend and not the other — which is exactly
+                // what shipped: a tty session with no way to open a terminal.
+                let binding = keyboard.input::<Option<Binding>, _>(
                     &mut state,
                     // libinput reports evdev codes; xkb wants them offset by
                     // eight. Feeding the raw code shifts every key by one row,
@@ -1366,8 +1375,29 @@ fn run_on_tty(
                     },
                     SERIAL_COUNTER.next_serial(),
                     time,
-                    |_, _, _| smithay::input::keyboard::FilterResult::<()>::Forward,
+                    |state, modifiers, handle| {
+                        state.modifiers = *modifiers;
+                        if pressed && state.mod_key.held(modifiers) {
+                            if let Some(binding) =
+                                binding_for(handle.modified_sym(), modifiers.shift)
+                            {
+                                // Intercepted, not forwarded, or the terminal
+                                // receives a 'd' every time the launcher opens.
+                                return FilterResult::Intercept(Some(binding));
+                            }
+                        }
+                        FilterResult::Forward
+                    },
                 );
+                if let Some(Some(binding)) = binding {
+                    state.apply_binding(
+                        binding,
+                        &cfg,
+                        terminal.as_deref(),
+                        &socket_name,
+                        drm.size,
+                    );
+                }
             }
 
             // Motion first, so a click in the same drain lands where the
@@ -1461,6 +1491,177 @@ fn run_on_tty(
 
     drm.restore();
     outcome
+}
+
+/// Which compositor binding a keysym asks for, if any.
+///
+/// A pure function so both drivers agree by construction. The tty driver
+/// shipped without any of these — a session with a wallpaper, a panel and no
+/// way to open a terminal — because the whole table lived inside the winit
+/// event handler.
+///
+/// The caller checks the modifier: whether the chord is armed depends on
+/// `ModKey` and the seat's state, and neither belongs in a lookup table.
+fn binding_for(sym: Keysym, shift: bool) -> Option<Binding> {
+    match sym {
+        Keysym::m => Some(Binding::ToggleMaximize),
+        Keysym::t => Some(Binding::ToggleTiling),
+        Keysym::space => Some(Binding::ToggleFloating),
+        Keysym::e => Some(Binding::CycleLayout),
+        Keysym::l => Some(Binding::Widen(1)),
+        Keysym::h => Some(Binding::Widen(-1)),
+        Keysym::Return | Keysym::KP_Enter => Some(Binding::Spawn),
+        Keysym::d => Some(Binding::Launcher),
+        Keysym::j => Some(Binding::FocusStep(1)),
+        Keysym::k => Some(Binding::FocusStep(-1)),
+        // Shift gives the capitalised keysym, so the
+        // shifted bindings are distinguished here
+        // rather than by re-reading modifier state.
+        Keysym::J => Some(Binding::MoveInOrder(1)),
+        Keysym::K => Some(Binding::MoveInOrder(-1)),
+        Keysym::P => Some(Binding::Promote),
+        // Digits pick a workspace; shifted digits send
+        // the focused window to one. Shift produces a
+        // different keysym per layout (! " # on some,
+        // symbols on others), so the unshifted keysym
+        // is read and the modifier checked separately —
+        // matching on the shifted symbol works on one
+        // keyboard layout and silently fails on the
+        // rest.
+        sym => match sym.raw() {
+            0x0031..=0x0039 => {
+                let index = (sym.raw() - 0x0031) as usize;
+                Some(if shift {
+                    Binding::SendToWorkspace(index)
+                } else {
+                    Binding::Workspace(index)
+                })
+            }
+            _ => None,
+        },
+    }
+}
+
+/// Carry out a binding.
+///
+/// A method rather than a closure in the event handler, for the same reason
+/// `draw_frame` is a function: two drivers, one behaviour. Spawning needs the
+/// socket name and the configured programs, which is why they are arguments
+/// rather than fields — they belong to the session, not to the compositor.
+impl Cusk {
+    fn apply_binding(
+        &mut self,
+        binding: Binding,
+        cfg: &config::Config,
+        terminal: Option<&str>,
+        socket_name: &str,
+        output_size: (i32, i32),
+    ) {
+        // Topmost in stacking order is the focused window.
+        let focused = self.focused();
+        match binding {
+            Binding::ToggleMaximize => {
+                if let Some(w) = focused {
+                    self.toggle_maximize(&w, output_size);
+                }
+            }
+            Binding::ToggleTiling => self.toggle_tiling(),
+            Binding::ToggleFloating => {
+                if let Some(w) = focused {
+                    self.toggle_floating(&w);
+                }
+            }
+            Binding::CycleLayout => {
+                let next = self.layout().next();
+                self.workspaces.active_mut().layout = next;
+                tracing::info!("layout: {}", next.name());
+                self.relayout();
+            }
+            Binding::FocusStep(d) => self.focus_step(d),
+            Binding::MoveInOrder(d) => self.move_in_order(d),
+            Binding::Promote => self.promote(),
+            Binding::Workspace(i) => self.switch_workspace(i),
+            Binding::SendToWorkspace(i) => self.send_to_workspace(i),
+            Binding::Launcher => {
+                let program = resolve_launcher(&cfg.launcher);
+                match std::process::Command::new(&program)
+                    .env("WAYLAND_DISPLAY", socket_name)
+                    .spawn()
+                {
+                    Ok(child) => {
+                        tracing::info!("launcher {program} (pid {})", child.id());
+                        std::thread::spawn(move || {
+                let mut child = child;
+                let _ = child.wait();
+                        });
+                    }
+                    Err(e) => tracing::warn!("could not run {program}: {e}"),
+                }
+            }
+            Binding::Spawn => match terminal {
+                Some(term) => spawn_terminal(term, socket_name),
+                None => tracing::warn!("no terminal to spawn"),
+            },
+            Binding::Widen(dir) => {
+                let wider = self.layout().widen(0.05 * dir as f64);
+                self.workspaces.active_mut().layout = wider;
+                self.relayout();
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod binding_tests {
+    use super::*;
+
+    /// Every binding the banner advertises must actually resolve. A table this
+    /// long is exactly where an entry goes missing, and the symptom is one
+    /// dead key among a dozen working ones.
+    #[test]
+    fn the_advertised_bindings_all_resolve() {
+        for (sym, expected) in [
+            (Keysym::Return, Binding::Spawn),
+            (Keysym::d, Binding::Launcher),
+            (Keysym::t, Binding::ToggleTiling),
+            (Keysym::e, Binding::CycleLayout),
+            (Keysym::m, Binding::ToggleMaximize),
+            (Keysym::space, Binding::ToggleFloating),
+            (Keysym::j, Binding::FocusStep(1)),
+            (Keysym::k, Binding::FocusStep(-1)),
+            (Keysym::l, Binding::Widen(1)),
+            (Keysym::h, Binding::Widen(-1)),
+            (Keysym::J, Binding::MoveInOrder(1)),
+            (Keysym::K, Binding::MoveInOrder(-1)),
+            (Keysym::P, Binding::Promote),
+        ] {
+            assert_eq!(
+                binding_for(sym, false),
+                Some(expected),
+                "{sym:?} resolves to nothing"
+            );
+        }
+    }
+
+    /// Digits pick a workspace; shifted digits send a window to one. Shift is
+    /// read as modifier state rather than as a shifted keysym, because that
+    /// symbol differs per keyboard layout.
+    #[test]
+    fn digits_pick_a_workspace_and_shift_sends_to_it() {
+        assert_eq!(binding_for(Keysym::_1, false), Some(Binding::Workspace(0)));
+        assert_eq!(binding_for(Keysym::_9, false), Some(Binding::Workspace(8)));
+        assert_eq!(binding_for(Keysym::_1, true), Some(Binding::SendToWorkspace(0)));
+        assert_eq!(binding_for(Keysym::_3, true), Some(Binding::SendToWorkspace(2)));
+    }
+
+    /// An unbound key must forward, or ordinary typing disappears whenever the
+    /// modifier happens to be down.
+    #[test]
+    fn unbound_keys_are_not_claimed() {
+        for sym in [Keysym::a, Keysym::z, Keysym::F5, Keysym::Escape, Keysym::_0] {
+            assert_eq!(binding_for(sym, false), None, "{sym:?} was claimed");
+        }
+    }
 }
 
 /// Everything the render loop needs that outlives a single frame.
@@ -2538,43 +2739,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         // terminal receives an 'm' every time a window is
                         // maximised.
                         if key_state == KeyState::Pressed && state.mod_key.held(modifiers) {
-                            let bound = match handle.modified_sym() {
-                                Keysym::m => Some(Binding::ToggleMaximize),
-                                Keysym::t => Some(Binding::ToggleTiling),
-                                Keysym::space => Some(Binding::ToggleFloating),
-                                Keysym::e => Some(Binding::CycleLayout),
-                                Keysym::l => Some(Binding::Widen(1)),
-                                Keysym::h => Some(Binding::Widen(-1)),
-                                Keysym::Return | Keysym::KP_Enter => Some(Binding::Spawn),
-                                Keysym::d => Some(Binding::Launcher),
-                                Keysym::j => Some(Binding::FocusStep(1)),
-                                Keysym::k => Some(Binding::FocusStep(-1)),
-                                // Shift gives the capitalised keysym, so the
-                                // shifted bindings are distinguished here
-                                // rather than by re-reading modifier state.
-                                Keysym::J => Some(Binding::MoveInOrder(1)),
-                                Keysym::K => Some(Binding::MoveInOrder(-1)),
-                                Keysym::P => Some(Binding::Promote),
-                                // Digits pick a workspace; shifted digits send
-                                // the focused window to one. Shift produces a
-                                // different keysym per layout (! " # on some,
-                                // symbols on others), so the unshifted keysym
-                                // is read and the modifier checked separately —
-                                // matching on the shifted symbol works on one
-                                // keyboard layout and silently fails on the
-                                // rest.
-                                sym => match sym.raw() {
-                                    0x0031..=0x0039 => {
-                                        let index = (sym.raw() - 0x0031) as usize;
-                                        Some(if modifiers.shift {
-                                            Binding::SendToWorkspace(index)
-                                        } else {
-                                            Binding::Workspace(index)
-                                        })
-                                    }
-                                    _ => None,
-                                },
-                            };
+                            let bound = binding_for(handle.modified_sym(), modifiers.shift);
                             if let Some(binding) = bound {
                                 return FilterResult::Intercept(Some(binding));
                             }
@@ -2584,56 +2749,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
 
                 if let Some(Some(binding)) = binding {
-                    let focused = state.focused();
-                    match binding {
-                        Binding::ToggleMaximize => {
-                            if let Some(w) = focused {
-                                state.toggle_maximize(&w, (logical_size.w, logical_size.h));
-                            }
-                        }
-                        Binding::ToggleTiling => state.toggle_tiling(),
-                        Binding::ToggleFloating => {
-                            if let Some(w) = focused {
-                                state.toggle_floating(&w);
-                            }
-                        }
-                        Binding::CycleLayout => {
-                            let next = state.layout().next();
-                            state.workspaces.active_mut().layout = next;
-                            tracing::info!("layout: {}", next.name());
-                            state.relayout();
-                        }
-                        Binding::FocusStep(d) => state.focus_step(d),
-                        Binding::MoveInOrder(d) => state.move_in_order(d),
-                        Binding::Promote => state.promote(),
-                        Binding::Workspace(i) => state.switch_workspace(i),
-                        Binding::SendToWorkspace(i) => state.send_to_workspace(i),
-                        Binding::Launcher => {
-                            let program = resolve_launcher(&current.launcher);
-                            match std::process::Command::new(&program)
-                                .env("WAYLAND_DISPLAY", &socket_name)
-                                .spawn()
-                            {
-                                Ok(child) => {
-                                    tracing::info!("launcher {program} (pid {})", child.id());
-                                    std::thread::spawn(move || {
-                                        let mut child = child;
-                                        let _ = child.wait();
-                                    });
-                                }
-                                Err(e) => tracing::warn!("could not run {program}: {e}"),
-                            }
-                        }
-                        Binding::Spawn => match terminal.as_deref() {
-                            Some(term) => spawn_terminal(term, &socket_name),
-                            None => tracing::warn!("no terminal to spawn"),
-                        },
-                        Binding::Widen(dir) => {
-                            let wider = state.layout().widen(0.05 * dir as f64);
-                            state.workspaces.active_mut().layout = wider;
-                            state.relayout();
-                        }
-                    }
+                    state.apply_binding(binding, &current, terminal.as_deref(), &socket_name, (logical_size.w, logical_size.h));
                 }
             }
 
