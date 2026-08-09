@@ -1764,6 +1764,81 @@ fn draw_frame(
     }
     Ok(())
 }
+/// Everything a driver needs to run a session, built once.
+///
+/// Extracted so the winit and DRM drivers construct it the same way. The
+/// alternative is each backend building its own compositor state, which is
+/// two places for a global to be registered and one of them to be forgotten —
+/// and a missing global shows up as a client that starts and draws nothing.
+struct Compositor {
+    display: Display<Cusk>,
+    state: Cusk,
+    listener: ListeningSocket,
+    socket_name: String,
+    keyboard: smithay::input::keyboard::KeyboardHandle<Cusk>,
+    pointer: smithay::input::pointer::PointerHandle<Cusk>,
+}
+
+/// Build the Wayland side: display, globals, seat, socket.
+///
+/// The dmabuf global is deliberately *not* created here. It needs the
+/// renderer's format list, which only the driver has, so it is the one global
+/// each backend registers for itself.
+fn build_compositor(cfg: &config::Config) -> Result<Compositor, Box<dyn std::error::Error>> {
+    let mod_key = ModKey::resolve(&cfg.mod_key);
+    let display: Display<Cusk> = Display::new()?;
+    let dh = display.handle();
+
+    let compositor_state = CompositorState::new::<Cusk>(&dh);
+    let shm_state = ShmState::new::<Cusk>(&dh, vec![]);
+    let dmabuf_state = DmabufState::new();
+    let mut seat_state = SeatState::new();
+    let seat = seat_state.new_wl_seat(&dh, "cusk");
+
+    let mut state = Cusk {
+        compositor_state,
+        xdg_shell_state: XdgShellState::new::<Cusk>(&dh),
+        shm_state,
+        dmabuf_state,
+        data_device_state: DataDeviceState::new::<Cusk>(&dh),
+        seat_state,
+        seat,
+        space: Space::default(),
+        pointer_location: (0.0, 0.0).into(),
+        modifiers: ModifiersState::default(),
+        mod_key,
+        workspaces: workspace::Workspaces::new(
+            cfg.workspace_count.max(1) as usize,
+            cfg.tiling_on_start,
+            match cfg.default_layout.as_str() {
+                "columns" => layout::Layout::Columns,
+                _ => layout::Layout::MasterStack { ratio: cfg.master_ratio },
+            },
+        ),
+        gaps: layout::Gaps { inner: cfg.inner_gap, outer: cfg.outer_gap },
+        focus_follows_mouse: cfg.focus_follows_mouse,
+        panel_height: cfg.panel_height,
+        pending_dmabufs: Vec::new(),
+        cursor: smithay::input::pointer::CursorImageStatus::default_named(),
+        output_size: (1280, 800),
+    };
+
+    // Let the socket be allocated rather than hardcoded. A fixed name collides
+    // with any other nested compositor and, worse, can bind over a name a real
+    // session is using.
+    let listener = ListeningSocket::bind_auto("cusk", 1..32)?;
+    let socket_name = listener
+        .socket_name()
+        .ok_or("socket has no name")?
+        .to_string_lossy()
+        .into_owned();
+    tracing::info!("listening on {socket_name}");
+
+    let keyboard = state.seat.add_keyboard(Default::default(), 200, 25)?;
+    let pointer = state.seat.add_pointer();
+
+    Ok(Compositor { display, state, listener, socket_name, keyboard, pointer })
+}
 fn send_frames(surface: &WlSurface, time: u32) {
     with_surface_tree_downward(
         surface,
@@ -1946,56 +2021,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mod_key = ModKey::resolve(&cfg.mod_key);
 
-    let mut display: Display<Cusk> = Display::new()?;
+    let Compositor {
+        mut display,
+        mut state,
+        listener,
+        socket_name,
+        keyboard,
+        pointer,
+    } = build_compositor(&cfg)?;
     let mut dh = display.handle();
-
-    let compositor_state = CompositorState::new::<Cusk>(&dh);
-    let shm_state = ShmState::new::<Cusk>(&dh, vec![]);
-    let dmabuf_state = DmabufState::new();
-    let mut seat_state = SeatState::new();
-    let seat = seat_state.new_wl_seat(&dh, "cusk");
-
-    let mut state = Cusk {
-        compositor_state,
-        xdg_shell_state: XdgShellState::new::<Cusk>(&dh),
-        shm_state,
-        dmabuf_state,
-        data_device_state: DataDeviceState::new::<Cusk>(&dh),
-        seat_state,
-        seat,
-        space: Space::default(),
-        pointer_location: (0.0, 0.0).into(),
-        modifiers: ModifiersState::default(),
-        mod_key,
-        workspaces: workspace::Workspaces::new(
-            cfg.workspace_count.max(1) as usize,
-            cfg.tiling_on_start,
-            match cfg.default_layout.as_str() {
-                "columns" => layout::Layout::Columns,
-                _ => layout::Layout::MasterStack { ratio: cfg.master_ratio },
-            },
-        ),
-        gaps: layout::Gaps { inner: cfg.inner_gap, outer: cfg.outer_gap },
-        focus_follows_mouse: cfg.focus_follows_mouse,
-        panel_height: cfg.panel_height,
-        pending_dmabufs: Vec::new(),
-        cursor: smithay::input::pointer::CursorImageStatus::default_named(),
-        output_size: (1280, 800),
-    };
-
-    // Let the socket be allocated rather than hardcoded. A fixed name collides
-    // with any other nested compositor and, worse, can bind over a name a real
-    // session is using.
-    let listener = ListeningSocket::bind_auto("cusk", 1..32)?;
-    let socket_name = listener
-        .socket_name()
-        .ok_or("socket has no name")?
-        .to_string_lossy()
-        .into_owned();
-    tracing::info!("listening on {socket_name}");
-
-    let keyboard = state.seat.add_keyboard(Default::default(), 200, 25)?;
-    let pointer = state.seat.add_pointer();
 
     let face = text::find_font(&cfg.font).and_then(|path| {
         let loaded = text::Face::load(&path);

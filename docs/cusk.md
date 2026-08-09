@@ -1763,6 +1763,39 @@ than costing a trip to a VT:
 a Linear allocation reports Some(Linear), so framebuffer flags = FbCmd2Flags(MODIFIERS)
 ```
 
+---
+
+## Milestone 24: one compositor, two drivers, 2026-08-09
+
+`build_compositor` and `Compositor`. The last groundwork before the DRM loop.
+
+The Wayland side — display, globals, seat, socket — was built inline in
+`main`, so a second driver could not reach it. Each backend constructing its
+own would be two places for a global to be registered and one of them to be
+forgotten, and a missing global shows up as a client that starts and draws
+nothing rather than as an error.
+
+**The dmabuf global is deliberately not built here.** It needs the renderer's
+format list, and only the driver has a renderer. It is the one global each
+backend registers for itself, which is stated in the function rather than left
+for someone to wonder about.
+
+`mod_key` moved in with it: it is resolved from the config plus the `CUSK_MOD`
+override, and that resolution belongs with the seat it arms rather than beside
+the backend that happens to run first.
+
+### Verified as a no-op
+
+Wallpaper, blur, window blur, opacity, corners, panel, title, dmabuf, font,
+three windows: **no errors, no warnings**, 142 tests.
+
+One thing this run caught about the *tests* rather than the code: an earlier
+verification had silently exercised nothing, because the scratchpad had been
+cleaned and cusk had regenerated a default config — no wallpaper set, so no
+backdrop, no blur and no warning either. "No warnings" from a run that did
+nothing looks exactly like "no warnings" from a run that did everything. The
+re-run checks for the `wallpaper ready` line specifically.
+
 ### Next
 
 The DRM driver itself: the loop that owns a session, allocates a pair of
