@@ -54,6 +54,7 @@ use smithay::backend::renderer::{Bind, Color32F, Frame, ImportMem, Renderer, Ren
 use smithay::backend::winit::{self, WinitEvent};
 use smithay::desktop::{Space, Window, WindowSurfaceType};
 use smithay::output::{Mode as OutputMode, Output, PhysicalProperties, Subpixel};
+use smithay::wayland::output::OutputManagerState;
 use smithay::backend::input::KeyState;
 use smithay::input::keyboard::{FilterResult, Keysym, ModifiersState};
 use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode as DecorationMode;
@@ -209,6 +210,15 @@ struct Cusk {
     #[allow(dead_code)]
     xdg_decoration_state: XdgDecorationState,
     layer_shell_state: WlrLayerShellState,
+    /// Held for the `zxdg_output_manager_v1` global's lifetime.
+    ///
+    /// `Output::create_global` alone advertises `wl_output` and nothing else.
+    /// xdg-output is how a client learns an output's **name and logical
+    /// geometry**, and panels use the name to decide which screen to sit on —
+    /// waybar refuses to start without it, with `Failed to acquire required
+    /// resources` and no indication of which one was missing.
+    #[allow(dead_code)]
+    output_manager_state: OutputManagerState,
     shm_state: ShmState,
     dmabuf_state: DmabufState,
     seat_state: SeatState<Self>,
@@ -297,6 +307,50 @@ impl CompositorHandler for Cusk {
                 toplevel.send_configure();
             }
         }
+        // A layer surface's anchor, size and exclusive zone are *client*
+        // state, and none of it exists until the client commits. Arranging
+        // only at creation — as this did — computes a layout from an empty
+        // request, so a panel maps, draws, and reserves nothing.
+        //
+        // Same shape as `Window::on_commit`: the compositor learns what a
+        // surface is on commit, not on creation.
+        let is_layer = {
+            let map = layer_map_for_output(&self.output);
+            map.layer_for_surface(surface, WindowSurfaceType::ALL).is_some()
+        };
+        if is_layer {
+            // `arrange` computes the layout but does **not** send the first
+            // configure, and a layer-shell client cannot attach a buffer until
+            // it gets one. waybar waits exactly one second and then destroys
+            // the surface — `Timed out waiting for initial .configure` — so
+            // the bar appeared in the map, reserved its zone, and vanished
+            // again before anything could use it.
+            let changed = {
+                let mut map = layer_map_for_output(&self.output);
+                let changed = map.arrange();
+                if let Some(layer) = map.layer_for_surface(surface, WindowSurfaceType::ALL) {
+                    let sent = smithay::wayland::compositor::with_states(
+                        layer.wl_surface(),
+                        |states| {
+                            states
+                                .data_map
+                                .get::<smithay::wayland::shell::wlr_layer::LayerSurfaceData>()
+                                .and_then(|d| d.lock().ok().map(|d| d.initial_configure_sent))
+                                .unwrap_or(true)
+                        },
+                    );
+                    if !sent {
+                        layer.layer_surface().send_configure();
+                    }
+                }
+                changed
+            };
+            if changed {
+                // The zone moved, so anything placed against it is now wrong.
+                self.relayout();
+            }
+        }
+
         self.space.refresh();
     }
 }
@@ -530,6 +584,11 @@ impl WlrLayerShellHandler for Cusk {
         // The requested output is ignored because there is exactly one. When
         // hotplug lands this has to honour it, and a surface anchored to a
         // monitor that has gone away has to be re-homed rather than dropped.
+        if self.output_size.0 <= 0 || self.output_size.1 <= 0 {
+            // Arranging against a zero-sized output produces a negative zone,
+            // silently, and the surface reserves nothing.
+            tracing::warn!("layer surface {namespace:?} arrived before the output had a mode");
+        }
         let mut map = layer_map_for_output(&self.output);
         if let Err(e) = map.map_layer(&LayerSurface::new(surface, namespace.clone())) {
             tracing::warn!("could not map layer surface {namespace:?}: {e}");
@@ -558,6 +617,7 @@ impl WlrLayerShellHandler for Cusk {
             map.arrange();
         }
         drop(map);
+        tracing::info!("layer surface destroyed");
         // The space it reserved is usable again, and a layout computed while
         // it existed is now wrong.
         self.relayout();
@@ -2723,6 +2783,7 @@ fn build_compositor(cfg: &config::Config) -> Result<Compositor, Box<dyn std::err
         xdg_shell_state: XdgShellState::new::<Cusk>(&dh),
         xdg_decoration_state: XdgDecorationState::new::<Cusk>(&dh),
         layer_shell_state: WlrLayerShellState::new::<Cusk>(&dh),
+        output_manager_state: OutputManagerState::new_with_xdg_output::<Cusk>(&dh),
         shm_state,
         dmabuf_state,
         data_device_state: DataDeviceState::new::<Cusk>(&dh),
@@ -2746,7 +2807,14 @@ fn build_compositor(cfg: &config::Config) -> Result<Compositor, Box<dyn std::err
         panel_height: cfg.panel_height,
         pending_dmabufs: Vec::new(),
         cursor: smithay::input::pointer::CursorImageStatus::default_named(),
-        output_size: (1280, 800),
+        // Zero, not a plausible-looking guess. It was (1280, 800), which is
+        // exactly what the nested backend reports — so the driver's
+        // "did the size change?" check was false on the first frame and the
+        // output never got a mode at all. Layer surfaces then arranged
+        // against a 0x0 screen and reserved nothing.
+        //
+        // A wrong value that looks right is worse than an obviously empty one.
+        output_size: (0, 0),
     };
 
     // Let the socket be allocated rather than hardcoded. A fixed name collides

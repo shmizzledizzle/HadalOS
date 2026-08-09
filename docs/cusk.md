@@ -2209,13 +2209,38 @@ A first attempt smuggled the layer surface out of `surface_under` through a
 `Cell`. A side channel to return a second kind of answer is a signature that
 is wrong, and it was replaced rather than made to work.
 
-### Verified, and not
+### Verified with waybar
 
-Both drivers run clean: no errors, no warnings, three windows, wallpaper
-loaded, 126 tests. **No layer-shell client is installed on this machine**, so
-the protocol has not been exercised by a real one — the global is created and
-the handler compiles, which is not the same claim. `waybar`, `swaybg` or
-`fuzzel` would settle it.
+waybar was installed and it found three bugs that "it compiles" would never
+have. Each was silent.
+
+**1. `zxdg_output_manager_v1` was missing.** `Output::create_global` advertises
+`wl_output` and nothing else; xdg-output is how a client learns an output's
+**name**, and panels use the name to choose a screen. waybar refused to start
+with `Failed to acquire required resources` — which names no resource.
+
+**2. The output never got a mode.** `Cusk` seeded `output_size` to
+`(1280, 800)`, which is exactly what the nested backend reports, so the
+driver's *did the size change?* check was false on the first frame and
+`set_output_mode` never ran. Layer surfaces then arranged against a **0×0**
+screen and produced a zone of `{ y: 30, width: 0, height: -30 }` — a negative
+rectangle, reserving nothing. The seed is `(0, 0)` now: *a wrong value that
+looks right is worse than an obviously empty one.*
+
+**3. `arrange()` does not send the first configure.** A layer-shell client
+cannot attach a buffer until it receives one. waybar waits one second, logs
+`Timed out waiting for initial .configure`, and destroys the surface — so the
+bar appeared in the map, reserved its zone, and vanished again a second later,
+which looked from inside cusk like a client that had simply left.
+
+### Measured
+
+| | window placement |
+|---|---|
+| no bar | `(40, 40)` |
+| waybar, 30px top bar | `(40, 70)` |
+
+The exclusive zone reserves its strip and window placement respects it.
 
 ### Next
 
