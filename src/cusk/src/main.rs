@@ -1220,7 +1220,7 @@ fn run_on_tty(
     cfg: config::Config,
     seconds: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (mut session, _notifier) = smithay::backend::session::libseat::LibSeatSession::new()
+    let (mut session, notifier) = smithay::backend::session::libseat::LibSeatSession::new()
         .map_err(|e| format!("could not join a session: {e}\n  This needs its own VT."))?;
     let seat_name = smithay::backend::session::Session::seat(&session);
 
@@ -1269,9 +1269,19 @@ fn run_on_tty(
     println!("  escape to quit — {seconds}s limit");
     println!();
 
+    // Watching before the display is taken, so a switch during startup is not
+    // missed and cusk does not draw over a VT it no longer owns.
+    let (mut session_events, mut active) = tty::watch_session(notifier)?;
+
     // Armed before the display is taken, so a hang anywhere after this point
-    // still ends with a usable console.
-    drm.arm_watchdog(seconds + 3);
+    // still ends with a usable console. `seconds == 0` means no limit, which
+    // is only safe now that a VT switch releases the display — before
+    // pause/resume worked, an unbounded run could hold the screen forever.
+    if seconds > 0 {
+        drm.arm_watchdog(seconds + 3);
+    } else {
+        println!("  no time limit — escape is the way out");
+    }
     drm.take_display();
 
     let mut ctx = FrameContext {
@@ -1287,10 +1297,35 @@ fn run_on_tty(
     };
     let mut clients = Vec::new();
     let start = std::time::Instant::now();
-    let deadline = start + std::time::Duration::from_secs(seconds);
+    let deadline = (seconds > 0).then(|| start + std::time::Duration::from_secs(seconds));
 
     let outcome = (|| -> Result<(), Box<dyn std::error::Error>> {
-        while std::time::Instant::now() < deadline {
+        while deadline.is_none_or(|deadline| std::time::Instant::now() < deadline) {
+            // Zero timeout: this is a poll inside the render loop, not the
+            // loop itself.
+            session_events.dispatch(Some(std::time::Duration::ZERO), &mut active)?;
+
+            if !active.active {
+                // Nothing is drawn and no input is read while another VT has
+                // the display. Drawing would write to a revoked fd and fail
+                // every frame; reading input would steal keys from whoever is
+                // actually using the machine.
+                libinput.suspend();
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                display.flush_clients()?;
+                continue;
+            }
+
+            if std::mem::take(&mut active.just_resumed) {
+                // Devices were revoked and handed back, so libinput needs to
+                // reopen them. The mode needs no special handling: `present`
+                // sets the CRTC every frame, so the first frame after a
+                // resume restores it.
+                if libinput.resume().is_err() {
+                    tracing::warn!("libinput could not resume; input may be dead");
+                }
+            }
+
             let input = tty::drain(&mut libinput);
             if input.escape {
                 break;

@@ -1171,6 +1171,63 @@ pub fn clamp_pointer(
     )
 }
 
+/// Whether the session currently owns the hardware.
+///
+/// logind revokes device access when the user switches to another VT, and
+/// restores it on switching back. A compositor that keeps drawing through a
+/// switch is writing to a revoked fd: every frame fails, and the errors arrive
+/// on a console the user is no longer looking at.
+#[derive(Default)]
+pub struct Active {
+    pub active: bool,
+    /// Set on the transition, so the driver can do the work that only makes
+    /// sense once — reclaiming input, forcing a mode-set — rather than on
+    /// every frame while active.
+    pub just_resumed: bool,
+}
+
+/// Watch for VT switches.
+///
+/// A calloop loop dispatched with a zero timeout each frame, rather than the
+/// whole driver restructured around calloop. The notifier is an event source
+/// and this is the smallest thing that can poll one; moving the render loop
+/// onto calloop is worth doing when DRM page-flip events need draining, and
+/// not before.
+pub fn watch_session(
+    notifier: smithay::backend::session::libseat::LibSeatSessionNotifier,
+) -> Result<
+    (
+        smithay::reexports::calloop::EventLoop<'static, Active>,
+        Active,
+    ),
+    String,
+> {
+    use smithay::backend::session::Event;
+    use smithay::reexports::calloop::EventLoop;
+
+    let event_loop: EventLoop<Active> =
+        EventLoop::try_new().map_err(|e| format!("could not create an event loop: {e}"))?;
+    event_loop
+        .handle()
+        .insert_source(notifier, |event, _, active: &mut Active| match event {
+            Event::PauseSession => {
+                tracing::info!("session paused — another VT has the display");
+                active.active = false;
+            }
+            Event::ActivateSession => {
+                tracing::info!("session resumed");
+                active.active = true;
+                active.just_resumed = true;
+            }
+        })
+        .map_err(|e| format!("could not watch the session: {e}"))?;
+
+    // Starts active: cusk only gets this far on the VT it was launched from,
+    // and waiting for an activate that has already happened would hang before
+    // the first frame.
+    Ok((event_loop, Active { active: true, just_resumed: false }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::framebuffer_flags;

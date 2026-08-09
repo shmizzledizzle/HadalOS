@@ -1891,10 +1891,52 @@ were hand-edited.
 Cursor tracks the touchpad, wallpaper renders, pills and panel draw. cusk runs
 on a virtual terminal, without root.
 
+---
+
+## Milestone 26: VT switching, 2026-08-09
+
+The time box is gone. `--seconds=0` runs until Escape.
+
+**The notifier was being dropped.** `LibSeatSession::new` returns a session *and*
+a notifier, and every phase so far bound the second to `_notifier` — so cusk
+never learned that the user had switched away. logind revokes device access on
+a VT switch and restores it on switching back; a compositor that keeps drawing
+through one is writing to a revoked fd, failing every frame, and reporting it to
+a console nobody is looking at.
+
+### While paused, nothing happens
+
+No drawing, and **no input reading** — libinput is suspended. Continuing to read
+would steal keystrokes from whoever is actually using the machine, which is a
+worse failure than a blank screen and much harder to attribute.
+
+### Resume is nearly free, by accident
+
+Milestone 25 chose `set_crtc` over a page flip because flips need an event loop
+to drain completions. That decision pays here: `present` sets the CRTC every
+frame, so **the first frame after a resume restores the mode** with no special
+case. The only thing resume has to do is tell libinput to reopen its devices.
+
+### calloop, but only for this
+
+The notifier is a calloop event source, and the driver is a plain loop. Rather
+than restructure everything, a calloop loop holding just the notifier is
+dispatched with a **zero timeout** once per frame — a poll inside the render
+loop rather than the loop itself. Moving the whole driver onto calloop is worth
+doing when DRM page-flip completions need draining, and not before.
+
+### The time box was load-bearing until now
+
+An unbounded run could previously hold the display forever, which is why every
+phase carried `--seconds` and a watchdog. With a VT switch releasing the screen
+there is always a way out, so `--seconds=0` is now safe — and the watchdog is
+skipped in that mode rather than firing on a session someone is using.
+
 ### Next
 
-VT switching and session pause/resume — what removes the time box and makes
-this a session rather than a demonstration. on eDP-1, rendering a single colour, with a hard timeout that
+The remaining gaps are hotplug (a monitor appearing or leaving), DRM page-flip
+timing to replace the tearing `set_crtc`, and the winit driver sharing this
+loop's structure. None of them block using cusk on a tty. on eDP-1, rendering a single colour, with a hard timeout that
    restores the VT — the first thing that can strand a screen, so it should be
    unable to strand it for more than a few seconds.
 2. libinput, so there is a keyboard.
