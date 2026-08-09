@@ -2553,6 +2553,13 @@ fn draw_frame(
         // `draw_render_elements` expects for a combined list, and the
         // reason the previous flattened version stacked windows upside
         // down whenever two of them overlapped.
+        //
+        // Layer surfaces bracket them: background and bottom beneath, top and
+        // overlay above. Without these two calls a panel maps, reserves its
+        // zone and is never drawn — which is exactly what shipped, and looked
+        // from outside like the client failing to start.
+        draw_render_elements(&mut frame, 1.0, &below, &[damage])?;
+
         for (rect, focused, elements) in &layers {
             if let Some(backdrop) = &ctx.backdrop {
                 if current.blur {
@@ -2618,6 +2625,7 @@ fn draw_frame(
 
         }
 
+        draw_render_elements(&mut frame, 1.0, &above, &[damage])?;
 
         // Drawn after the windows and before the cursor. A floating window
         // can still be dragged over the reserved strip — only tiling is

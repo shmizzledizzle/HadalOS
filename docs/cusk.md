@@ -2289,6 +2289,24 @@ With the dock running on a 1280-wide screen, the usable area is **1224** —
 exactly 56 less. The exclusive zone is honoured, so windows tile and maximise
 beside the dock rather than under it.
 
+### The dock did not appear, and the draw calls were never there
+
+Reported invisible. The layer surface mapped, survived, and reserved 56px — and
+was never drawn: `&below` and `&above` appeared **nowhere** in the compositor.
+The edit that added the two `draw_render_elements` calls was another string
+replacement that did not match, so the elements were gathered every frame and
+thrown away.
+
+**Third silent no-op edit this session.** Every string replacement now asserts
+its match count before writing, and the assertion caught a fourth on the very
+next edit — a wrong anchor that would otherwise have been another quiet nothing.
+
+The surviving arrangement is better than the one intended: `above` sits outside
+the `!live_blur` branch, so top and overlay layers draw whether or not window
+blur is on. `below` is still inside it, which means background-layer clients
+would not draw with blur enabled. Nothing uses that layer yet — the dock is
+`Top` — and it is recorded rather than quietly left.
+
 ### Not done
 
 The dock lists **everything installed**, scrollably. Pinning a chosen few is
