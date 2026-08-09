@@ -2108,11 +2108,57 @@ stopping both when only one ended makes a diagonal flick finish sideways.
 worth having once rather than twice — which is the lesson of the three parity
 milestones applied before the divergence rather than after it.
 
+---
+
+## Milestone 31: one origin, and the buttons, 2026-08-09
+
+### The titlebar drag was a coordinate bug
+
+Clicking the visible titlebar did nothing; clicking the row *below* it behaved
+like the titlebar. Reported as a suspicion that the alacritty padding had moved
+things, which it had not — padding is inside the client's content area and
+cannot move a frame.
+
+A client with its own decorations draws them as **subsurfaces at negative
+offsets**: the frame sits above and left of the content, and
+`Window::geometry().loc` is how far into that tree the real window begins.
+smithay's own `render_location` is `location - geometry().loc` for exactly this
+reason.
+
+cusk ignored it and rendered the surface tree at the geometry location, so the
+visual and the hit region drifted apart by the frame's inset. The titlebar drew
+where nothing could be clicked, and the row below it answered to clicks meant
+for the bar.
+
+`surface_origin` names the offset once, and rendering and hit-testing both use
+it. Milestone 2 had already recorded the evidence — *"a press resolved to
+`surface at (-4, -4)` for a window at `(40, 40)`… a window's surfaces are not
+confined to its geometry"* — and the conclusion drawn there was about layout,
+not about this.
+
+### The buttons
+
+Minimise and maximise did nothing because the requests behind them were never
+implemented; close worked only because closing is the client destroying itself
+and needs no compositor at all.
+
+`maximize_request` and `unmaximize_request` now route to the same toggle the
+keybinding uses, guarded so a maximise request on an already-maximised window
+does not restore it.
+
+**Minimise is refused, with a reason.** Hiding a window with no way to bring it
+back is worse than a button that does nothing, and there is no task list to
+restore from yet. It says so in the log rather than appearing to work.
+
 ### Next
 
-Hotplug, and page-flip timing to replace the tearing `set_crtc`. Also
-outstanding: why a client's own titlebar does not drag, which the `move_request`
-log line will answer on the next tty run. on eDP-1, rendering a single colour, with a hard timeout that
+The shell layout — a right-hand dock in floating mode, a drop-down launcher in
+tiling, and a system tray. Recorded in memory; the gate is `wlr-layer-shell`,
+because iced cannot speak it and a second compositor-drawn panel would have to
+be undone. The tray additionally needs StatusNotifierItem over D-Bus, which is
+an IPC problem rather than a drawing one.
+
+Then hotplug and page-flip timing. on eDP-1, rendering a single colour, with a hard timeout that
    restores the VT — the first thing that can strand a screen, so it should be
    unable to strand it for more than a few seconds.
 2. libinput, so there is a keyboard.

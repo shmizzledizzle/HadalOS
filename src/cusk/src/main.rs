@@ -373,6 +373,51 @@ impl XdgShellHandler for Cusk {
         }
     }
 
+    /// The maximise button. Never implemented, so the button drew and did
+    /// nothing — the close button worked only because closing is the client
+    /// destroying itself and needs no compositor at all.
+    fn maximize_request(&mut self, surface: ToplevelSurface) {
+        let found = self
+            .space
+            .elements()
+            .find(|w| w.toplevel().map(|t| t.wl_surface()) == Some(surface.wl_surface()))
+            .cloned();
+        if let Some(window) = found {
+            if !geometry::is_displaced(&window) {
+                let size = (self.output_size.0, self.output_size.1);
+                self.toggle_maximize(&window, size);
+            }
+        }
+    }
+
+    fn unmaximize_request(&mut self, surface: ToplevelSurface) {
+        let found = self
+            .space
+            .elements()
+            .find(|w| w.toplevel().map(|t| t.wl_surface()) == Some(surface.wl_surface()))
+            .cloned();
+        if let Some(window) = found {
+            if geometry::is_displaced(&window) {
+                let size = (self.output_size.0, self.output_size.1);
+                self.toggle_maximize(&window, size);
+            }
+        }
+    }
+
+    /// The minimise button.
+    ///
+    /// Unmapped rather than moved off-screen, for the reason workspace
+    /// switching unmaps: a window parked at a huge coordinate is still in the
+    /// `Space`, still hit-tested, still counted by the layout.
+    ///
+    /// **There is no way to bring it back yet.** A minimise that hides a
+    /// window with no route to restoring it is worse than a button that does
+    /// nothing, so this refuses and says why until there is a task list to
+    /// restore from.
+    fn minimize_request(&mut self, _surface: ToplevelSurface) {
+        tracing::info!("minimise ignored: nothing can restore a hidden window yet");
+    }
+
     fn new_popup(&mut self, _surface: PopupSurface, _positioner: PositionerState) {}
 
     fn grab(&mut self, _surface: PopupSurface, _seat: wl_seat::WlSeat, _serial: Serial) {}
@@ -510,12 +555,30 @@ impl Cusk {
 
     /// Window and surface under a compositor-global point, with the surface's
     /// origin — the three things pointer routing always needs together.
+    /// Where a window's *surface tree* starts, given where its geometry is.
+    ///
+    /// A client with its own decorations draws them as subsurfaces at negative
+    /// offsets — the frame sits above and left of the content — and
+    /// `Window::geometry().loc` is how far into that tree the real window
+    /// begins. smithay's own `render_location` is `location - geometry().loc`
+    /// for exactly this reason.
+    ///
+    /// cusk ignored it, and rendered the tree at the geometry location. The
+    /// visual and the hit region then drift apart by the frame's inset: the
+    /// titlebar draws where nothing can be clicked, and the row below it
+    /// answers to clicks meant for the bar. One origin, used by both, is the
+    /// fix.
+    fn surface_origin(space: &Space<Window>, window: &Window) -> Point<i32, Logical> {
+        space.element_location(window).unwrap_or_default() - window.geometry().loc
+    }
+
     fn surface_under(
         &self,
         point: Point<f64, smithay::utils::Logical>,
     ) -> Option<(Window, WlSurface, Point<f64, smithay::utils::Logical>)> {
-        let (window, window_loc) = self.space.element_under(point)?;
+        let (window, _) = self.space.element_under(point)?;
         let window = window.clone();
+        let window_loc = Self::surface_origin(&self.space, &window);
 
         // Descend to the actual surface, not the toplevel's root.
         //
