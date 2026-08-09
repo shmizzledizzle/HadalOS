@@ -1886,10 +1886,15 @@ the way the GUI does — including writing the same key twice — confirms the
 result still parses with no duplicate keys or repeated headers. The duplicates
 were hand-edited.
 
+### Verified on a VT, 2026-08-09
+
+Cursor tracks the touchpad, wallpaper renders, pills and panel draw. cusk runs
+on a virtual terminal, without root.
+
 ### Next
 
-Pointer input, then VT switching and session pause/resume — which is what
-removes the time box and makes this a session rather than a demonstration. on eDP-1, rendering a single colour, with a hard timeout that
+VT switching and session pause/resume — what removes the time box and makes
+this a session rather than a demonstration. on eDP-1, rendering a single colour, with a hard timeout that
    restores the VT — the first thing that can strand a screen, so it should be
    unable to strand it for more than a few seconds.
 2. libinput, so there is a keyboard.
