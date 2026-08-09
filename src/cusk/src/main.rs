@@ -1235,7 +1235,7 @@ fn run_on_tty(
         listener,
         socket_name,
         keyboard,
-        pointer: _pointer,
+        pointer,
     } = build_compositor(&cfg).map_err(|e| {
         // Overwhelmingly this is `XDG_RUNTIME_DIR` missing, and overwhelmingly
         // that means someone reached for `sudo` — which strips it. Saying so
@@ -1291,9 +1291,13 @@ fn run_on_tty(
 
     let outcome = (|| -> Result<(), Box<dyn std::error::Error>> {
         while std::time::Instant::now() < deadline {
-            let escaped = tty::pump_keyboard(&mut libinput, |code, pressed| {
-                let serial = SERIAL_COUNTER.next_serial();
-                let time = start.elapsed().as_millis() as u32;
+            let input = tty::drain(&mut libinput);
+            if input.escape {
+                break;
+            }
+
+            let time = start.elapsed().as_millis() as u32;
+            for (code, pressed) in input.keys {
                 keyboard.input::<(), _>(
                     &mut state,
                     // libinput reports evdev codes; xkb wants them offset by
@@ -1305,13 +1309,59 @@ fn run_on_tty(
                     } else {
                         smithay::backend::input::KeyState::Released
                     },
-                    serial,
+                    SERIAL_COUNTER.next_serial(),
                     time,
                     |_, _, _| smithay::input::keyboard::FilterResult::<()>::Forward,
                 );
-            });
-            if escaped {
-                break;
+            }
+
+            // Motion first, so a click in the same drain lands where the
+            // pointer has just arrived rather than where it used to be.
+            if input.motion != (0.0, 0.0) {
+                let at = tty::clamp_pointer(
+                    (state.pointer_location.x, state.pointer_location.y),
+                    input.motion,
+                    drm.size,
+                );
+                let location = Point::<f64, Logical>::from((at.0, at.1));
+                state.pointer_location = location;
+
+                // The same routing the winit path uses, so hover, focus and
+                // grabs behave identically on both backends.
+                let under = state
+                    .surface_under(location)
+                    .map(|(_, surface, loc)| (surface, loc));
+                if state.focus_follows_mouse {
+                    state.focus_under_pointer(location);
+                }
+                pointer.motion(
+                    &mut state,
+                    under,
+                    &MotionEvent { location, serial: SERIAL_COUNTER.next_serial(), time },
+                );
+                pointer.frame(&mut state);
+            }
+
+            for (button, pressed) in input.buttons {
+                if pressed {
+                    if let Some((window, _, _)) = state.surface_under(state.pointer_location) {
+                        state.focus(&window);
+                    }
+                }
+                pointer.button(
+                    &mut state,
+                    &ButtonEvent {
+                        button,
+                        state: if pressed {
+                            ButtonState::Pressed
+                        } else {
+                            ButtonState::Released
+                        },
+                        serial: SERIAL_COUNTER.next_serial(),
+                        time,
+                    },
+                );
+                pointer.frame(&mut state);
             }
 
             let size = Size::<i32, Physical>::from((drm.size.0, drm.size.1));
@@ -2115,9 +2165,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .and_then(|v| v.parse().ok())
             .unwrap_or(30);
         let config_path = config::default_path();
-        let cfg = config::Config::load(&config_path)
-            .map(|(cfg, _)| cfg)
-            .unwrap_or_default();
+        // Reported, not swallowed. This used to be `unwrap_or_default()`, and
+        // a config with a duplicate key silently became *every* setting at its
+        // default — no wallpaper, default panel, default everything — with
+        // nothing on screen or in the log to say why. A file that fails to
+        // parse is the one case where the user most needs to be told.
+        let cfg = match config::Config::load(&config_path) {
+            Ok((cfg, complaints)) => {
+                for complaint in &complaints {
+                    tracing::warn!("{}: {}", config_path.display(), complaint);
+                }
+                cfg
+            }
+            Err(e) => {
+                println!();
+                println!("  {} could not be read:", config_path.display());
+                println!("    {e}");
+                println!();
+                println!("  Every setting is at its default until that is fixed.");
+                println!("  Duplicate keys and repeated [section] headers are the usual cause.");
+                println!();
+                config::Config::default()
+            }
+        };
         match run_on_tty(cfg, seconds) {
             Ok(()) => println!("\n  cusk exited cleanly.\n"),
             Err(e) => {

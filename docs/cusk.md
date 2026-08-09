@@ -1850,11 +1850,41 @@ so rather than naming a variable and leaving the cause to be guessed.
 Worth stating plainly, because the whole design assumes it: **the tty backend
 does not need root.** Every phase up to this one was built to make that true.
 
-### Not yet
+### First tty run: pointer, and a silent config
 
-Pointer input. libinput reports relative motion, so the driver has to integrate
-and clamp it to the output itself, and doing that badly gives a cursor that
-drifts off screen and cannot be brought back. Keyboard first.
+The compositor came up on the real screen — workspace pills and cursor drawn at
+1920x1080. Two things were wrong.
+
+**The cursor did not move.** Expected: pointer input was the stated gap, so the
+cursor was drawn at a `pointer_location` that started at the origin and never
+changed. Now wired: motion is accumulated across a drain rather than dispatched
+per event — a touchpad emits dozens of deltas between frames, and each one
+would otherwise cost a hit test and an enter/leave pass for a pointer that ends
+up somewhere once. Clicks focus and route exactly as they do under winit.
+
+`clamp_pointer` keeps it on screen, and that is not defensive: a pointer that
+can leave has no desktop edge to catch it and no other compositor to reset it,
+so it is the difference between a usable session and one killed from another
+VT. It stops one pixel short of the far edge, because a pointer exactly at
+`width` is outside every window and the rightmost column would never respond.
+
+**The wallpaper did not appear, and that was a silent failure of mine.** The
+config had a duplicate `window-blur` key and a repeated `[commands]` header —
+both TOML errors — so it failed to parse and *every* setting fell back to its
+default. The panel appeared because 28 is the default; the wallpaper did not
+because empty is.
+
+The winit path warns about that. The `--tty` path did
+`Config::load(..).unwrap_or_default()`, which **discarded the error entirely**.
+A file that will not parse is precisely the case where the user most needs to
+be told, and it was the one case that said nothing. It now prints the parse
+error with its line number and says every setting is at its default until it is
+fixed.
+
+The settings GUI was suspected and cleared: a test that edits the generated file
+the way the GUI does — including writing the same key twice — confirms the
+result still parses with no duplicate keys or repeated headers. The duplicates
+were hand-edited.
 
 ### Next
 

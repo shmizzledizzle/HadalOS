@@ -1090,33 +1090,85 @@ pub fn libinput_for(session: &LibSeatSession, seat: &str) -> Result<input::Libin
     open_libinput(session, seat)
 }
 
-/// Drain libinput, feeding keys to the compositor and reporting Escape.
-///
-/// Keyboard only, for now. The pointer needs absolute positioning that
-/// libinput does not provide for relative devices — the driver has to
-/// integrate motion itself and clamp to the output — and doing that badly
-/// means a cursor that drifts off screen and cannot be brought back.
-pub fn pump_keyboard<F>(libinput: &mut input::Libinput, mut on_key: F) -> bool
-where
-    F: FnMut(u32, bool),
-{
-    use input::event::keyboard::KeyboardEventTrait;
-    use input::event::{Event, KeyboardEvent};
 
+/// What draining libinput produced.
+#[derive(Default)]
+pub struct Input {
+    pub escape: bool,
+    /// Key presses and releases, as evdev codes.
+    pub keys: Vec<(u32, bool)>,
+    /// Accumulated pointer movement since the last drain.
+    pub motion: (f64, f64),
+    pub buttons: Vec<(u32, bool)>,
+}
+
+/// Drain libinput once.
+///
+/// Returns what happened rather than calling back into the compositor, because
+/// the caller needs `&mut Cusk` for the seat and libinput is borrowed here —
+/// two mutable borrows otherwise, and the shape that avoids it is a plain
+/// value.
+///
+/// Motion is **accumulated**, not reported per event. A touchpad emits dozens
+/// of deltas between frames, and dispatching each one separately would mean a
+/// hit test and an enter/leave pass per delta for a pointer that only ends up
+/// somewhere once.
+pub fn drain(libinput: &mut input::Libinput) -> Input {
+    use input::event::keyboard::KeyboardEventTrait;
+    use input::event::{Event, KeyboardEvent, PointerEvent};
+
+    let mut out = Input::default();
     if libinput.dispatch().is_err() {
-        return false;
+        return out;
     }
-    let mut escape = false;
     for event in &mut *libinput {
-        if let Event::Keyboard(KeyboardEvent::Key(key)) = event {
-            let pressed = key.key_state() == input::event::keyboard::KeyState::Pressed;
-            if pressed && key.key() == KEY_ESC {
-                escape = true;
+        match event {
+            Event::Keyboard(KeyboardEvent::Key(key)) => {
+                let pressed = key.key_state() == input::event::keyboard::KeyState::Pressed;
+                if pressed && key.key() == KEY_ESC {
+                    out.escape = true;
+                }
+                out.keys.push((key.key(), pressed));
             }
-            on_key(key.key(), pressed);
+            Event::Pointer(PointerEvent::Motion(motion)) => {
+                out.motion.0 += motion.dx();
+                out.motion.1 += motion.dy();
+            }
+            // Absolute devices — tablets, touchscreens — report where they
+            // *are*. Not handled yet rather than handled wrongly: mapping them
+            // needs the device's own coordinate range, and treating an
+            // absolute position as a delta would fling the pointer across the
+            // screen on every touch.
+            Event::Pointer(PointerEvent::Button(button)) => {
+                let pressed =
+                    button.button_state() == input::event::pointer::ButtonState::Pressed;
+                out.buttons.push((button.button(), pressed));
+            }
+            _ => {}
         }
     }
-    escape
+    out
+}
+
+/// Move a pointer by a delta and keep it on screen.
+///
+/// Clamped to the output. A pointer that can leave the screen cannot be
+/// brought back — there is no desktop edge to catch it and no other compositor
+/// to reset it — so this is the difference between a usable session and one
+/// that has to be killed from another VT.
+pub fn clamp_pointer(
+    at: (f64, f64),
+    delta: (f64, f64),
+    output: (i32, i32),
+) -> (f64, f64) {
+    // One pixel short of the far edge: a pointer exactly at `width` is outside
+    // every window, so the rightmost column would never be clickable.
+    let max_x = (output.0 as f64 - 1.0).max(0.0);
+    let max_y = (output.1 as f64 - 1.0).max(0.0);
+    (
+        (at.0 + delta.0).clamp(0.0, max_x),
+        (at.1 + delta.1).clamp(0.0, max_y),
+    )
 }
 
 #[cfg(test)]
@@ -1127,6 +1179,37 @@ mod tests {
 
     /// A real modifier means the flag must be set, or `add_planar_framebuffer`
     /// asserts and the process dies.
+    /// A pointer that can leave the screen cannot be brought back: there is no
+    /// desktop edge to catch it and no other compositor to reset it. This is
+    /// the difference between a usable session and one killed from another VT.
+    #[test]
+    fn the_pointer_cannot_leave_the_screen() {
+        let output = (1920, 1080);
+        assert_eq!(super::clamp_pointer((0.0, 0.0), (-500.0, -500.0), output), (0.0, 0.0));
+        let far = super::clamp_pointer((1900.0, 1000.0), (500.0, 500.0), output);
+        assert!(far.0 <= 1919.0 && far.1 <= 1079.0, "{far:?}");
+    }
+
+    /// One pixel short of the far edge, because a pointer exactly at `width`
+    /// is outside every window and the rightmost column would never respond.
+    #[test]
+    fn the_far_edge_stays_clickable() {
+        let at = super::clamp_pointer((0.0, 0.0), (9999.0, 9999.0), (1920, 1080));
+        assert_eq!(at, (1919.0, 1079.0));
+    }
+
+    #[test]
+    fn ordinary_motion_is_just_added() {
+        assert_eq!(super::clamp_pointer((100.0, 100.0), (5.5, -3.0), (1920, 1080)), (105.5, 97.0));
+    }
+
+    /// A degenerate output must not produce a negative bound, which would make
+    /// `clamp` panic on an inverted range.
+    #[test]
+    fn a_zero_sized_output_does_not_panic() {
+        assert_eq!(super::clamp_pointer((0.0, 0.0), (10.0, 10.0), (0, 0)), (0.0, 0.0));
+    }
+
     #[test]
     fn a_real_modifier_sets_the_flag() {
         assert_eq!(

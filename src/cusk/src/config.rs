@@ -1167,4 +1167,43 @@ mod-key = \"alt\"
         let setting = Config::setting("layout.master-ratio").unwrap();
         assert_eq!(label_of(setting), "Master ratio");
     }
+    /// Does editing the *generated* file produce a file that still parses?
+    ///
+    /// The generated file's tables are empty, with every setting commented
+    /// out. Writing into one is the normal path — the settings GUI does
+    /// nothing else — so if that can produce a duplicate key or a second table
+    /// header, every user's config eventually stops parsing.
+    #[test]
+    fn editing_the_generated_file_keeps_it_valid() {
+        let mut doc = Config::default_file().parse::<DocumentMut>().unwrap();
+        for (key, value) in [
+            ("layout.inner-gap", Value::Int(35)),
+            ("layout.master-ratio", Value::Float(0.42)),
+            ("appearance.window-blur", Value::Bool(true)),
+            ("appearance.window-opacity", Value::Float(0.85)),
+            // Twice, because a GUI writes the same key on every drag.
+            ("appearance.window-blur", Value::Bool(true)),
+            ("commands.launcher", Value::Text("/somewhere/cusk-launcher".into())),
+        ] {
+            set_in_document(&mut doc, key, value).unwrap();
+        }
+        let written = doc.to_string();
+        let (config, complaints) = Config::from_str(&written)
+            .unwrap_or_else(|e| panic!("the edited file no longer parses: {e}\n{written}"));
+        assert!(complaints.is_empty(), "{complaints:?}");
+        assert_eq!(config.inner_gap, 35);
+        assert!(config.window_blur);
+
+        // Real keys only — the generated file also has a *commented* copy of
+        // every setting, and counting those would make this pass or fail for
+        // the wrong reason.
+        let real = |needle: &str| {
+            written
+                .lines()
+                .filter(|line| !line.trim_start().starts_with('#') && line.trim_start().starts_with(needle))
+                .count()
+        };
+        assert_eq!(real("window-blur"), 1, "duplicate key:\n{written}");
+        assert_eq!(real("[commands]"), 1, "duplicate table:\n{written}");
+    }
 }
