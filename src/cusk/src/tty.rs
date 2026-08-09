@@ -868,6 +868,245 @@ pub fn probe_scanout(seconds: u64) -> Result<(), String> {
     outcome
 }
 
+// ── phase four: the driver ───────────────────────────────────────────────
+
+/// One scanout buffer and everything the two consumers of it need.
+///
+/// The GPU writes through the dmabuf; the display controller reads through the
+/// framebuffer handle. Both refer to the same memory, and keeping them
+/// together is what stops one being freed while the other is still using it.
+pub struct Surface {
+    dmabuf: smithay::backend::allocator::dmabuf::Dmabuf,
+    framebuffer: framebuffer::Handle,
+}
+
+/// Everything the DRM driver owns for the life of a session.
+pub struct Drm {
+    card: Arc<Opened>,
+    pub renderer: smithay::backend::renderer::gles::GlesRenderer,
+    pub surfaces: [Surface; 2],
+    /// Which surface is being scanned out. The other is the one to draw into.
+    front: usize,
+    pub crtc: crtc::Handle,
+    pub connector: connector::Handle,
+    pub mode: drm::control::Mode,
+    previous: Previous,
+    pub size: (i32, i32),
+    /// Render formats, for the dmabuf global the driver registers itself.
+    pub formats: Vec<smithay::backend::allocator::Format>,
+}
+
+impl Drm {
+    /// Open the device, pick an output, and allocate a pair of buffers.
+    ///
+    /// Nothing here takes DRM master. That is deliberate: everything that can
+    /// fail while the console is still readable should fail before the screen
+    /// is taken over.
+    pub fn open(session: &mut LibSeatSession) -> Result<Self, String> {
+        use smithay::backend::allocator::dmabuf::AsDmabuf;
+        use smithay::backend::allocator::gbm::{GbmAllocator, GbmBufferFlags, GbmDevice};
+        use smithay::backend::allocator::{Allocator, Modifier};
+        use smithay::backend::egl::{EGLContext, EGLDisplay};
+        use smithay::backend::renderer::gles::GlesRenderer;
+        use smithay::reexports::drm::buffer::PlanarBuffer;
+
+        let path = drm_devices().into_iter().next().ok_or("no DRM device")?;
+        let fd = session
+            .open(
+                &path,
+                rustix::fs::OFlags::RDWR
+                    | rustix::fs::OFlags::CLOEXEC
+                    | rustix::fs::OFlags::NONBLOCK,
+            )
+            .map_err(|e| format!("session refused {}: {e}", path.display()))?;
+        let card = Arc::new(Opened { file: std::fs::File::from(fd) });
+
+        let resources = card
+            .resource_handles()
+            .map_err(|e| format!("could not read resources: {e}"))?;
+        let (connector, mode) = resources
+            .connectors()
+            .iter()
+            .filter_map(|handle| card.get_connector(*handle, true).ok())
+            .filter(|info| info.state() == connector::State::Connected)
+            .find_map(|info| info.modes().first().copied().map(|m| (info.handle(), m)))
+            .ok_or("no connected output with a mode")?;
+        let info = card
+            .get_connector(connector, false)
+            .map_err(|e| format!("could not re-read the connector: {e}"))?;
+        let crtc = info
+            .current_encoder()
+            .and_then(|handle| card.get_encoder(handle).ok())
+            .and_then(|encoder| encoder.crtc())
+            .or_else(|| resources.crtcs().first().copied())
+            .ok_or("no CRTC for that connector")?;
+
+        let crtc_info = card
+            .get_crtc(crtc)
+            .map_err(|e| format!("could not read the CRTC: {e}"))?;
+        let previous = Previous {
+            crtc,
+            mode: crtc_info.mode(),
+            framebuffer: crtc_info.framebuffer(),
+            position: crtc_info.position(),
+            connector,
+        };
+
+        let dup = |what: &str| {
+            card.file
+                .try_clone()
+                .map_err(|e| format!("could not dup the card for {what}: {e}"))
+        };
+        let gbm_for_egl = GbmDevice::new(dup("EGL")?).map_err(|e| format!("no GBM: {e}"))?;
+        let gbm_for_alloc = GbmDevice::new(dup("allocation")?).map_err(|e| format!("no GBM: {e}"))?;
+        let display =
+            unsafe { EGLDisplay::new(gbm_for_egl) }.map_err(|e| format!("no EGL display: {e}"))?;
+        let formats = display.dmabuf_render_formats().iter().copied().collect();
+        let context = EGLContext::new(&display).map_err(|e| format!("no EGL context: {e}"))?;
+        let renderer =
+            unsafe { GlesRenderer::new(context) }.map_err(|e| format!("no GL renderer: {e}"))?;
+
+        let (width, height) = mode.size();
+        let mut allocator =
+            GbmAllocator::new(gbm_for_alloc, GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT);
+
+        // Two, so a frame is never drawn into the buffer the display is
+        // currently reading. One buffer means every frame is visible while it
+        // is still being assembled.
+        let mut make = || -> Result<Surface, String> {
+            let buffer = allocator
+                .create_buffer(width as u32, height as u32, DrmFourcc::Xrgb8888, &[Modifier::Linear])
+                .map_err(|e| format!("could not allocate a scanout buffer: {e}"))?;
+            let framebuffer = card
+                .add_planar_framebuffer(&buffer, framebuffer_flags(PlanarBuffer::modifier(&buffer)))
+                .map_err(|e| format!("the display controller refused the buffer: {e}"))?;
+            let dmabuf = buffer
+                .export()
+                .map_err(|e| format!("could not export the buffer: {e}"))?;
+            Ok(Surface { dmabuf, framebuffer })
+        };
+        let surfaces = [make()?, make()?];
+
+        Ok(Drm {
+            card,
+            renderer,
+            surfaces,
+            front: 0,
+            crtc,
+            connector,
+            mode,
+            previous,
+            size: (width as i32, height as i32),
+            formats,
+        })
+    }
+
+    /// Take the display. Everything before this point is reversible.
+    pub fn take_display(&self) -> Result<(), String> {
+        self.card
+            .acquire_master_lock()
+            .map_err(|e| format!("could not become DRM master: {e}\n  This needs its own VT."))
+    }
+
+    /// Draw into the buffer that is not currently on screen.
+    ///
+    /// A closure rather than handing out the renderer and the buffer
+    /// separately, because both are fields of this struct and the caller
+    /// cannot borrow two of them at once. Destructuring here splits the borrow
+    /// where the compiler can see it.
+    pub fn with_back<T>(
+        &mut self,
+        draw: impl FnOnce(
+            &mut smithay::backend::renderer::gles::GlesRenderer,
+            &mut <smithay::backend::renderer::gles::GlesRenderer as smithay::backend::renderer::RendererSuper>::Framebuffer<'_>,
+        ) -> T,
+    ) -> Result<T, String> {
+        use smithay::backend::renderer::Bind;
+
+        let back = 1 - self.front;
+        let Drm { renderer, surfaces, .. } = self;
+        let mut framebuffer = renderer
+            .bind(&mut surfaces[back].dmabuf)
+            .map_err(|e| format!("could not bind the scanout buffer: {e}"))?;
+        Ok(draw(renderer, &mut framebuffer))
+    }
+
+    /// Show what was just drawn.
+    ///
+    /// `set_crtc` rather than a page flip. A flip is asynchronous and its
+    /// completion arrives as a DRM event that has to be read before the next
+    /// one can be queued; doing that properly needs the event loop that this
+    /// driver does not have yet. `set_crtc` is synchronous and tears, which is
+    /// visible and honest, where a flip queued twice without draining silently
+    /// returns `EBUSY` and the screen simply stops updating.
+    pub fn present(&mut self) -> Result<(), String> {
+        let back = 1 - self.front;
+        self.card
+            .set_crtc(
+                self.crtc,
+                Some(self.surfaces[back].framebuffer),
+                (0, 0),
+                &[self.connector],
+                Some(self.mode),
+            )
+            .map_err(|e| format!("could not present: {e}"))?;
+        self.front = back;
+        Ok(())
+    }
+
+    pub fn restore(&self) {
+        self.previous.restore(&self.card);
+        let _ = self.card.release_master_lock();
+    }
+
+    /// Arm the watchdog. Call before taking the display.
+    pub fn arm_watchdog(&self, seconds: u64) {
+        let card = Arc::clone(&self.card);
+        let previous = self.previous;
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(seconds));
+            eprintln!("  watchdog fired — restoring and exiting");
+            previous.restore(&card);
+            let _ = card.release_master_lock();
+            std::process::exit(2);
+        });
+    }
+}
+
+/// Open libinput for a session, for the driver to pump.
+pub fn libinput_for(session: &LibSeatSession, seat: &str) -> Result<input::Libinput, String> {
+    open_libinput(session, seat)
+}
+
+/// Drain libinput, feeding keys to the compositor and reporting Escape.
+///
+/// Keyboard only, for now. The pointer needs absolute positioning that
+/// libinput does not provide for relative devices — the driver has to
+/// integrate motion itself and clamp to the output — and doing that badly
+/// means a cursor that drifts off screen and cannot be brought back.
+pub fn pump_keyboard<F>(libinput: &mut input::Libinput, mut on_key: F) -> bool
+where
+    F: FnMut(u32, bool),
+{
+    use input::event::keyboard::KeyboardEventTrait;
+    use input::event::{Event, KeyboardEvent};
+
+    if libinput.dispatch().is_err() {
+        return false;
+    }
+    let mut escape = false;
+    for event in &mut *libinput {
+        if let Event::Keyboard(KeyboardEvent::Key(key)) = event {
+            let pressed = key.key_state() == input::event::keyboard::KeyState::Pressed;
+            if pressed && key.key() == KEY_ESC {
+                escape = true;
+            }
+            on_key(key.key(), pressed);
+        }
+    }
+    escape
+}
+
 #[cfg(test)]
 mod tests {
     use super::framebuffer_flags;

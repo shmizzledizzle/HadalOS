@@ -1206,6 +1206,137 @@ fn texture_src(rect: Rectangle<i32, Logical>) -> Rectangle<f64, smithay::utils::
     )
 }
 
+/// Run cusk on a virtual terminal.
+///
+/// The winit loop's counterpart: obtain a framebuffer, pump input, call
+/// `draw_frame`, present, dispatch clients. Everything about *what* is drawn is
+/// shared — that was the point of milestones 21 and 24.
+///
+/// Time-boxed for now. VT switching and session pause/resume are not handled,
+/// so a compositor that ran indefinitely would keep DRM master across a switch
+/// away and leave the other VT blank. Escape ends it early; the watchdog ends
+/// it regardless.
+fn run_on_tty(
+    cfg: config::Config,
+    seconds: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (mut session, _notifier) = smithay::backend::session::libseat::LibSeatSession::new()
+        .map_err(|e| format!("could not join a session: {e}\n  This needs its own VT."))?;
+    let seat_name = smithay::backend::session::Session::seat(&session);
+
+    // Opened before the display is taken, so anything that fails here fails
+    // while the console is still readable.
+    let mut drm = tty::Drm::open(&mut session)?;
+    let mut libinput = tty::libinput_for(&session, &seat_name)?;
+
+    let Compositor {
+        mut display,
+        mut state,
+        listener,
+        socket_name,
+        keyboard,
+        pointer: _pointer,
+    } = build_compositor(&cfg)?;
+    let mut dh = display.handle();
+
+    // The one global the driver registers itself, because it needs the
+    // renderer's formats and only a driver has a renderer.
+    let _dmabuf_global = if drm.formats.is_empty() {
+        tracing::warn!("no dmabuf render formats; clients will use shared memory");
+        None
+    } else {
+        let count = drm.formats.len();
+        let global = state
+            .dmabuf_state
+            .create_global::<Cusk>(&dh, drm.formats.clone());
+        tracing::info!("dmabuf advertised with {count} formats");
+        Some(global)
+    };
+
+    state.output_size = drm.size;
+    println!();
+    println!("  cusk on {seat_name}, {}x{}", drm.size.0, drm.size.1);
+    println!("  WAYLAND_DISPLAY={socket_name}");
+    println!("  escape to quit — {seconds}s limit");
+    println!();
+
+    // Armed before the display is taken, so a hang anywhere after this point
+    // still ends with a usable console.
+    drm.arm_watchdog(seconds + 3);
+    drm.take_display()?;
+
+    let mut ctx = FrameContext {
+        chrome: None,
+        blur: None,
+        backdrop: None,
+        refused: None,
+        face: text::find_font(&cfg.font).and_then(|path| text::Face::load(&path)),
+        title_texture: None,
+        pointer_image: cursor::arrow(24),
+        pointer_texture: None,
+        warned_square_corners: false,
+    };
+    let mut clients = Vec::new();
+    let start = std::time::Instant::now();
+    let deadline = start + std::time::Duration::from_secs(seconds);
+
+    let outcome = (|| -> Result<(), Box<dyn std::error::Error>> {
+        while std::time::Instant::now() < deadline {
+            let escaped = tty::pump_keyboard(&mut libinput, |code, pressed| {
+                let serial = SERIAL_COUNTER.next_serial();
+                let time = start.elapsed().as_millis() as u32;
+                keyboard.input::<(), _>(
+                    &mut state,
+                    // libinput reports evdev codes; xkb wants them offset by
+                    // eight. Feeding the raw code shifts every key by one row,
+                    // which reads as a broken layout rather than an offset.
+                    smithay::backend::input::Keycode::from(code + 8),
+                    if pressed {
+                        smithay::backend::input::KeyState::Pressed
+                    } else {
+                        smithay::backend::input::KeyState::Released
+                    },
+                    serial,
+                    time,
+                    |_, _, _| smithay::input::keyboard::FilterResult::<()>::Forward,
+                );
+            });
+            if escaped {
+                break;
+            }
+
+            let size = Size::<i32, Physical>::from((drm.size.0, drm.size.1));
+            let logical = Size::<i32, Logical>::from((drm.size.0, drm.size.1));
+            drm.with_back(|renderer, framebuffer| {
+                draw_frame(
+                    renderer,
+                    framebuffer,
+                    &mut state,
+                    &mut ctx,
+                    &cfg,
+                    size,
+                    logical,
+                    // Not flipped: winit hands back an inverted framebuffer and
+                    // DRM does not.
+                    Transform::Normal,
+                    start,
+                )
+            })??;
+            drm.present()?;
+
+            if let Some(stream) = listener.accept()? {
+                clients.push(dh.insert_client(stream, Arc::new(ClientState::default()))?);
+            }
+            display.dispatch_clients(&mut state)?;
+            display.flush_clients()?;
+        }
+        Ok(())
+    })();
+
+    drm.restore();
+    outcome
+}
+
 /// Everything the render loop needs that outlives a single frame.
 ///
 /// Gathered into one place because the loop used to thread ten separate
@@ -1959,6 +2090,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap_or(5);
         match tty::probe_scanout(seconds) {
             Ok(()) => println!("\n  the GPU drew it and the display scanned it out.\n"),
+            Err(e) => {
+                println!("\n  {e}\n");
+                std::process::exit(1);
+            }
+        }
+        return Ok(());
+    }
+
+    // The real thing: cusk on a virtual terminal.
+    if args.iter().any(|a| a == "--tty") {
+        let seconds = args
+            .iter()
+            .find_map(|a| a.strip_prefix("--seconds="))
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(30);
+        let config_path = config::default_path();
+        let cfg = config::Config::load(&config_path)
+            .map(|(cfg, _)| cfg)
+            .unwrap_or_default();
+        match run_on_tty(cfg, seconds) {
+            Ok(()) => println!("\n  cusk exited cleanly.\n"),
             Err(e) => {
                 println!("\n  {e}\n");
                 std::process::exit(1);

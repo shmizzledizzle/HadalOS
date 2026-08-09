@@ -1796,11 +1796,49 @@ backdrop, no blur and no warning either. "No warnings" from a run that did
 nothing looks exactly like "no warnings" from a run that did everything. The
 re-run checks for the `wallpaper ready` line specifically.
 
+---
+
+## Milestone 25: cusk on a tty, 2026-08-09
+
+`cusk --tty [--seconds=N]`. The compositor, on a virtual terminal, drawing the
+real scene and accepting real clients.
+
+The winit loop's counterpart, and deliberately small because milestones 21 and
+24 did the work: obtain a framebuffer, pump input, call `draw_frame`, present,
+dispatch clients. Everything about *what* is drawn is shared.
+
+### Decisions
+
+- **Two buffers.** A frame is never drawn into the buffer the display is
+  reading, or every frame is visible while it is still being assembled.
+- **`set_crtc`, not a page flip.** A flip is asynchronous and its completion
+  arrives as a DRM event that must be read before the next can be queued.
+  Doing that needs an event loop this driver does not have yet. `set_crtc`
+  tears, which is visible and honest; a flip queued twice without draining
+  returns `EBUSY` and the screen silently stops updating.
+- **Everything fallible happens before the display is taken.** Device, buffers,
+  libinput and the compositor are all built first, so a failure lands on a
+  readable console.
+- **The watchdog is armed before master**, as everywhere else here.
+- **`Transform::Normal`.** winit hands back an inverted framebuffer; DRM does
+  not. That is the parameter milestone 21 introduced, earning itself.
+- **Keycodes are offset by eight.** libinput reports evdev codes and xkb wants
+  them shifted; feeding the raw code moves every key one row and reads as a
+  broken layout rather than an offset.
+- **Time-boxed.** VT switching and session pause/resume are not handled, so a
+  compositor running indefinitely would hold DRM master across a switch away
+  and leave the other VT blank. Escape ends it early.
+
+### Not yet
+
+Pointer input. libinput reports relative motion, so the driver has to integrate
+and clamp it to the output itself, and doing that badly gives a cursor that
+drifts off screen and cannot be brought back. Keyboard first.
+
 ### Next
 
-The DRM driver itself: the loop that owns a session, allocates a pair of
-buffers, calls `draw_frame`, and page-flips — with the Wayland setup shared
-between it and the winit driver. Then VT switching and hotplug. on eDP-1, rendering a single colour, with a hard timeout that
+Pointer input, then VT switching and session pause/resume — which is what
+removes the time box and makes this a session rather than a demonstration. on eDP-1, rendering a single colour, with a hard timeout that
    restores the VT — the first thing that can strand a screen, so it should be
    unable to strand it for more than a few seconds.
 2. libinput, so there is a keyboard.
