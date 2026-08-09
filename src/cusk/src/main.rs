@@ -279,6 +279,7 @@ impl CompositorHandler for Cusk {
             window.on_commit();
             self.classify(&window);
 
+
             if let Some(toplevel) = window.toplevel() {
                 toplevel.send_configure();
             }
@@ -2052,10 +2053,18 @@ fn draw_frame(
             // is required rather than incidental: `opaque_regions` returns
             // empty below 1.0, so whatever is behind a translucent window
             // still gets drawn instead of being skipped as hidden.
+            // The *surface* origin, not the geometry location. A client with
+            // its own decorations puts the frame above and left of its root
+            // surface — measured on alacritty, `geometry().loc` is `(0, -35)`,
+            // a 35px titlebar — so rendering the tree at the geometry location
+            // draws the whole window 35px too low while every hit test uses
+            // the correct origin. `Space::element_under` already returns
+            // `render_location()`, which is this; only rendering disagreed.
+            let origin = Cusk::surface_origin(&state.space, window);
             let elements = render_elements_from_surface_tree(
                 renderer,
                 &surface,
-                (loc.x, loc.y),
+                (origin.x, origin.y),
                 1.0,
                 current.window_opacity as f32,
                 Kind::Unspecified,

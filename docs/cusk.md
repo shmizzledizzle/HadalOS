@@ -2136,6 +2136,25 @@ it. Milestone 2 had already recorded the evidence — *"a press resolved to
 confined to its geometry"* — and the conclusion drawn there was about layout,
 not about this.
 
+### The first attempt did not apply, and said nothing
+
+Reported still offset afterwards. Probing rather than reasoning gave the
+numbers in one run: `loc=(40,70) geo.loc=(0,-35)` — a 35px titlebar above the
+root surface, exactly the reported offset.
+
+Two findings from that. First, **hit-testing was never wrong**:
+`Space::element_under` already returns `render_location()`, which is the
+surface origin, so the change to `surface_under` computed a value it already
+had. Only rendering disagreed, drawing every decorated window 35px too low.
+
+Second, and worse: **the edit to the render site never applied.** It was made
+with a string replacement that did not match, and `str.replace` returns the
+subject unchanged rather than failing. The build passed, the tests passed, the
+commit went out, and the only evidence was a user reporting the same symptom.
+The replacement now asserts its match count before writing — a silent no-op
+edit is the same class of failure as everything else recorded here, one layer
+further out.
+
 ### The buttons
 
 Minimise and maximise did nothing because the requests behind them were never
