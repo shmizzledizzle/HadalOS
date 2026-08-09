@@ -53,6 +53,7 @@ use smithay::backend::renderer::utils::{draw_render_elements, on_commit_buffer_h
 use smithay::backend::renderer::{Bind, Color32F, Frame, ImportMem, Renderer, RendererSuper};
 use smithay::backend::winit::{self, WinitEvent};
 use smithay::desktop::{Space, Window, WindowSurfaceType};
+use smithay::output::{Mode as OutputMode, Output, PhysicalProperties, Subpixel};
 use smithay::backend::input::KeyState;
 use smithay::input::keyboard::{FilterResult, Keysym, ModifiersState};
 use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode as DecorationMode;
@@ -189,6 +190,13 @@ struct Classification {
 }
 
 struct Cusk {
+    /// The screen, as clients see it.
+    ///
+    /// cusk passed size tuples around until now and never advertised
+    /// `wl_output`, so a client could not learn the resolution, the scale or
+    /// the refresh rate — and a layer-shell surface, which anchors to an
+    /// output, had nothing to anchor to.
+    output: Output,
     compositor_state: CompositorState,
     xdg_shell_state: XdgShellState,
     /// Held, not read: the global lives as long as this does, and dropping it
@@ -491,6 +499,11 @@ impl XdgDecorationHandler for Cusk {
     }
 }
 delegate_xdg_decoration!(Cusk);
+/// Nothing to do on bind: cusk has one output whose state is set before any
+/// client connects, so there is no per-client work and no second output to
+/// reconcile. It becomes interesting with hotplug.
+impl smithay::wayland::output::OutputHandler for Cusk {}
+smithay::delegate_output!(Cusk);
 
 impl SeatHandler for Cusk {
     type KeyboardFocus = WlSurface;
@@ -1403,6 +1416,9 @@ fn run_on_tty(
     };
 
     state.output_size = drm.size;
+    let refresh = drm.mode.vrefresh() as i32 * 1000;
+    let out = state.output.clone();
+    set_output_mode(&mut state.space, &out, drm.size, refresh);
     println!();
     println!("  cusk on {seat_name}, {}x{}", drm.size.0, drm.size.1);
     println!("  WAYLAND_DISPLAY={socket_name}");
@@ -1946,6 +1962,20 @@ fn axis_frame(scroll: tty::Scroll, time: u32) -> AxisFrame {
         frame = frame.stop(Axis::Vertical);
     }
     frame
+}
+
+/// Tell the output — and every client watching it — what size the screen is.
+///
+/// Called by whichever driver knows, because only a driver does. A client that
+/// binds `wl_output` and is told nothing has to guess its own scale and
+/// dimensions, and the guess is usually 1x at whatever it feels like.
+fn set_output_mode(space: &mut Space<Window>, output: &Output, size: (i32, i32), refresh: i32) {
+    let mode = OutputMode { size: (size.0, size.1).into(), refresh };
+    output.change_current_state(Some(mode), Some(Transform::Normal), None, Some((0, 0).into()));
+    output.set_preferred(mode);
+    // Mapped into the Space so layer surfaces and window geometry are measured
+    // against the same origin.
+    space.map_output(output, (0, 0));
 }
 
 /// Everything the render loop needs that outlives a single frame.
@@ -2539,6 +2569,23 @@ fn build_compositor(cfg: &config::Config) -> Result<Compositor, Box<dyn std::err
     let display: Display<Cusk> = Display::new()?;
     let dh = display.handle();
 
+    // Advertised before any client connects, so nobody has to cope with an
+    // output appearing late. The size is corrected once the backend reports
+    // its real one — a placeholder that is visibly wrong is better than a
+    // global that arrives after the clients that needed it.
+    let output = Output::new(
+        "cusk-0".to_string(),
+        PhysicalProperties {
+            // Zero means "unknown", which is what a nested compositor honestly
+            // knows about physical millimetres.
+            size: (0, 0).into(),
+            subpixel: Subpixel::Unknown,
+            make: "HadalOS".into(),
+            model: "Cusk".into(),
+        },
+    );
+    output.create_global::<Cusk>(&dh);
+
     let compositor_state = CompositorState::new::<Cusk>(&dh);
     let shm_state = ShmState::new::<Cusk>(&dh, vec![]);
     let dmabuf_state = DmabufState::new();
@@ -2554,6 +2601,7 @@ fn build_compositor(cfg: &config::Config) -> Result<Compositor, Box<dyn std::err
         data_device_state: DataDeviceState::new::<Cusk>(&dh),
         seat_state,
         seat,
+        output: output.clone(),
         space: Space::default(),
         pointer_location: (0.0, 0.0).into(),
         modifiers: ModifiersState::default(),
@@ -3006,6 +3054,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // margin, both of which read as a layout bug rather than a stale size.
         if state.output_size != (logical_size.w, logical_size.h) {
             state.output_size = (logical_size.w, logical_size.h);
+            // 60Hz in mHz. winit does not report a refresh rate, and a made-up
+            // one that is obviously round is better than zero, which some
+            // clients read as "no mode".
+            let out = state.output.clone();
+            set_output_mode(&mut state.space, &out, state.output_size, 60_000);
             state.relayout();
         }
 
