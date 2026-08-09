@@ -1217,7 +1217,7 @@ fn texture_src(rect: Rectangle<i32, Logical>) -> Rectangle<f64, smithay::utils::
 /// away and leave the other VT blank. Escape ends it early; the watchdog ends
 /// it regardless.
 fn run_on_tty(
-    cfg: config::Config,
+    mut cfg: config::Config,
     seconds: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (mut session, notifier) = smithay::backend::session::libseat::LibSeatSession::new()
@@ -1299,11 +1299,17 @@ fn run_on_tty(
         warned_square_corners: false,
     };
     // Resolved once, as the winit driver does, so Super+Return has something
-    // to spawn.
-    let terminal: Option<String> = match cfg.terminal.as_str() {
+    // to spawn. Mutable because a config reload can change it.
+    let mut terminal: Option<String> = match cfg.terminal.as_str() {
         "auto" => pick_terminal().map(str::to_owned),
         named => Some(named.to_string()),
     };
+    // Hot reload works on the tty too. It was winit-only, which meant the
+    // settings editor could be open on one backend and inert on the other —
+    // the same parity gap as the bindings and the drag, in the one feature
+    // whose whole point is that an edit lands immediately.
+    let mut watcher = config::Watcher::new(config::default_path());
+
     let mut clients = Vec::new();
     let mut chord = tty::Chord::default();
     let start = std::time::Instant::now();
@@ -1428,10 +1434,13 @@ fn run_on_tty(
             }
 
             for (button, pressed) in input.buttons {
-                if pressed {
-                    if let Some((window, _, _)) = state.surface_under(state.pointer_location) {
-                        state.focus(&window);
-                    }
+                let serial = SERIAL_COUNTER.next_serial();
+                // The same press handling the winit driver uses, so the panel,
+                // click-to-focus and Super+drag behave identically. Without
+                // this the tty session could focus a window and not move it.
+                let forward = if pressed { state.press(button, serial) } else { true };
+                if !forward {
+                    continue;
                 }
                 pointer.button(
                     &mut state,
@@ -1442,7 +1451,7 @@ fn run_on_tty(
                         } else {
                             ButtonState::Released
                         },
-                        serial: SERIAL_COUNTER.next_serial(),
+                        serial,
                         time,
                     },
                 );
@@ -1478,6 +1487,30 @@ fn run_on_tty(
                     continue;
                 }
                 return Err(e.into());
+            }
+
+            match watcher.poll() {
+                config::Reload::Unchanged => {}
+                config::Reload::Applied { config: fresh, complaints } => {
+                    for complaint in &complaints {
+                        tracing::warn!("{}: {}", watcher.path().display(), complaint);
+                    }
+                    for key in config::restart_only_changes(&cfg, &fresh) {
+                        tracing::info!("{key} changed; takes effect on restart");
+                    }
+                    state.apply_config(&fresh);
+                    terminal = match fresh.terminal.as_str() {
+                        "auto" => pick_terminal().map(str::to_owned),
+                        named => Some(named.to_string()),
+                    };
+                    cfg = fresh;
+                }
+                config::Reload::Failed(e) => {
+                    tracing::warn!(
+                        "{}: {e} — keeping the running configuration",
+                        watcher.path().display()
+                    );
+                }
             }
 
             if let Some(stream) = listener.accept()? {
@@ -1660,6 +1693,66 @@ mod binding_tests {
     fn unbound_keys_are_not_claimed() {
         for sym in [Keysym::a, Keysym::z, Keysym::F5, Keysym::Escape, Keysym::_0] {
             assert_eq!(binding_for(sym, false), None, "{sym:?} was claimed");
+        }
+    }
+}
+
+impl Cusk {
+    /// Handle a pointer press, returning whether the client should still see
+    /// it.
+    ///
+    /// Lifted out of the winit handler for the third time in three milestones,
+    /// and for the same reason: welded into one driver, it was invisible to
+    /// the other. The tty session had click-to-focus and no Super+drag, so
+    /// floating windows could be clicked and not moved.
+    ///
+    /// The order is the substance. The panel owns its strip outright and is
+    /// tested first, or a floating window overlapping the bar takes the click.
+    /// Focus is taken before any modifier handling, so a Super+drag also
+    /// focuses. Consumed presses are not forwarded, or Super+drag selects text
+    /// in the terminal it is dragging.
+    fn press(&mut self, button: u32, serial: Serial) -> bool {
+        if self.panel_click(self.pointer_location.to_i32_round()) {
+            return false;
+        }
+
+        let Some((window, _, _)) = self.surface_under(self.pointer_location) else {
+            // Clicking the background clears focus. Otherwise the last window
+            // keeps the keyboard while looking inert.
+            if let Some(keyboard) = self.seat.get_keyboard() {
+                keyboard.set_focus(self, None, serial);
+            }
+            return true;
+        };
+
+        self.focus(&window);
+
+        // Logged unconditionally at debug: when a host compositor eats the
+        // modifier the symptom is that nothing happens, and nothing happening
+        // is indistinguishable from a bug in the grab.
+        tracing::debug!(
+            "button {button:#x} mods: super={} alt={} ctrl={} shift={}",
+            self.modifiers.logo,
+            self.modifiers.alt,
+            self.modifiers.ctrl,
+            self.modifiers.shift,
+        );
+
+        if !self.mod_key.held(&self.modifiers) {
+            return true;
+        }
+        match button {
+            floating::BTN_LEFT => {
+                self.start_move(window, button);
+                false
+            }
+            floating::BTN_RIGHT => {
+                let rect = floating::window_rect(&self.space, &window);
+                let edges = floating::nearest_edge(rect, self.pointer_location);
+                self.start_resize(window, button, edges);
+                false
+            }
+            _ => true,
         }
     }
 }
@@ -2789,66 +2882,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let button = event.button_code();
                 let button_state = event.state();
                 let mut forward = true;
-
-                // The panel is checked before anything else, because it owns
-                // its strip of screen outright. Testing it after the surface
-                // hit would let a floating window that overlaps the bar take
-                // the click instead.
-                if button_state == ButtonState::Pressed
-                    && state.panel_click(state.pointer_location.to_i32_round())
-                {
-                    forward = false;
-                }
-
-                if forward && button_state == ButtonState::Pressed {
-                    let hit = state.surface_under(state.pointer_location);
-                    tracing::debug!(
-                        "press {button:#x} at {:?} -> {}, super={} alt={}",
-                        state.pointer_location,
-                        match &hit {
-                            Some((_, _, loc)) => format!("surface at {loc:?}"),
-                            None => "NO SURFACE".to_string(),
-                        },
-                        state.modifiers.logo,
-                        state.modifiers.alt,
-                    );
-                    if let Some((window, _, _)) = hit {
-                        // Click to focus and raise, always — before any
-                        // modifier handling, so a Super+drag also focuses.
-                        state.focus(&window);
-
-                        // Logged unconditionally at debug: when a host
-                        // compositor eats the modifier, the symptom is that
-                        // nothing happens, and nothing happening is
-                        // indistinguishable from a bug in the grab.
-                        tracing::debug!(
-                            "button {button:#x} mods: super={} alt={} ctrl={} shift={}",
-                            state.modifiers.logo,
-                            state.modifiers.alt,
-                            state.modifiers.ctrl,
-                            state.modifiers.shift,
-                        );
-                        if state.mod_key.held(&state.modifiers) {
-                            match button {
-                                floating::BTN_LEFT => {
-                                    state.start_move(window, button);
-                                    forward = false;
-                                }
-                                floating::BTN_RIGHT => {
-                                    let rect = floating::window_rect(&state.space, &window);
-                                    let edges =
-                                        floating::nearest_edge(rect, state.pointer_location);
-                                    state.start_resize(window, button, edges);
-                                    forward = false;
-                                }
-                                _ => {}
-                            }
-                        }
-                    } else {
-                        // Clicking the background clears focus. Otherwise the
-                        // last window keeps the keyboard while looking inert.
-                        keyboard.set_focus(&mut state, None, serial);
-                    }
+                if button_state == ButtonState::Pressed {
+                    forward = state.press(button, serial);
                 }
 
                 // A binding the compositor consumed must not also reach the

@@ -2012,10 +2012,40 @@ away again. **A run that does nothing produces the same output as a run that
 does everything**, so the check now counts the `wallpaper ready` line rather
 than trusting the absence of warnings. Second time this session.
 
+---
+
+## Milestone 28: the rest of the driver parity, 2026-08-09
+
+Floating windows could be clicked on the tty and not dragged. The Super+drag
+and Super+right-drag logic lived inside the winit button handler — **the third
+time in three milestones** that behaviour welded into one driver turned out to
+be invisible to the other, after `draw_frame`, `build_compositor` and the
+binding table.
+
+`Cusk::press` now owns it, and the order in it is the substance: the panel is
+tested first because it owns its strip outright, focus is taken before any
+modifier handling so a Super+drag also focuses, and a consumed press is not
+forwarded or Super+drag selects text in the terminal it is dragging.
+
+**Hot reload was winit-only too**, which meant the settings editor could be open
+on one backend and inert on the other — in the one feature whose entire point is
+that an edit lands immediately. The tty driver now watches the file as well.
+
+### The pattern, named
+
+Three milestones, three instances, one shape: *anything welded into a driver is
+invisible to the other, and the failure is silence rather than an error*. Not a
+missing feature that errors, not a wrong result — a key that does nothing, a
+window that will not move, a config that will not reload.
+
+An audit for the rest turned up one more, in a different category: **neither
+driver handles scroll**. That is a missing feature rather than a parity gap, so
+it is recorded here rather than fixed under this heading.
+
 ### Next
 
-Hotplug, page-flip timing to replace the tearing `set_crtc`, and the winit
-driver adopting this loop's structure. None block using cusk on a tty. on eDP-1, rendering a single colour, with a hard timeout that
+Scroll, which no backend has. Then hotplug, and page-flip timing to replace the
+tearing `set_crtc`. on eDP-1, rendering a single colour, with a hard timeout that
    restores the VT — the first thing that can strand a screen, so it should be
    unable to strand it for more than a few seconds.
 2. libinput, so there is a keyboard.
