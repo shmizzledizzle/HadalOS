@@ -93,6 +93,10 @@ use smithay::wayland::selection::data_device::{
     ClientDndGrabHandler, DataDeviceHandler, DataDeviceState, ServerDndGrabHandler,
 };
 use smithay::wayland::selection::SelectionHandler;
+use smithay::desktop::{layer_map_for_output, LayerSurface};
+use smithay::wayland::shell::wlr_layer::{
+    Layer, LayerSurface as WlrLayerSurface, WlrLayerShellHandler, WlrLayerShellState,
+};
 use smithay::wayland::shell::xdg::decoration::{XdgDecorationHandler, XdgDecorationState};
 use smithay::wayland::shell::xdg::{
     PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
@@ -204,6 +208,7 @@ struct Cusk {
     /// already bound it.
     #[allow(dead_code)]
     xdg_decoration_state: XdgDecorationState,
+    layer_shell_state: WlrLayerShellState,
     shm_state: ShmState,
     dmabuf_state: DmabufState,
     seat_state: SeatState<Self>,
@@ -311,11 +316,8 @@ impl XdgShellHandler for Cusk {
         // visibly a second window. Floating placement policy in miniature —
         // §3's floating mode is this, with intent.
         let n = self.space.elements().count() as i32;
-        let usable = panel::usable_area(
-            Size::from((self.output_size.0, self.output_size.1)),
-            self.panel_height,
-        );
-        let location = (40 + n * 30, usable.loc.y + 40 + n * 30);
+        let usable = self.usable_area();
+        let location = (usable.loc.x + 40 + n * 30, usable.loc.y + 40 + n * 30);
         self.space.map_element(window.clone(), location, true);
 
         if let Some(toplevel) = window.toplevel() {
@@ -393,8 +395,7 @@ impl XdgShellHandler for Cusk {
             .cloned();
         if let Some(window) = found {
             if !geometry::is_displaced(&window) {
-                let size = (self.output_size.0, self.output_size.1);
-                self.toggle_maximize(&window, size);
+                self.toggle_maximize(&window);
             }
         }
     }
@@ -407,8 +408,7 @@ impl XdgShellHandler for Cusk {
             .cloned();
         if let Some(window) = found {
             if geometry::is_displaced(&window) {
-                let size = (self.output_size.0, self.output_size.1);
-                self.toggle_maximize(&window, size);
+                self.toggle_maximize(&window);
             }
         }
     }
@@ -505,6 +505,66 @@ delegate_xdg_decoration!(Cusk);
 impl smithay::wayland::output::OutputHandler for Cusk {}
 smithay::delegate_output!(Cusk);
 
+/// Panels, docks and overlays.
+///
+/// `wlr-layer-shell` is what lets a bar or a launcher be an ordinary client
+/// rather than something the compositor draws. cusk's own panel is drawn
+/// in-process precisely because iced cannot speak this protocol; with it
+/// implemented, a dock and a launcher can be replaceable programs instead of
+/// code inside the compositor that would have to be undone later.
+///
+/// The `LayerMap` does the arithmetic — anchors, margins, exclusive zones —
+/// against the output, which is why an `Output` had to exist first.
+impl WlrLayerShellHandler for Cusk {
+    fn shell_state(&mut self) -> &mut WlrLayerShellState {
+        &mut self.layer_shell_state
+    }
+
+    fn new_layer_surface(
+        &mut self,
+        surface: WlrLayerSurface,
+        _output: Option<smithay::reexports::wayland_server::protocol::wl_output::WlOutput>,
+        _layer: Layer,
+        namespace: String,
+    ) {
+        // The requested output is ignored because there is exactly one. When
+        // hotplug lands this has to honour it, and a surface anchored to a
+        // monitor that has gone away has to be re-homed rather than dropped.
+        let mut map = layer_map_for_output(&self.output);
+        if let Err(e) = map.map_layer(&LayerSurface::new(surface, namespace.clone())) {
+            tracing::warn!("could not map layer surface {namespace:?}: {e}");
+            return;
+        }
+        map.arrange();
+        drop(map);
+
+        // The exclusive zone may have changed, which changes where windows are
+        // allowed to be. Re-laying out here is what stops a new panel from
+        // overlapping windows that were placed before it existed.
+        self.relayout();
+        tracing::info!("layer surface {namespace:?} mapped");
+    }
+
+    fn layer_destroyed(&mut self, surface: WlrLayerSurface) {
+        let mut map = layer_map_for_output(&self.output);
+        // Found and cloned before unmapping: `layers()` borrows the map, and
+        // `unmap_layer` needs it mutably.
+        let found = map
+            .layers()
+            .find(|l| l.layer_surface() == &surface)
+            .cloned();
+        if let Some(layer) = found {
+            map.unmap_layer(&layer);
+            map.arrange();
+        }
+        drop(map);
+        // The space it reserved is usable again, and a layout computed while
+        // it existed is now wrong.
+        self.relayout();
+    }
+}
+smithay::delegate_layer_shell!(Cusk);
+
 impl SeatHandler for Cusk {
     type KeyboardFocus = WlSurface;
     type PointerFocus = WlSurface;
@@ -569,6 +629,43 @@ impl Cusk {
 
     /// Window and surface under a compositor-global point, with the surface's
     /// origin — the three things pointer routing always needs together.
+    /// What the pointer is over, window or layer surface.
+    ///
+    /// Separate from `surface_under` because they answer different questions.
+    /// `surface_under` asks *which window*, and a layer surface is not one —
+    /// returning a panel there would put it into the tiling order and let a
+    /// dock be focused, moved and maximised.
+    ///
+    /// Layers above the windows are tested first, because that is where they
+    /// are drawn; a dock that rendered over a window and let the window take
+    /// its clicks would be worse than one that did not render at all. Layers
+    /// *below* are not tested at all — a wallpaper client stealing clicks from
+    /// the windows in front of it is the same bug facing the other way.
+    fn pointer_focus(
+        &self,
+        point: Point<f64, Logical>,
+    ) -> Option<(WlSurface, Point<f64, Logical>)> {
+        let map = layer_map_for_output(&self.output);
+        for layer in map.layers().rev() {
+            if !matches!(layer.layer(), Layer::Top | Layer::Overlay) {
+                continue;
+            }
+            let Some(geo) = map.layer_geometry(layer) else { continue };
+            if !geo.to_f64().contains(point) {
+                continue;
+            }
+            if let Some((surface, loc)) =
+                layer.surface_under(point - geo.loc.to_f64(), WindowSurfaceType::ALL)
+            {
+                return Some((surface, (loc + geo.loc).to_f64()));
+            }
+        }
+        drop(map);
+
+        self.surface_under(point)
+            .map(|(_, surface, loc)| (surface, loc))
+    }
+
     /// Where a window's *surface tree* starts, given where its geometry is.
     ///
     /// A client with its own decorations draws them as subsurfaces at negative
@@ -859,6 +956,25 @@ impl Cusk {
         true
     }
 
+    /// The area windows may occupy.
+    ///
+    /// cusk's own panel takes its strip off the top; layer surfaces take
+    /// whatever they reserved through their exclusive zones. Both, in one
+    /// place, because tiling, placement and maximise all read it and three
+    /// separate subtractions would eventually disagree by a pixel.
+    ///
+    /// The layer map's zone is intersected rather than replaced: a client that
+    /// reserves nothing must not be able to hand back the strip the panel is
+    /// already drawing in.
+    fn usable_area(&self) -> Rectangle<i32, Logical> {
+        let after_panel = panel::usable_area(
+            Size::from((self.output_size.0, self.output_size.1)),
+            self.panel_height,
+        );
+        let zone = layer_map_for_output(&self.output).non_exclusive_zone();
+        after_panel.intersection(zone).unwrap_or(after_panel)
+    }
+
     /// Tell one window who draws its decorations.
     fn tell_decoration(&mut self, toplevel: &ToplevelSurface) {
         let tiling = self.tiling();
@@ -979,12 +1095,7 @@ impl Cusk {
             return;
         }
         let windows = self.tiled();
-        // The one place the usable area is computed, so tiling, placement and
-        // maximise cannot disagree about where the screen starts.
-        let area = panel::usable_area(
-            Size::from((self.output_size.0, self.output_size.1)),
-            self.panel_height,
-        );
+        let area = self.usable_area();
         let tiles = self.layout().arrange(area, windows.len(), self.gaps);
 
         for (window, tile) in windows.iter().zip(tiles) {
@@ -1075,7 +1186,7 @@ impl Cusk {
     /// must be undoable, which is exactly what remembered geometry is for. It
     /// is also the cheapest way to prove the remembering works, since the
     /// window has to come back to the pixel.
-    fn toggle_maximize(&mut self, window: &Window, output_size: (i32, i32)) {
+    fn toggle_maximize(&mut self, window: &Window) {
         // A tiled window is already displaced, so without this guard the
         // toggle takes the restore branch and pops the window back to its
         // floating rectangle while tiling is still on — leaving one window
@@ -1108,10 +1219,7 @@ impl Cusk {
                 return;
             }
             geometry::set_displaced(window, true);
-            let area = panel::usable_area(
-                Size::from((output_size.0, output_size.1)),
-                self.panel_height,
-            );
+            let area = self.usable_area();
             if let Some(toplevel) = window.toplevel() {
                 toplevel.with_pending_state(|state| {
                     state.size = Some(area.size);
@@ -1552,13 +1660,7 @@ fn run_on_tty(
                     },
                 );
                 if let Some(Some(binding)) = binding {
-                    state.apply_binding(
-                        binding,
-                        &cfg,
-                        terminal.as_deref(),
-                        &socket_name,
-                        drm.size,
-                    );
+                    state.apply_binding(binding, &cfg, terminal.as_deref(), &socket_name);
                 }
             }
 
@@ -1575,9 +1677,7 @@ fn run_on_tty(
 
                 // The same routing the winit path uses, so hover, focus and
                 // grabs behave identically on both backends.
-                let under = state
-                    .surface_under(location)
-                    .map(|(_, surface, loc)| (surface, loc));
+                let under = state.pointer_focus(location);
                 if state.focus_follows_mouse {
                     state.focus_under_pointer(location);
                 }
@@ -1752,14 +1852,13 @@ impl Cusk {
         cfg: &config::Config,
         terminal: Option<&str>,
         socket_name: &str,
-        output_size: (i32, i32),
     ) {
         // Topmost in stacking order is the focused window.
         let focused = self.focused();
         match binding {
             Binding::ToggleMaximize => {
                 if let Some(w) = focused {
-                    self.toggle_maximize(&w, output_size);
+                    self.toggle_maximize(&w);
                 }
             }
             Binding::ToggleTiling => self.toggle_tiling(),
@@ -2101,6 +2200,33 @@ fn draw_frame(
             );
             let focused = state.focused().as_ref() == Some(window);
             layers.push((Rectangle::new(loc, window.geometry().size), focused, elements));
+        }
+
+        // Layer surfaces, gathered into the bands the protocol defines.
+        //
+        // Background and bottom go under every window; top and overlay go over
+        // them. That ordering is the whole point of the protocol — a panel
+        // that drew below a maximised window would be invisible, and a
+        // wallpaper client that drew above one would hide the desktop.
+        let mut below: Vec<WaylandSurfaceRenderElement<GlesRenderer>> = Vec::new();
+        let mut above: Vec<WaylandSurfaceRenderElement<GlesRenderer>> = Vec::new();
+        {
+            let map = layer_map_for_output(&state.output);
+            for layer in map.layers() {
+                let Some(geo) = map.layer_geometry(layer) else { continue };
+                let elements = render_elements_from_surface_tree(
+                    renderer,
+                    layer.wl_surface(),
+                    (geo.loc.x, geo.loc.y),
+                    1.0,
+                    1.0,
+                    Kind::Unspecified,
+                );
+                match layer.layer() {
+                    Layer::Background | Layer::Bottom => below.extend(elements),
+                    Layer::Top | Layer::Overlay => above.extend(elements),
+                }
+            }
         }
 
         // Answered here because this is where the renderer is reachable.
@@ -2596,6 +2722,7 @@ fn build_compositor(cfg: &config::Config) -> Result<Compositor, Box<dyn std::err
         compositor_state,
         xdg_shell_state: XdgShellState::new::<Cusk>(&dh),
         xdg_decoration_state: XdgDecorationState::new::<Cusk>(&dh),
+        layer_shell_state: WlrLayerShellState::new::<Cusk>(&dh),
         shm_state,
         dmabuf_state,
         data_device_state: DataDeviceState::new::<Cusk>(&dh),
@@ -3095,7 +3222,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
 
                 if let Some(Some(binding)) = binding {
-                    state.apply_binding(binding, &current, terminal.as_deref(), &socket_name, (logical_size.w, logical_size.h));
+                    state.apply_binding(binding, &current, terminal.as_deref(), &socket_name);
                 }
             }
 
@@ -3117,7 +3244,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     state.focus_under_pointer(location);
                 }
 
-                let under = hit.map(|(_, surface, loc)| (surface, loc));
+                let under = state.pointer_focus(location);
                 pointer.motion(
                     &mut state,
                     under,

@@ -2169,15 +2169,59 @@ does not restore it.
 back is worse than a button that does nothing, and there is no task list to
 restore from yet. It says so in the log rather than appearing to work.
 
+---
+
+## Milestone 32: an output, and layer-shell, 2026-08-09
+
+The gate before the dock. With `wlr-layer-shell`, a bar or a launcher is an
+ordinary client rather than code inside the compositor — cusk's own panel is
+drawn in-process only because iced cannot speak this protocol, and a second
+compositor-drawn panel would have had to be undone.
+
+### An output had to exist first
+
+cusk passed size tuples around and **never created a `wl_output` global**, so a
+client could not learn the resolution, the scale or the refresh rate — and a
+layer surface, which anchors to an output, had nothing to anchor to.
+
+Created before any client can connect, so nothing has to cope with an output
+appearing late; the size is corrected once a driver reports its real one. winit
+has no refresh rate to give, so it claims a round 60Hz rather than zero, which
+some clients read as "no mode".
+
+### What layer-shell needed from the rest
+
+- **Exclusive zones shrink `usable_area`**, alongside the panel's own strip.
+  Intersected rather than replaced: a client that reserves nothing must not be
+  able to hand back the strip the panel is already drawing in.
+- **Rendering in bands.** Background and bottom under every window, top and
+  overlay over them. That ordering *is* the protocol — a panel drawn below a
+  maximised window is invisible, and a wallpaper client drawn above one hides
+  the desktop.
+- **`pointer_focus` is separate from `surface_under`.** They answer different
+  questions: `surface_under` asks *which window*, and a layer surface is not
+  one. Returning a panel from it would put a dock into the tiling order and let
+  it be focused, moved and maximised. Only the layers above windows take
+  clicks; a wallpaper client stealing them from the windows in front of it is
+  the same bug facing the other way.
+
+A first attempt smuggled the layer surface out of `surface_under` through a
+`Cell`. A side channel to return a second kind of answer is a signature that
+is wrong, and it was replaced rather than made to work.
+
+### Verified, and not
+
+Both drivers run clean: no errors, no warnings, three windows, wallpaper
+loaded, 126 tests. **No layer-shell client is installed on this machine**, so
+the protocol has not been exercised by a real one — the global is created and
+the handler compiles, which is not the same claim. `waybar`, `swaybg` or
+`fuzzel` would settle it.
+
 ### Next
 
-The shell layout — a right-hand dock in floating mode, a drop-down launcher in
-tiling, and a system tray. Recorded in memory; the gate is `wlr-layer-shell`,
-because iced cannot speak it and a second compositor-drawn panel would have to
-be undone. The tray additionally needs StatusNotifierItem over D-Bus, which is
-an IPC problem rather than a drawing one.
-
-Then hotplug and page-flip timing. on eDP-1, rendering a single colour, with a hard timeout that
+The dock and launcher as layer-shell clients, and the tray — which needs
+StatusNotifierItem over D-Bus, an IPC problem rather than a drawing one. Then
+hotplug and page-flip timing. on eDP-1, rendering a single colour, with a hard timeout that
    restores the VT — the first thing that can strand a screen, so it should be
    unable to strand it for more than a few seconds.
 2. libinput, so there is a keyboard.
