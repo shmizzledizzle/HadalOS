@@ -1236,7 +1236,16 @@ fn run_on_tty(
         socket_name,
         keyboard,
         pointer: _pointer,
-    } = build_compositor(&cfg)?;
+    } = build_compositor(&cfg).map_err(|e| {
+        // Overwhelmingly this is `XDG_RUNTIME_DIR` missing, and overwhelmingly
+        // that means someone reached for `sudo` — which strips it. Saying so
+        // here saves the guess, because the message from the socket layer
+        // names the variable without naming the cause.
+        format!(
+            "{e}\n  If this says XDG_RUNTIME_DIR: run cusk as yourself, not under sudo.\n  \
+             The tty backend does not need root."
+        )
+    })?;
     let mut dh = display.handle();
 
     // The one global the driver registers itself, because it needs the
@@ -1263,7 +1272,7 @@ fn run_on_tty(
     // Armed before the display is taken, so a hang anywhere after this point
     // still ends with a usable console.
     drm.arm_watchdog(seconds + 3);
-    drm.take_display()?;
+    drm.take_display();
 
     let mut ctx = FrameContext {
         chrome: None,

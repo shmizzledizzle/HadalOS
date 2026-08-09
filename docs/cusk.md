@@ -1829,6 +1829,27 @@ dispatch clients. Everything about *what* is drawn is shared.
   compositor running indefinitely would hold DRM master across a switch away
   and leave the other VT blank. Escape ends it early.
 
+### Two failures on the first VT run, one assumption
+
+As an ordinary user: `could not become DRM master: Permission denied`. The
+session *was* acquired — it printed `cusk on seat0, 1920x1080` — so the failure
+was the explicit `SET_MASTER` call.
+
+**That call was the mistake.** With logind, `TakeDevice` on an active session
+already returns a master-capable fd; logind does the granting, and a process
+asking for master itself needs root. `EACCES` there usually means "you are
+already master and did not need to ask". Most compositors on logind never make
+the call. It is now attempted and ignored, with `set_crtc` — which reports its
+own error — as the real test.
+
+Under `sudo` it failed differently: `XDG_RUNTIME_DIR is not set or invalid`,
+because sudo strips it and the Wayland socket cannot be created without it. So
+`sudo` was never a workaround, only a different failure, and the error now says
+so rather than naming a variable and leaving the cause to be guessed.
+
+Worth stating plainly, because the whole design assumes it: **the tty backend
+does not need root.** Every phase up to this one was built to make that true.
+
 ### Not yet
 
 Pointer input. libinput reports relative motion, so the driver has to integrate

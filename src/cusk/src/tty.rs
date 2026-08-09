@@ -1001,11 +1001,23 @@ impl Drm {
         })
     }
 
-    /// Take the display. Everything before this point is reversible.
-    pub fn take_display(&self) -> Result<(), String> {
-        self.card
-            .acquire_master_lock()
-            .map_err(|e| format!("could not become DRM master: {e}\n  This needs its own VT."))
+    /// Take the display, if it is not already ours.
+    ///
+    /// **Not fatal when it fails.** With logind, `TakeDevice` on an active
+    /// session already returns a master-capable fd — logind does the granting,
+    /// and a process calling `SET_MASTER` itself needs root. So `EACCES` here
+    /// usually means "you are already master and did not need to ask", not
+    /// "you cannot have the display".
+    ///
+    /// Treating it as fatal is what made `--tty` refuse to start as an
+    /// ordinary user and demand `sudo` — which then failed differently,
+    /// because sudo strips `XDG_RUNTIME_DIR` and the Wayland socket cannot be
+    /// created without it. The real test is whether `set_crtc` works, and that
+    /// reports its own error a moment later.
+    pub fn take_display(&self) {
+        if let Err(e) = self.card.acquire_master_lock() {
+            tracing::debug!("set_master declined ({e}); assuming logind already granted it");
+        }
     }
 
     /// Draw into the buffer that is not currently on screen.
