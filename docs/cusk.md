@@ -1925,6 +1925,27 @@ dispatched with a **zero timeout** once per frame — a poll inside the render
 loop rather than the loop itself. Moving the whole driver onto calloop is worth
 doing when DRM page-flip completions need draining, and not before.
 
+### Switching *away* is the compositor's job too
+
+The first unbounded run could not leave: Ctrl+Alt+F1 did nothing. Holding
+session control means **logind has disabled the kernel's own VT switching**, so
+a compositor that does not implement the chord traps the user on its terminal —
+which is a worse trap than the time box it had just removed.
+
+Bound now, and checked before the key reaches the compositor, then not
+forwarded: a client receiving the F-key as well would act on it while the
+screen is being handed away.
+
+Read as **raw evdev codes**, not xkb keysyms. The keysym route depends on the
+layout including `srvr_ctrl(fkey2vt)`; when it does not, `XF86Switch_VT` never
+arrives and VT switching silently does not work, which is the hardest kind of
+failure to attribute. Switching terminals is a physical-key operation, so a
+physical key is the right thing to read.
+
+The trap worth a test: **F11 and F12 are not adjacent to F1..F10 in evdev**
+(87 and 88, against 59..68), so one subtraction gets them wrong and the symptom
+is landing on the wrong terminal.
+
 ### The time box was load-bearing until now
 
 An unbounded run could previously hold the display forever, which is why every

@@ -1228,6 +1228,67 @@ pub fn watch_session(
     Ok((event_loop, Active { active: true, just_resumed: false }))
 }
 
+/// evdev codes for the modifiers that arm a VT switch, and the function keys.
+const KEY_LEFTCTRL: u32 = 29;
+const KEY_RIGHTCTRL: u32 = 97;
+const KEY_LEFTALT: u32 = 56;
+const KEY_RIGHTALT: u32 = 100;
+const KEY_F1: u32 = 59;
+const KEY_F10: u32 = 68;
+const KEY_F11: u32 = 87;
+const KEY_F12: u32 = 88;
+
+/// Which VT `Ctrl+Alt+F<n>` asks for, if this key is a function key.
+///
+/// Raw evdev codes rather than xkb keysyms. The keysym route depends on the
+/// layout including `srvr_ctrl(fkey2vt)`, and when it does not, `XF86Switch_VT`
+/// never arrives and VT switching silently does not work — which is exactly
+/// the failure that is hardest to attribute. Switching terminals is a physical
+/// -key operation, so a physical key is the right thing to read.
+///
+/// F11 and F12 are not adjacent to F1..F10 in evdev, which is the off-by-many
+/// this exists to contain.
+pub fn vt_for_key(code: u32) -> Option<i32> {
+    match code {
+        KEY_F1..=KEY_F10 => Some((code - KEY_F1 + 1) as i32),
+        KEY_F11 => Some(11),
+        KEY_F12 => Some(12),
+        _ => None,
+    }
+}
+
+/// Tracks whether a VT-switch chord is armed.
+///
+/// Kept here rather than read from the compositor's xkb state, because a VT
+/// switch has to work even when the keyboard focus is somewhere that would
+/// swallow it — and because the compositor's modifier state is updated by the
+/// same keys this is watching, which makes the ordering a coin toss.
+#[derive(Default)]
+pub struct Chord {
+    ctrl: bool,
+    alt: bool,
+}
+
+impl Chord {
+    /// Feed a key. Returns the VT to switch to, if this completes the chord.
+    pub fn key(&mut self, code: u32, pressed: bool) -> Option<i32> {
+        match code {
+            KEY_LEFTCTRL | KEY_RIGHTCTRL => {
+                self.ctrl = pressed;
+                None
+            }
+            KEY_LEFTALT | KEY_RIGHTALT => {
+                self.alt = pressed;
+                None
+            }
+            // On press only. Acting on the release as well would switch away
+            // and immediately back.
+            code if pressed && self.ctrl && self.alt => vt_for_key(code),
+            _ => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::framebuffer_flags;
@@ -1265,6 +1326,70 @@ mod tests {
     #[test]
     fn a_zero_sized_output_does_not_panic() {
         assert_eq!(super::clamp_pointer((0.0, 0.0), (10.0, 10.0), (0, 0)), (0.0, 0.0));
+    }
+
+    /// F11 and F12 are not adjacent to F1..F10 in evdev, so a single
+    /// subtraction gets them wrong — and the symptom is switching to the wrong
+    /// terminal, which looks like a broken keyboard.
+    #[test]
+    fn function_keys_map_to_the_terminal_they_name() {
+        assert_eq!(super::vt_for_key(59), Some(1));
+        assert_eq!(super::vt_for_key(60), Some(2));
+        assert_eq!(super::vt_for_key(68), Some(10));
+        assert_eq!(super::vt_for_key(87), Some(11));
+        assert_eq!(super::vt_for_key(88), Some(12));
+    }
+
+    #[test]
+    fn other_keys_are_not_terminals() {
+        for code in [1, 30, 57, 69, 86, 89, 200] {
+            assert_eq!(super::vt_for_key(code), None, "code {code}");
+        }
+    }
+
+    /// Both modifiers, or an ordinary F5 in an editor would switch terminals.
+    #[test]
+    fn the_chord_needs_ctrl_and_alt() {
+        let mut chord = super::Chord::default();
+        assert_eq!(chord.key(59, true), None, "F1 alone");
+
+        chord.key(29, true);
+        assert_eq!(chord.key(59, true), None, "ctrl alone");
+
+        chord.key(56, true);
+        assert_eq!(chord.key(59, true), Some(1), "ctrl+alt+F1");
+    }
+
+    /// Releasing a modifier disarms it, or the chord stays live for the rest
+    /// of the session and every F-key becomes a VT switch.
+    #[test]
+    fn releasing_a_modifier_disarms_the_chord() {
+        let mut chord = super::Chord::default();
+        chord.key(29, true);
+        chord.key(56, true);
+        assert_eq!(chord.key(60, true), Some(2));
+
+        chord.key(56, false);
+        assert_eq!(chord.key(60, true), None, "alt released");
+    }
+
+    /// Acting on release as well would switch away and immediately back.
+    #[test]
+    fn only_the_press_switches() {
+        let mut chord = super::Chord::default();
+        chord.key(29, true);
+        chord.key(56, true);
+        assert_eq!(chord.key(59, true), Some(1));
+        assert_eq!(chord.key(59, false), None, "release must do nothing");
+    }
+
+    /// The right-hand modifiers are the same chord.
+    #[test]
+    fn either_side_of_the_keyboard_works() {
+        let mut chord = super::Chord::default();
+        chord.key(97, true);
+        chord.key(100, true);
+        assert_eq!(chord.key(61, true), Some(3));
     }
 
     #[test]

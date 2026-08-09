@@ -1266,7 +1266,10 @@ fn run_on_tty(
     println!();
     println!("  cusk on {seat_name}, {}x{}", drm.size.0, drm.size.1);
     println!("  WAYLAND_DISPLAY={socket_name}");
-    println!("  escape to quit — {seconds}s limit");
+    println!("  escape to quit    ctrl+alt+F1..F12 to switch terminal");
+    if seconds > 0 {
+        println!("  {seconds}s limit");
+    }
     println!();
 
     // Watching before the display is taken, so a switch during startup is not
@@ -1296,6 +1299,7 @@ fn run_on_tty(
         warned_square_corners: false,
     };
     let mut clients = Vec::new();
+    let mut chord = tty::Chord::default();
     let start = std::time::Instant::now();
     let deadline = (seconds > 0).then(|| start + std::time::Duration::from_secs(seconds));
 
@@ -1333,6 +1337,22 @@ fn run_on_tty(
 
             let time = start.elapsed().as_millis() as u32;
             for (code, pressed) in input.keys {
+                // Checked before the key reaches the compositor. Holding
+                // session control means logind has disabled the kernel's own
+                // Ctrl+Alt+F<n>, so a compositor that does not implement it
+                // traps the user on its VT — which is what happened on the
+                // first unbounded run.
+                if let Some(vt) = chord.key(code, pressed) {
+                    tracing::info!("switching to VT {vt}");
+                    if let Err(e) = smithay::backend::session::Session::change_vt(&mut session, vt)
+                    {
+                        tracing::warn!("could not switch to VT {vt}: {e}");
+                    }
+                    // Not forwarded. A client receiving the F-key as well would
+                    // act on it while the screen is being handed away.
+                    continue;
+                }
+
                 keyboard.input::<(), _>(
                     &mut state,
                     // libinput reports evdev codes; xkb wants them offset by
