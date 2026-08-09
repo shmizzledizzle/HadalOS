@@ -626,10 +626,60 @@ pub fn probe_render() -> Result<String, String> {
         ));
     }
 
+    // Allocating here as well, because the modifier a driver actually returns
+    // is what decides the framebuffer flags — and getting those wrong is a
+    // panic inside drm, not an error. Checking it on the render node costs
+    // nothing and saves a trip to a VT to find out.
+    let modifier_note = {
+        use smithay::backend::allocator::gbm::{GbmAllocator, GbmBufferFlags};
+        use smithay::backend::allocator::{Allocator, Modifier};
+        use smithay::reexports::drm::buffer::PlanarBuffer;
+
+        let gbm = GbmDevice::new(
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)
+                .map_err(|e| format!("could not reopen for allocation: {e}"))?,
+        )
+        .map_err(|e| format!("no GBM device for allocation: {e}"))?;
+        let mut allocator = GbmAllocator::new(gbm, GbmBufferFlags::RENDERING);
+        match allocator.create_buffer(64, 64, DrmFourcc::Xrgb8888, &[Modifier::Linear]) {
+            Ok(buffer) => {
+                let modifier = PlanarBuffer::modifier(&buffer);
+                format!(
+                    "; a Linear allocation reports {modifier:?}, so framebuffer flags = {:?}",
+                    framebuffer_flags(modifier)
+                )
+            }
+            Err(e) => format!("; could not test allocation here ({e})"),
+        }
+    };
+
     Ok(format!(
-        "{} — GBM, EGL and GlesRenderer all work, and the pixels are right",
+        "{} — GBM, EGL and GlesRenderer all work, and the pixels are right{modifier_note}",
         path.display()
     ))
+}
+
+/// Which `FbCmd2Flags` a buffer's modifier calls for.
+///
+/// `add_planar_framebuffer` asserts that `MODIFIERS` is set exactly when the
+/// buffer carries a real modifier — and *asserts*, so getting it wrong is a
+/// panic rather than an error. `Invalid` counts as no modifier, which is the
+/// part that is easy to miss: a driver can hand back `Invalid` for a buffer
+/// that was allocated with an explicit modifier, and then the flag must be
+/// unset even though a modifier was requested.
+pub fn framebuffer_flags(
+    modifier: Option<smithay::reexports::drm::buffer::DrmModifier>,
+) -> smithay::reexports::drm::control::FbCmd2Flags {
+    use smithay::reexports::drm::buffer::DrmModifier;
+    use smithay::reexports::drm::control::FbCmd2Flags;
+
+    match modifier {
+        Some(modifier) if !matches!(modifier, DrmModifier::Invalid) => FbCmd2Flags::MODIFIERS,
+        _ => FbCmd2Flags::empty(),
+    }
 }
 
 // ── phase four groundwork: scanning out a GL-rendered buffer ─────────────
@@ -660,7 +710,7 @@ pub fn probe_scanout(seconds: u64) -> Result<(), String> {
     use smithay::backend::egl::{EGLContext, EGLDisplay};
     use smithay::backend::renderer::gles::GlesRenderer;
     use smithay::backend::renderer::{Bind, Color32F, Frame, Renderer};
-    use smithay::reexports::drm::control::FbCmd2Flags;
+    use smithay::reexports::drm::buffer::PlanarBuffer;
     use smithay::utils::{Physical, Rectangle, Size, Transform};
 
     let (mut session, _notifier) = LibSeatSession::new().map_err(|e| {
@@ -791,8 +841,19 @@ pub fn probe_scanout(seconds: u64) -> Result<(), String> {
         }
 
         // ...and the display controller reads from the same memory.
+        //
+        // The flags have to agree with the buffer: `add_planar_framebuffer`
+        // asserts that `MODIFIERS` is set exactly when the buffer carries a
+        // real modifier, and panics otherwise. Passing `empty()` with a
+        // Linear-modifier buffer is what that panic was.
+        //
+        // Derived from the buffer with the same predicate the assertion uses,
+        // rather than hardcoded, so the two cannot drift — and so a driver
+        // that hands back `Invalid` instead of the requested modifier is
+        // handled by the same line.
+        let fb_flags = framebuffer_flags(PlanarBuffer::modifier(&buffer));
         let fb = card
-            .add_planar_framebuffer(&buffer, FbCmd2Flags::empty())
+            .add_planar_framebuffer(&buffer, fb_flags)
             .map_err(|e| format!("the display controller refused the buffer: {e}"))?;
         card.set_crtc(crtc_handle, Some(fb), (0, 0), &[connector_handle], Some(mode))
             .map_err(|e| format!("could not set the mode: {e}"))?;
@@ -805,4 +866,34 @@ pub fn probe_scanout(seconds: u64) -> Result<(), String> {
     previous.restore(&card);
     let _ = card.release_master_lock();
     outcome
+}
+
+#[cfg(test)]
+mod tests {
+    use super::framebuffer_flags;
+    use smithay::reexports::drm::buffer::DrmModifier;
+    use smithay::reexports::drm::control::FbCmd2Flags;
+
+    /// A real modifier means the flag must be set, or `add_planar_framebuffer`
+    /// asserts and the process dies.
+    #[test]
+    fn a_real_modifier_sets_the_flag() {
+        assert_eq!(
+            framebuffer_flags(Some(DrmModifier::Linear)),
+            FbCmd2Flags::MODIFIERS
+        );
+    }
+
+    /// `Invalid` is the trap. It is `Some`, so a naive `is_some()` sets the
+    /// flag — and then the assertion fails because drm filters `Invalid` out
+    /// before comparing.
+    #[test]
+    fn an_invalid_modifier_counts_as_none() {
+        assert_eq!(framebuffer_flags(Some(DrmModifier::Invalid)), FbCmd2Flags::empty());
+    }
+
+    #[test]
+    fn no_modifier_leaves_the_flag_clear() {
+        assert_eq!(framebuffer_flags(None), FbCmd2Flags::empty());
+    }
 }

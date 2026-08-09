@@ -1729,8 +1729,39 @@ rejects it.
   what makes the buffer usable by both.
 - **Single-buffered on purpose.** Double buffering and page flips are the
   driver's problem; adding them here would test something this does not claim.
+- **The framebuffer flags are derived from the buffer, not hardcoded.** See
+  below — this was wrong first time and it panicked.
 - Teal rather than blue, so it is distinguishable from the mode-set test on
   screen without reading the log.
+
+### The flags and the buffer have to agree
+
+First run on a VT panicked inside drm:
+
+```
+assertion failed: (has_modifier && modifier.is_some()) || (!has_modifier && modifier.is_none())
+```
+
+`add_planar_framebuffer` **asserts** that `FbCmd2Flags::MODIFIERS` is set
+exactly when the buffer carries a real modifier. The allocation asked for
+`Modifier::Linear`, so the buffer had one, and `FbCmd2Flags::empty()` was
+passed anyway — a panic rather than an error, because drm treats the mismatch
+as a programming mistake, which it was.
+
+The flag is now derived from the buffer with the **same predicate the assertion
+uses**, so the two cannot drift. That predicate has a trap in it worth naming:
+`Invalid` is `Some`, so a naive `is_some()` sets the flag and then fails the
+assertion, because drm filters `Invalid` out before comparing. A driver can
+return `Invalid` for a buffer allocated with an explicit modifier, so this is
+not hypothetical.
+
+`framebuffer_flags` is a pure function with three tests, and `--probe-render`
+now reports what the driver actually returns — checkable from a desktop rather
+than costing a trip to a VT:
+
+```
+a Linear allocation reports Some(Linear), so framebuffer flags = FbCmd2Flags(MODIFIERS)
+```
 
 ### Next
 
