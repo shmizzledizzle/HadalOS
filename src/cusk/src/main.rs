@@ -210,6 +210,15 @@ struct Cusk {
     #[allow(dead_code)]
     xdg_decoration_state: XdgDecorationState,
     layer_shell_state: WlrLayerShellState,
+    /// Held for the `wp_viewporter` global's lifetime.
+    ///
+    /// Lets a client say "scale this buffer to that size", which is how a
+    /// toolkit handles fractional and HiDPI scaling without re-rendering.
+    /// `iced_layershell` refuses to start without it — *panics*, with
+    /// `need viewport support to better wayland hidpi` — so on a compositor
+    /// lacking it, an iced panel is not merely blurry, it is impossible.
+    #[allow(dead_code)]
+    viewporter_state: smithay::wayland::viewporter::ViewporterState,
     /// Held for the `zxdg_output_manager_v1` global's lifetime.
     ///
     /// `Output::create_global` alone advertises `wl_output` and nothing else.
@@ -624,6 +633,7 @@ impl WlrLayerShellHandler for Cusk {
     }
 }
 smithay::delegate_layer_shell!(Cusk);
+smithay::delegate_viewporter!(Cusk);
 
 impl SeatHandler for Cusk {
     type KeyboardFocus = WlSurface;
@@ -2783,6 +2793,7 @@ fn build_compositor(cfg: &config::Config) -> Result<Compositor, Box<dyn std::err
         xdg_shell_state: XdgShellState::new::<Cusk>(&dh),
         xdg_decoration_state: XdgDecorationState::new::<Cusk>(&dh),
         layer_shell_state: WlrLayerShellState::new::<Cusk>(&dh),
+        viewporter_state: smithay::wayland::viewporter::ViewporterState::new::<Cusk>(&dh),
         output_manager_state: OutputManagerState::new_with_xdg_output::<Cusk>(&dh),
         shm_state,
         dmabuf_state,

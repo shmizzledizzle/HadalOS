@@ -13,11 +13,10 @@
 //! Styled from `cusk::theme`, so it matches the compositor's chrome and the
 //! settings editor without a third copy of the palette.
 
-mod entry;
 mod style;
 
 use cusk::config::Config;
-use entry::Entry;
+use cusk::entry::{self, Entry};
 use iced::keyboard::{self, key::Named};
 use iced::widget::operation;
 use iced::widget::{column, container, image, row, scrollable, space, text, text_input, Id};

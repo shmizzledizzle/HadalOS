@@ -2242,9 +2242,67 @@ which looked from inside cusk like a client that had simply left.
 
 The exclusive zone reserves its strip and window placement respects it.
 
+---
+
+## Milestone 33: the dock, 2026-08-09
+
+`src/cusk-dock` — a vertical strip of applications down the right edge, with
+the launcher attached at the top, as in the KaOS/Niri reference.
+
+**A client, not compositor code.** cusk's top panel is drawn in-process only
+because iced cannot speak `wlr-layer-shell`; `iced_layershell` removes that
+constraint, so the dock is an ordinary program — replaceable, restartable, and
+rewritable without touching the compositor. It targets iced 0.14, the same
+version the launcher and settings editor use, so all three share
+`cusk::theme`.
+
+### Two protocols the compositor was missing
+
+Neither was predictable from reading the code; both came from running the
+thing.
+
+- **`wp_viewporter`.** `iced_layershell` does not degrade without it — it
+  **panics**, with `need viewport support to better wayland hidpi`. On a
+  compositor lacking it an iced panel is not blurry, it is impossible.
+- Plus the three that waybar found in the previous milestone.
+
+### Icons: the directory layout was the whole problem
+
+`entry.rs` moved into the library, because the launcher and the dock need the
+same list and a second copy would drift into two different sets of installed
+applications.
+
+A first resolver looked only in `hicolor/SIZE/apps/name.png` and found **135 of
+316**. The misses were not obscure applications — they were the entire KDE
+suite, because **breeze nests the other way round**, `apps/SIZE/name`, and is
+*entirely* SVG: 19,827 files against hicolor's 823. Handling both layouts and
+both formats took it to **143 of 158**.
+
+Not covered, and named rather than left to be found: theme inheritance,
+`index.theme`, `@2x` variants, and the user's configured theme — the search
+order is a guess at preference, not a reading of their settings. An unresolved
+icon gets a lettered tile, so a miss is visibly a miss rather than a gap.
+
+### Measured
+
+With the dock running on a 1280-wide screen, the usable area is **1224** —
+exactly 56 less. The exclusive zone is honoured, so windows tile and maximise
+beside the dock rather than under it.
+
+### Not done
+
+The dock lists **everything installed**, scrollably. Pinning a chosen few is
+what a dock is for, and it belongs in the schema rather than as a list
+hardcoded in the source.
+
+It is also not mode-aware yet. The plan is a dock in floating mode only, and a
+client cannot know the compositor's mode — that needs either cusk starting and
+stopping it, or an IPC for the compositor to tell it. The second is the same
+channel the tray will want.
+
 ### Next
 
-The dock and launcher as layer-shell clients, and the tray — which needs
+The tray — which needs
 StatusNotifierItem over D-Bus, an IPC problem rather than a drawing one. Then
 hotplug and page-flip timing. on eDP-1, rendering a single colour, with a hard timeout that
    restores the VT — the first thing that can strand a screen, so it should be

@@ -10,6 +10,12 @@
 //! binary. They are about running a session, and nothing outside one needs them.
 
 pub mod config;
+/// Desktop entries: finding, parsing and ranking installed applications.
+///
+/// In the library because the launcher and the dock both need the same list.
+/// A second copy would drift, and the drift would be a program that appears in
+/// one and not the other.
+pub mod entry;
 pub mod theme;
 
 /// Re-exported so the settings editor edits documents with *this* version of
