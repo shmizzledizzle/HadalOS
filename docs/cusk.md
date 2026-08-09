@@ -2042,6 +2042,46 @@ An audit for the rest turned up one more, in a different category: **neither
 driver handles scroll**. That is a missing feature rather than a parity gap, so
 it is recorded here rather than fixed under this heading.
 
+---
+
+## Milestone 29: who draws the titlebar, 2026-08-09
+
+`zxdg_decoration_manager_v1`. §3 said floating and tiling are two policies over
+one window set; this is where that becomes visible on screen.
+
+- **Floating** — a window is its own object, so it keeps its titlebar. That bar
+  is what a client offers to drag, which is the other half of what floating
+  mode means.
+- **Tiling** — position is computed, so the bar is a lie. It cannot be dragged
+  anywhere meaningful, it eats a row of every tile, and the thing it names is
+  already in the panel. Clients are told `ServerSide` and cusk draws nothing,
+  which is how the bar disappears.
+
+Toggling tiling re-sends the mode to every window, because leaving the bars
+behind when tiling turns on is exactly the half-applied state that call
+prevents.
+
+**A client that insists is not overruled.** The protocol is a negotiation and
+some toolkits cannot turn their decorations off; forcing the mode would leave a
+window rendering wrongly rather than one with a spare titlebar.
+
+### The drag, not yet explained
+
+Dragging a client's own titlebar does not move the window. `move_request` is
+wired and calls the same grab a Super+drag uses, and that path was verified
+working in milestone 2 — so either the client is not asking, or the grab is not
+taking, and those have completely different causes.
+
+Rather than guess, `move_request` now logs at info, like `start_move` beside
+it. One line distinguishes them:
+
+- neither line — the client never sent `xdg_toplevel.move`
+- `client requested a move` alone — the request arrived and the grab refused
+- both — the grab started and something else is wrong
+
+Three wrong guesses preceded the milestone 2 fix, and instrumenting took one
+round and cost less than any of them. Same choice here.
+
 ### Next
 
 Scroll, which no backend has. Then hotplug, and page-flip timing to replace the

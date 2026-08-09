@@ -55,6 +55,7 @@ use smithay::backend::winit::{self, WinitEvent};
 use smithay::desktop::{Space, Window, WindowSurfaceType};
 use smithay::backend::input::KeyState;
 use smithay::input::keyboard::{FilterResult, Keysym, ModifiersState};
+use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode as DecorationMode;
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 
 /// A compositor-level binding, returned from the keyboard filter so the event
@@ -91,6 +92,7 @@ use smithay::wayland::selection::data_device::{
     ClientDndGrabHandler, DataDeviceHandler, DataDeviceState, ServerDndGrabHandler,
 };
 use smithay::wayland::selection::SelectionHandler;
+use smithay::wayland::shell::xdg::decoration::{XdgDecorationHandler, XdgDecorationState};
 use smithay::wayland::shell::xdg::{
     PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
 };
@@ -100,7 +102,7 @@ use smithay::wayland::dmabuf::{
 use smithay::wayland::shm::{ShmHandler, ShmState};
 use smithay::{
     delegate_compositor, delegate_data_device, delegate_dmabuf, delegate_seat, delegate_shm,
-    delegate_xdg_shell,
+    delegate_xdg_decoration, delegate_xdg_shell,
 };
 // `::winit` — smithay re-exports a module of the same name, which shadows it.
 use ::winit::platform::pump_events::PumpStatus;
@@ -189,6 +191,11 @@ struct Classification {
 struct Cusk {
     compositor_state: CompositorState,
     xdg_shell_state: XdgShellState,
+    /// Held, not read: the global lives as long as this does, and dropping it
+    /// would withdraw `zxdg_decoration_manager_v1` from clients that have
+    /// already bound it.
+    #[allow(dead_code)]
+    xdg_decoration_state: XdgDecorationState,
     shm_state: ShmState,
     dmabuf_state: DmabufState,
     seat_state: SeatState<Self>,
@@ -335,6 +342,10 @@ impl XdgShellHandler for Cusk {
             .elements()
             .find(|w| w.toplevel().map(|t| t.wl_surface()) == Some(surface.wl_surface()))
             .cloned();
+        // Info, like `start_move`. Without it, "the titlebar does not drag"
+        // cannot be told apart from "the client never asked" — and those have
+        // completely different causes.
+        tracing::info!("client requested a move");
         if let Some(window) = found {
             self.start_move(window, floating::BTN_LEFT);
         }
@@ -398,6 +409,37 @@ impl XdgShellHandler for Cusk {
         }
     }
 }
+
+/// Who draws a window's titlebar.
+///
+/// §3 says floating and tiling are two policies over one window set, and this
+/// is where that becomes visible. In **floating** mode a window is its own
+/// object: it gets its titlebar, which is what a client offers to drag. In
+/// **tiling** mode position is computed and the bar is a lie — it cannot be
+/// dragged anywhere meaningful, it eats a row of every tile, and the thing it
+/// names is already in the panel.
+///
+/// A client that insists on drawing its own is not overruled. The protocol is
+/// a negotiation and some toolkits cannot turn their decorations off; forcing
+/// the mode would leave a window that renders wrongly rather than one with a
+/// spare titlebar.
+impl XdgDecorationHandler for Cusk {
+    fn new_decoration(&mut self, toplevel: ToplevelSurface) {
+        self.tell_decoration(&toplevel);
+    }
+
+    fn request_mode(&mut self, toplevel: ToplevelSurface, _mode: DecorationMode) {
+        // The client's preference is heard and then answered with the
+        // compositor's, which is what the protocol expects: the client asks,
+        // the compositor decides.
+        self.tell_decoration(&toplevel);
+    }
+
+    fn unset_mode(&mut self, toplevel: ToplevelSurface) {
+        self.tell_decoration(&toplevel);
+    }
+}
+delegate_xdg_decoration!(Cusk);
 
 impl SeatHandler for Cusk {
     type KeyboardFocus = WlSurface;
@@ -735,6 +777,31 @@ impl Cusk {
         true
     }
 
+    /// Tell one window who draws its decorations.
+    fn tell_decoration(&mut self, toplevel: &ToplevelSurface) {
+        let tiling = self.tiling();
+        toplevel.with_pending_state(|state| {
+            state.decoration_mode = Some(if tiling {
+                // Server side, and cusk draws nothing — which is how the bar
+                // disappears. The window's identity lives in the panel.
+                DecorationMode::ServerSide
+            } else {
+                DecorationMode::ClientSide
+            });
+        });
+        toplevel.send_pending_configure();
+    }
+
+    /// Tell every window, after the mode changes.
+    fn tell_all_decorations(&mut self) {
+        let windows: Vec<Window> = self.space.elements().cloned().collect();
+        for window in windows {
+            if let Some(toplevel) = window.toplevel() {
+                self.tell_decoration(&toplevel.clone());
+            }
+        }
+    }
+
     /// Show a different workspace.
     fn switch_workspace(&mut self, index: usize) {
         let Some(switch) = self.workspaces.switch_to(index) else { return };
@@ -890,6 +957,10 @@ impl Cusk {
                 self.space.map_element(window.clone(), rect.loc, false);
             }
         }
+        // The decoration mode is part of the mode switch, not a side effect of
+        // it: leaving the bars behind when tiling turns on is exactly the
+        // half-applied state this call prevents.
+        self.tell_all_decorations();
         tracing::info!(
             "tiling {} ({})",
             if self.tiling() { "on" } else { "off" },
@@ -2349,6 +2420,7 @@ fn build_compositor(cfg: &config::Config) -> Result<Compositor, Box<dyn std::err
     let mut state = Cusk {
         compositor_state,
         xdg_shell_state: XdgShellState::new::<Cusk>(&dh),
+        xdg_decoration_state: XdgDecorationState::new::<Cusk>(&dh),
         shm_state,
         dmabuf_state,
         data_device_state: DataDeviceState::new::<Cusk>(&dh),
