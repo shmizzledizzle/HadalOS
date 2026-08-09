@@ -75,7 +75,7 @@ enum Binding {
     Workspace(usize),
     SendToWorkspace(usize),
 }
-use smithay::input::pointer::{ButtonEvent, GrabStartData, MotionEvent};
+use smithay::input::pointer::{AxisFrame,ButtonEvent, GrabStartData, MotionEvent};
 use smithay::input::{Seat, SeatHandler, SeatState};
 use smithay::reexports::wayland_server::protocol::wl_buffer;
 use smithay::reexports::wayland_server::protocol::wl_seat;
@@ -1504,6 +1504,14 @@ fn run_on_tty(
                 pointer.frame(&mut state);
             }
 
+            for scroll in input.scrolls {
+                if scroll.is_empty() {
+                    continue;
+                }
+                pointer.axis(&mut state, axis_frame(scroll, time));
+                pointer.frame(&mut state);
+            }
+
             for (button, pressed) in input.buttons {
                 let serial = SERIAL_COUNTER.next_serial();
                 // The same press handling the winit driver uses, so the panel,
@@ -1826,6 +1834,49 @@ impl Cusk {
             _ => true,
         }
     }
+}
+
+/// Turn a scroll into the frame a client is sent.
+///
+/// Shared by both drivers, because the mapping has enough judgement in it to
+/// be worth having in one place: the source changes how a client interprets
+/// the numbers, wheels carry discrete steps as well as smooth ones, and a
+/// finger lift is a zero that has to be announced rather than dropped.
+fn axis_frame(scroll: tty::Scroll, time: u32) -> AxisFrame {
+    use smithay::backend::input::{Axis, AxisSource};
+
+    let mut frame = AxisFrame::new(time).source(match scroll.source {
+        tty::ScrollSource::Wheel => AxisSource::Wheel,
+        tty::ScrollSource::Finger => AxisSource::Finger,
+        tty::ScrollSource::Continuous => AxisSource::Continuous,
+    });
+
+    if let Some((h, v)) = scroll.v120 {
+        if h != 0.0 {
+            frame = frame.v120(Axis::Horizontal, h as i32);
+        }
+        if v != 0.0 {
+            frame = frame.v120(Axis::Vertical, v as i32);
+        }
+    }
+    if scroll.horizontal != 0.0 {
+        frame = frame.value(Axis::Horizontal, scroll.horizontal);
+    }
+    if scroll.vertical != 0.0 {
+        frame = frame.value(Axis::Vertical, scroll.vertical);
+    }
+
+    // A finger lift is reported as a zero on the axis that stopped, and a
+    // client needs it to end kinetic scrolling. Dropped, a touchpad flick
+    // keeps coasting, which reads as the scroll being stuck.
+    let (stop_h, stop_v) = scroll.stopped();
+    if stop_h {
+        frame = frame.stop(Axis::Horizontal);
+    }
+    if stop_v {
+        frame = frame.stop(Axis::Vertical);
+    }
+    frame
 }
 
 /// Everything the render loop needs that outlives a single frame.
@@ -2947,6 +2998,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     },
                 );
                 pointer.frame(&mut state);
+            }
+
+            // Scroll, so a terminal under winit behaves like one under the tty
+            // driver. Neither backend had it: an audit for driver parity found
+            // it missing from *both*, which makes it a gap rather than a
+            // divergence.
+            WinitEvent::Input(InputEvent::PointerAxis { event }) => {
+                use smithay::backend::input::{Axis, AxisSource, PointerAxisEvent};
+
+                let source = match event.source() {
+                    AxisSource::Finger => tty::ScrollSource::Finger,
+                    AxisSource::Continuous => tty::ScrollSource::Continuous,
+                    // Wheel and WheelTilt both carry discrete steps, which is
+                    // the distinction that matters to a client.
+                    _ => tty::ScrollSource::Wheel,
+                };
+                let scroll = tty::Scroll {
+                    source,
+                    horizontal: event.amount(Axis::Horizontal).unwrap_or(0.0),
+                    vertical: event.amount(Axis::Vertical).unwrap_or(0.0),
+                    v120: match source {
+                        tty::ScrollSource::Wheel => Some((
+                            event.amount_v120(Axis::Horizontal).unwrap_or(0.0),
+                            event.amount_v120(Axis::Vertical).unwrap_or(0.0),
+                        )),
+                        _ => None,
+                    },
+                };
+                if !scroll.is_empty() {
+                    pointer.axis(&mut state, axis_frame(scroll, event.time_msec()));
+                    pointer.frame(&mut state);
+                }
             }
 
             WinitEvent::Input(InputEvent::PointerButton { event }) => {

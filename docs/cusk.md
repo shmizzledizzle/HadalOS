@@ -2082,10 +2082,37 @@ it. One line distinguishes them:
 Three wrong guesses preceded the milestone 2 fix, and instrumenting took one
 round and cost less than any of them. Same choice here.
 
+---
+
+## Milestone 30: scroll, 2026-08-09
+
+Neither backend handled it, so scrolling in any terminal did nothing. Not a
+parity gap — a feature missing from both, found by auditing for parity.
+
+### Three sources, and the differences are the work
+
+- **Wheel** carries discrete steps as well as a smooth value. Sending only the
+  smooth one makes every wheel behave like a trackpad, and "scroll one notch"
+  stops meaning anything.
+- **Finger** ends a gesture with a **zero on the axis that stopped**. That zero
+  is information: it ends kinetic scrolling. Dropped as "an empty event", a
+  touchpad flick keeps coasting in any application with momentum, which reads
+  as the scroll being stuck.
+- **Continuous** — a trackpoint — has neither steps nor lifts.
+
+So an empty event must be dropped *except* for a finger, where empty is the
+message. Both halves are tested, along with each axis stopping independently:
+stopping both when only one ended makes a diagonal flick finish sideways.
+
+`axis_frame` is shared, because the mapping carries enough judgement to be
+worth having once rather than twice — which is the lesson of the three parity
+milestones applied before the divergence rather than after it.
+
 ### Next
 
-Scroll, which no backend has. Then hotplug, and page-flip timing to replace the
-tearing `set_crtc`. on eDP-1, rendering a single colour, with a hard timeout that
+Hotplug, and page-flip timing to replace the tearing `set_crtc`. Also
+outstanding: why a client's own titlebar does not drag, which the `move_request`
+log line will answer on the next tty run. on eDP-1, rendering a single colour, with a hard timeout that
    restores the VT — the first thing that can strand a screen, so it should be
    unable to strand it for more than a few seconds.
 2. libinput, so there is a keyboard.

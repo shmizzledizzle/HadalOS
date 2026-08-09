@@ -1122,6 +1122,10 @@ pub struct Input {
     /// Accumulated pointer movement since the last drain.
     pub motion: (f64, f64),
     pub buttons: Vec<(u32, bool)>,
+    /// One entry per libinput scroll event, not accumulated: the source and
+    /// the stop flags are per-event, and summing them would merge a wheel
+    /// notch with a finger lift.
+    pub scrolls: Vec<Scroll>,
 }
 
 /// Drain libinput once.
@@ -1161,6 +1165,39 @@ pub fn drain(libinput: &mut input::Libinput) -> Input {
             // needs the device's own coordinate range, and treating an
             // absolute position as a delta would fling the pointer across the
             // screen on every touch.
+            Event::Pointer(PointerEvent::ScrollWheel(scroll)) => {
+                use input::event::pointer::{Axis, PointerScrollEvent};
+                out.scrolls.push(Scroll {
+                    source: ScrollSource::Wheel,
+                    horizontal: scroll.scroll_value(Axis::Horizontal),
+                    vertical: scroll.scroll_value(Axis::Vertical),
+                    // A wheel's discrete steps are what a client needs to
+                    // scroll "one notch"; the smooth value alone makes every
+                    // wheel behave like a trackpad.
+                    v120: Some((
+                        scroll.scroll_value_v120(Axis::Horizontal),
+                        scroll.scroll_value_v120(Axis::Vertical),
+                    )),
+                });
+            }
+            Event::Pointer(PointerEvent::ScrollFinger(scroll)) => {
+                use input::event::pointer::{Axis, PointerScrollEvent};
+                out.scrolls.push(Scroll {
+                    source: ScrollSource::Finger,
+                    horizontal: scroll.scroll_value(Axis::Horizontal),
+                    vertical: scroll.scroll_value(Axis::Vertical),
+                    v120: None,
+                });
+            }
+            Event::Pointer(PointerEvent::ScrollContinuous(scroll)) => {
+                use input::event::pointer::{Axis, PointerScrollEvent};
+                out.scrolls.push(Scroll {
+                    source: ScrollSource::Continuous,
+                    horizontal: scroll.scroll_value(Axis::Horizontal),
+                    vertical: scroll.scroll_value(Axis::Vertical),
+                    v120: None,
+                });
+            }
             Event::Pointer(PointerEvent::Button(button)) => {
                 let pressed =
                     button.button_state() == input::event::pointer::ButtonState::Pressed;
@@ -1311,6 +1348,55 @@ impl Chord {
     }
 }
 
+/// One scroll event, in the terms `AxisFrame` needs.
+///
+/// Kept as data rather than turned into an `AxisFrame` here, because building
+/// one needs smithay types that this module deliberately does not carry — and
+/// because it makes the mapping decisions inspectable rather than buried in a
+/// chain of builder calls.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Scroll {
+    pub source: ScrollSource,
+    /// Pixels. Positive is right and down, matching pointer motion.
+    pub horizontal: f64,
+    pub vertical: f64,
+    /// Discrete steps, in 120ths of a notch. Wheels only.
+    pub v120: Option<(f64, f64)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScrollSource {
+    Wheel,
+    Finger,
+    Continuous,
+}
+
+impl Scroll {
+    /// Whether a finger has lifted, per axis.
+    ///
+    /// libinput ends a touchpad scroll with a zero on the axis that stopped,
+    /// and a client needs that to end kinetic scrolling. Without it a
+    /// touchpad flick keeps coasting in applications that implement momentum,
+    /// which reads as the scroll being stuck.
+    pub fn stopped(&self) -> (bool, bool) {
+        if self.source != ScrollSource::Finger {
+            return (false, false);
+        }
+        (self.horizontal == 0.0, self.vertical == 0.0)
+    }
+
+    /// Whether this event says anything at all.
+    ///
+    /// A frame with no axes in it is a message a client cannot act on, and
+    /// some toolkits treat one as a scroll stop — so an empty event must be
+    /// dropped rather than forwarded.
+    pub fn is_empty(&self) -> bool {
+        self.horizontal == 0.0
+            && self.vertical == 0.0
+            && self.source != ScrollSource::Finger
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::framebuffer_flags;
@@ -1354,6 +1440,68 @@ mod tests {
     /// subtraction gets them wrong — and the symptom is switching to the wrong
     /// terminal, which looks like a broken keyboard.
     /// The distinction that keeps a VT switch from looking like a crash.
+    fn wheel(h: f64, v: f64) -> super::Scroll {
+        super::Scroll {
+            source: super::ScrollSource::Wheel,
+            horizontal: h,
+            vertical: v,
+            v120: Some((h * 120.0, v * 120.0)),
+        }
+    }
+
+    fn finger(h: f64, v: f64) -> super::Scroll {
+        super::Scroll {
+            source: super::ScrollSource::Finger,
+            horizontal: h,
+            vertical: v,
+            v120: None,
+        }
+    }
+
+    /// A frame with no axes is a message a client cannot act on, and some
+    /// toolkits read one as a scroll stop.
+    #[test]
+    fn an_empty_wheel_event_is_dropped() {
+        assert!(wheel(0.0, 0.0).is_empty());
+        assert!(!wheel(0.0, 1.0).is_empty());
+        assert!(!wheel(-1.0, 0.0).is_empty());
+    }
+
+    /// A finger event with zeros is not empty — it is the lift, and it is the
+    /// one scroll event that carries information by being zero.
+    #[test]
+    fn a_finger_lift_is_not_an_empty_event() {
+        assert!(!finger(0.0, 0.0).is_empty());
+        assert_eq!(finger(0.0, 0.0).stopped(), (true, true));
+    }
+
+    /// Stopping one axis must not stop the other, or a diagonal flick ends
+    /// sideways.
+    #[test]
+    fn each_axis_stops_independently() {
+        assert_eq!(finger(0.0, 5.0).stopped(), (true, false));
+        assert_eq!(finger(5.0, 0.0).stopped(), (false, true));
+        assert_eq!(finger(5.0, 5.0).stopped(), (false, false));
+    }
+
+    /// Only a touchpad reports lifts. A wheel at rest simply sends nothing,
+    /// and calling that a stop would end kinetic scrolling that a finger
+    /// started.
+    #[test]
+    fn only_a_finger_reports_a_stop() {
+        assert_eq!(wheel(0.0, 0.0).stopped(), (false, false));
+        assert_eq!(
+            super::Scroll {
+                source: super::ScrollSource::Continuous,
+                horizontal: 0.0,
+                vertical: 0.0,
+                v120: None,
+            }
+            .stopped(),
+            (false, false)
+        );
+    }
+
     #[test]
     fn a_revoked_device_is_not_a_fault() {
         use std::io::{Error, ErrorKind};
