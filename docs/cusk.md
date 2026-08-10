@@ -2361,6 +2361,48 @@ immediately. Worth recording because the comment beside it asserted the
 opposite — that nothing meaningful could reach it — which would have been a
 confident, wrong explanation sitting in the source.
 
+### The system tray
+
+There is no Wayland protocol for a tray. The desktop-wide convention is
+**StatusNotifierItem**: the panel hosts a D-Bus service called
+`org.kde.StatusNotifierWatcher`, applications register against it, and the panel
+reads each one's icon, title and status back over IPC. So the dock is a D-Bus
+**server** and a **client** at once, and nothing appears until an application
+volunteers.
+
+**Exactly one process may own the watcher name.** On a running KDE session,
+Plasma already owns it and cusk's dock correctly fails to claim it — verified
+here: `could not become the StatusNotifierWatcher (name already taken on the
+bus)`, and the dock carries on with an empty tray. Two watchers would mean
+applications registering with one and being displayed by the other, so this is
+reported rather than worked around.
+
+Three decodings worth testing, all silent when wrong:
+
+- The wire carries **ARGB32**, renderers want RGBA. Wrong, it does not fail —
+  it rotates the channels, which reads as a theming bug.
+- Applications send **several sizes at once**; taking the first gives whichever
+  the toolkit listed, often 16×16, visibly soft beside the rest.
+- A registration may be a **bus name or an object path**, and applications
+  disagree about which. A form that is not understood never appears at all.
+
+A theme name is resolved through the same lookup desktop entries use, so a tray
+icon matches the rest of the desktop rather than being whatever the application
+shipped.
+
+### Two tests that nearly proved nothing
+
+`item_from_properties` was written, tested four ways — and **unused**. The live
+path read properties one at a time through the typed proxy, so those tests
+proved nothing about the code that ran. `refresh` now uses `GetAll`, which is
+one round trip instead of three *and* hands back the same map the tests
+exercise.
+
+The end-to-end test — claim the name, register a fake item, watch it reach the
+snapshot — passed in 0.11s, which was fast enough to be suspicious. Inverting
+the title preference made it fail with `Title must win over Id`, and restoring
+it made it pass again. A green test that cannot go red is a decoration.
+
 ### Not done
 
 The dock lists **everything installed**, scrollably. Pinning a chosen few is

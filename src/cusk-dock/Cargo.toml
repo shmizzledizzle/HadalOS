@@ -18,3 +18,5 @@ iced = { version = "0.14.0", features = ["tokio", "image", "svg"] }
 # is drawn in-process. This is the piece that lets a dock be an ordinary
 # client instead — anchored, exclusive, and replaceable.
 iced_layershell = "0.19.1"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync"] }
+zbus = { version = "5.19.0", default-features = false, features = ["tokio"] }
