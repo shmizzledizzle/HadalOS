@@ -31,6 +31,9 @@ use iced_layershell::to_layer_message;
 /// application list belongs in the launcher that opens beside it.
 const WIDTH: u32 = 48;
 const ICON: u16 = 26;
+/// The mark is a little larger than the pins: it is the one fixed landmark on
+/// the strip, and everything else is found relative to it.
+const MARK_SIZE: u16 = 30;
 
 /// The HadalOS mark, for the launcher button.
 const MARK: &[u8] = include_bytes!("../../cusk-launcher/assets/menu_icon.png");
@@ -144,10 +147,18 @@ impl App {
 
     fn view(&self) -> Element<'_, Message> {
         let launcher = tooltip(
-            button(image(self.mark.clone()).width(Length::Fixed(ICON as f32)))
-                .padding(6)
-                .style(style::tile)
-                .on_press(Message::OpenLauncher),
+            // Both dimensions, like the pinned icons below. Setting only the
+            // width leaves the height at iced's default of `Fill`, which
+            // collapses to nothing inside a shrink-height column — the mark
+            // was measured, laid out, and drawn zero pixels tall.
+            button(
+                image(self.mark.clone())
+                    .width(Length::Fixed(MARK_SIZE as f32))
+                    .height(Length::Fixed(MARK_SIZE as f32)),
+            )
+            .padding(6)
+            .style(style::tile)
+            .on_press(Message::OpenLauncher),
             container(text("Applications").size(12))
                 .padding(6)
                 .style(style::tip),
