@@ -2332,6 +2332,35 @@ write what they know and that is usually `firefox` rather than
 `org.mozilla.firefox`. A pin for something not installed is dropped rather than
 drawn as a gap or an icon that launches nothing.
 
+### The launcher slides out beside the dock
+
+`cusk-launcher` moved from an xdg-shell window to a layer-shell panel: anchored
+top-right, on the `Overlay` layer so it sits above the dock, reserving **no**
+exclusive zone — a launcher that pushed the windows aside every time it opened
+would rearrange the desktop to show a search box.
+
+It starts one full panel-width off-screen and animates its right margin in over
+160ms. That is what makes it read as *coming from behind the dock* rather than
+appearing; the animation is the only thing that says where it came from.
+
+The timer only runs while there is something to animate. A launcher that ticked
+forever would keep a core warm redrawing a panel that had already arrived.
+
+`KeyboardInteractivity::Exclusive`, because a search box that does not receive
+keys is furniture — the opposite of the dock, which takes no keyboard focus at
+all so reaching for an icon never steals it from the terminal being worked in.
+
+**The dock width is duplicated as a constant in the launcher.** A client cannot
+ask another client how wide it is. The honest fix is for cusk to publish its
+layout, which is the same IPC the tray and the mode-awareness both need — three
+things now pointing at one missing piece.
+
+A wildcard arm for the generated protocol messages was first placed at the *top*
+of the match, where it swallowed every real message. The compiler said so
+immediately. Worth recording because the comment beside it asserted the
+opposite — that nothing meaningful could reach it — which would have been a
+confident, wrong explanation sitting in the source.
+
 ### Not done
 
 The dock lists **everything installed**, scrollably. Pinning a chosen few is

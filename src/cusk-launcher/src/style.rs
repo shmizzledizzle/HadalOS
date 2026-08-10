@@ -26,19 +26,6 @@ fn alpha(color: Color, a: f32) -> Color {
     Color { a, ..color }
 }
 
-pub fn theme() -> Theme {
-    Theme::custom(
-        "cusk".to_string(),
-        iced::theme::Palette {
-            background: BG,
-            text: TEXT,
-            primary: ACCENT,
-            success: ACCENT,
-            warning: token(tokens::WARNING),
-            danger: token(tokens::DANGER),
-        },
-    )
-}
 
 pub fn window(_theme: &Theme) -> container::Style {
     container::Style {

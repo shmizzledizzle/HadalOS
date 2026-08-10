@@ -14,3 +14,4 @@ path = "src/main.rs"
 # same terminal setting the compositor spawns with.
 cusk = { path = "../cusk" }
 iced = { version = "0.14.0", features = ["image", "tokio"] }
+iced_layershell = "0.19.1"
