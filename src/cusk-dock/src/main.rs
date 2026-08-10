@@ -17,7 +17,7 @@
 mod style;
 
 use cusk::entry::{self, Entry};
-use iced::widget::{button, column, container, image, scrollable, svg, text, tooltip};
+use iced::widget::{button, column, container, image, svg, text, tooltip};
 use iced::{Element, Fill, Length, Task};
 use iced_layershell::build_pattern::application;
 use iced_layershell::reexport::{Anchor, KeyboardInteractivity, Layer};
@@ -26,8 +26,11 @@ use iced_layershell::to_layer_message;
 
 /// Width of the strip, and the exclusive zone it reserves. One constant, so
 /// the space claimed and the space drawn cannot disagree.
-const WIDTH: u32 = 56;
-const ICON: u16 = 34;
+///
+/// Narrow on purpose: the KaOS reference is a bar of icons, not a shelf. The
+/// application list belongs in the launcher that opens beside it.
+const WIDTH: u32 = 48;
+const ICON: u16 = 26;
 
 /// The HadalOS mark, for the launcher button.
 const MARK: &[u8] = include_bytes!("../../cusk-launcher/assets/menu_icon.png");
@@ -87,12 +90,12 @@ impl App {
             .map(|(cfg, _)| cfg)
             .unwrap_or_default();
 
-        // Everything installed, in name order, which is at least a defensible
-        // ordering. A real dock pins a chosen few — that is a setting, and the
-        // schema is where it belongs rather than a list hardcoded here.
-        let pinned = entry::load_all()
+        // Pinned only. The first version listed everything installed, which
+        // made the dock a second launcher sorted alphabetically — it answered
+        // "what is on this machine" when a dock's question is "what do I use".
+        let installed = entry::load_all();
+        let pinned = entry::resolve_pinned(&cfg.dock_pinned, &installed)
             .into_iter()
-            .filter(|e| e.icon.is_some())
             .map(|entry| {
                 let icon = entry
                     .icon
@@ -181,15 +184,17 @@ impl App {
             )
             .into()
         }))
-        .spacing(4);
+        .spacing(6)
+        .align_x(iced::Center);
 
+        // Mark at the top, pins beneath it, and the tray region held open at
+        // the bottom — the KaOS arrangement. `Fill` on the middle is what
+        // pushes the bottom group down without a hardcoded height.
         container(
             column![
                 launcher,
-                // Scrollable, because a dock listing everything installed is
-                // taller than any screen. Pinning a chosen few is the real
-                // answer and belongs in the schema.
-                scrollable(apps).height(Fill).style(style::scroller),
+                container(apps).height(Fill),
+                tray_placeholder(),
             ]
             .spacing(8)
             .align_x(iced::Center),
@@ -199,6 +204,23 @@ impl App {
         .style(style::dock)
         .into()
     }
+}
+
+/// Where the system tray will go.
+///
+/// **Empty, and deliberately so.** A tray is not a drawing problem: it is
+/// StatusNotifierItem over D-Bus, where applications register themselves and
+/// hand back icons, tooltips and menus over IPC. Drawing plausible-looking
+/// icons here would be a picture of a tray rather than a tray, and the first
+/// click would prove it.
+///
+/// The space is held open so the arrangement is right when it is filled, and
+/// so the bottom of the dock does not visibly move the day it is.
+fn tray_placeholder<'a>() -> Element<'a, Message> {
+    container(text(""))
+        .width(Length::Fixed(ICON as f32))
+        .height(Length::Fixed(2.0))
+        .into()
 }
 
 /// Start a program, detached.

@@ -45,12 +45,32 @@ pub fn usable_area(output: Size<i32, Logical>, panel_height: i32) -> Rectangle<i
     )
 }
 
-/// The panel's own rectangle.
-pub fn panel_area(output: Size<i32, Logical>, panel_height: i32) -> Rectangle<i32, Logical> {
+/// The panel's own rectangle, given the horizontal span it is allowed.
+///
+/// `span` is the part of the width no layer-shell client has claimed. A
+/// full-width bar drawn beside a right-hand dock overlaps it in the corner —
+/// and, because the panel is painted last and swallows clicks first, the dock's
+/// topmost icon becomes both hidden and unclickable.
+///
+/// The panel takes what is left rather than the dock giving way: an exclusive
+/// zone is a client's reservation, and a compositor that drew over one would
+/// be breaking the promise it asks clients to rely on.
+pub fn panel_area(
+    output: Size<i32, Logical>,
+    panel_height: i32,
+    span: (i32, i32),
+) -> Rectangle<i32, Logical> {
+    let (x, width) = span;
     Rectangle::new(
-        Point::from((0, 0)),
-        Size::from((output.w, panel_height.clamp(0, output.h))),
+        Point::from((x.clamp(0, output.w), 0)),
+        Size::from((width.clamp(0, output.w), panel_height.clamp(0, output.h))),
     )
+}
+
+/// The whole width, for callers with no layer surfaces to consider.
+#[allow(dead_code)]
+pub fn full_span(output: Size<i32, Logical>) -> (i32, i32) {
+    (0, output.w)
 }
 
 /// Where each workspace pill sits, left to right.
@@ -92,8 +112,13 @@ pub fn pill_at(pills: &[Rectangle<i32, Logical>], point: Point<i32, Logical>) ->
 }
 
 /// Whether a point is on the panel at all.
-pub fn contains(output: Size<i32, Logical>, panel_height: i32, point: Point<i32, Logical>) -> bool {
-    panel_height > 0 && panel_area(output, panel_height).contains(point)
+pub fn contains(
+    output: Size<i32, Logical>,
+    panel_height: i32,
+    span: (i32, i32),
+    point: Point<i32, Logical>,
+) -> bool {
+    panel_height > 0 && panel_area(output, panel_height, span).contains(point)
 }
 
 #[cfg(test)]
@@ -116,7 +141,7 @@ mod tests {
     #[test]
     fn the_panel_and_the_usable_area_tile_the_output() {
         for height in [0, 1, 24, 28, 60] {
-            let panel = panel_area(screen(), height);
+            let panel = panel_area(screen(), height, full_span(screen()));
             let usable = usable_area(screen(), height);
             assert_eq!(panel.size.h + usable.size.h, 800, "height {height}");
             assert_eq!(panel.loc.y + panel.size.h, usable.loc.y, "height {height}");
@@ -168,7 +193,7 @@ mod tests {
     #[test]
     fn pills_stay_inside_the_panel() {
         let height = 28;
-        let panel = panel_area(screen(), height);
+        let panel = panel_area(screen(), height, full_span(screen()));
         for pill in pills(screen(), height, 5, 1) {
             assert!(panel.contains_rect(pill), "{pill:?} escapes {panel:?}");
         }
@@ -206,9 +231,18 @@ mod tests {
 
     #[test]
     fn the_panel_owns_the_top_strip_and_nothing_below_it() {
-        assert!(contains(screen(), 28, Point::from((640, 0))));
-        assert!(contains(screen(), 28, Point::from((640, 27))));
-        assert!(!contains(screen(), 28, Point::from((640, 28))));
-        assert!(!contains(screen(), 0, Point::from((640, 0))), "disabled owns nothing");
+        let all = full_span(screen());
+        assert!(contains(screen(), 28, all, Point::from((640, 0))));
+        assert!(contains(screen(), 28, all, Point::from((640, 27))));
+        assert!(!contains(screen(), 28, all, Point::from((640, 28))));
+        assert!(!contains(screen(), 0, all, Point::from((640, 0))), "disabled owns nothing");
+
+        // The strip a dock has reserved is the dock's, including the corner.
+        let beside_dock = (0, 1224);
+        assert!(contains(screen(), 28, beside_dock, Point::from((640, 10))));
+        assert!(
+            !contains(screen(), 28, beside_dock, Point::from((1250, 10))),
+            "the panel must not own the dock's corner, or its top icon is unclickable"
+        );
     }
 }

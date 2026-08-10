@@ -2307,6 +2307,31 @@ blur is on. `below` is still inside it, which means background-layer clients
 would not draw with blur enabled. Nothing uses that layer yet — the dock is
 `Top` — and it is recorded rather than quietly left.
 
+### The bar overlapped the dock, and stole its clicks
+
+The compositor's panel spans the full width; a right-hand dock reserves the
+last 56px. They overlapped in the corner — and because the panel is painted
+last *and* tested first in `press`, the dock's topmost icon was both hidden and
+unclickable.
+
+`panel_span` is the width no layer client has claimed, and the panel takes what
+is left. The panel gives way rather than the dock, because an exclusive zone is
+a client's reservation and a compositor that drew over one would break the
+promise it asks clients to rely on.
+
+### Pinning
+
+The first dock listed **everything installed**, alphabetically, which made it a
+second launcher: it answered *what is on this machine* when a dock's question
+is *what do I use*. `dock.pinned` is a comma-separated list of desktop ids,
+resolved in the order written — a dock is muscle memory, and a list that
+reorders itself when a package is installed defeats the point.
+
+A pin may name the desktop id, the binary, or the visible name, because users
+write what they know and that is usually `firefox` rather than
+`org.mozilla.firefox`. A pin for something not installed is dropped rather than
+drawn as a gap or an icon that launches nothing.
+
 ### Not done
 
 The dock lists **everything installed**, scrollably. Pinning a chosen few is

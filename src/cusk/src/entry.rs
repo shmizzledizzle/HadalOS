@@ -323,6 +323,39 @@ pub fn rank<'a>(entries: &'a [Entry], query: &str) -> Vec<&'a Entry> {
     scored.into_iter().map(|(_, e)| e).collect()
 }
 
+/// Resolve a pinned list — desktop ids, comma separated — into entries.
+///
+/// Order is the user's, not the filesystem's: a dock is muscle memory, and a
+/// list that reorders itself when a package is installed defeats the point.
+///
+/// Unknown ids are dropped rather than shown as gaps. A pin naming an
+/// application that is not installed is a stale config, and the honest reading
+/// is "not here" rather than an icon that launches nothing.
+pub fn resolve_pinned(list: &str, available: &[Entry]) -> Vec<Entry> {
+    list.split(',')
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .filter_map(|id| {
+            available
+                .iter()
+                // The desktop id, then the binary, then the visible name —
+                // because users write what they know, and that is usually
+                // `firefox` rather than `org.mozilla.firefox`.
+                .find(|e| e.id.eq_ignore_ascii_case(id))
+                .or_else(|| {
+                    available.iter().find(|e| {
+                        e.exec
+                            .first()
+                            .and_then(|p| p.rsplit('/').next())
+                            .is_some_and(|p| p.eq_ignore_ascii_case(id))
+                    })
+                })
+                .or_else(|| available.iter().find(|e| e.name.eq_ignore_ascii_case(id)))
+                .cloned()
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -458,6 +491,57 @@ Exec=firefox --private-window
         ];
         let ranked = rank(&entries, "writer");
         assert_eq!(ranked[0].name, "Writer's Helper", "starts-with beats contains");
+    }
+
+    fn fake(id: &str, name: &str, exec: &str) -> Entry {
+        Entry {
+            id: id.into(),
+            name: name.into(),
+            comment: None,
+            exec: vec![exec.into()],
+            terminal: false,
+            icon: Some(id.into()),
+        }
+    }
+
+    fn catalogue() -> Vec<Entry> {
+        vec![
+            fake("org.mozilla.firefox", "Firefox", "/usr/bin/firefox"),
+            fake("Alacritty", "Alacritty", "/usr/bin/alacritty"),
+            fake("org.kde.dolphin", "Dolphin", "/usr/bin/dolphin"),
+        ]
+    }
+
+    /// A dock is muscle memory: the order is the user's, and must not become
+    /// the filesystem's the next time a package is installed.
+    #[test]
+    fn pins_keep_the_order_they_were_written_in() {
+        let pinned = resolve_pinned("org.kde.dolphin, Alacritty, org.mozilla.firefox", &catalogue());
+        let names: Vec<&str> = pinned.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["Dolphin", "Alacritty", "Firefox"]);
+    }
+
+    /// Users write what they know, which is the binary far more often than the
+    /// reverse-DNS desktop id.
+    #[test]
+    fn a_pin_may_name_the_binary_or_the_visible_name() {
+        assert_eq!(resolve_pinned("firefox", &catalogue()).len(), 1, "by binary");
+        assert_eq!(resolve_pinned("Dolphin", &catalogue()).len(), 1, "by name");
+        assert_eq!(resolve_pinned("ALACRITTY", &catalogue()).len(), 1, "case-insensitively");
+    }
+
+    /// A stale pin is dropped, not drawn as a gap or an icon that launches
+    /// nothing.
+    #[test]
+    fn a_pin_for_something_not_installed_is_dropped() {
+        let pinned = resolve_pinned("firefox, nothing-here, dolphin", &catalogue());
+        assert_eq!(pinned.len(), 2);
+    }
+
+    #[test]
+    fn an_empty_pin_list_pins_nothing() {
+        assert!(resolve_pinned("", &catalogue()).is_empty());
+        assert!(resolve_pinned("  ,  , ", &catalogue()).is_empty());
     }
 
     #[test]

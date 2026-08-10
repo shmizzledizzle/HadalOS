@@ -5,7 +5,7 @@
 //! drift apart.
 
 use cusk::theme as tokens;
-use iced::widget::{button, container, scrollable};
+use iced::widget::{button, container};
 use iced::{border, Background, Border, Color, Theme};
 
 const fn token(c: tokens::Rgba) -> Color {
@@ -84,22 +84,3 @@ pub fn tip(_theme: &Theme) -> container::Style {
     }
 }
 
-pub fn scroller(theme: &Theme, status: scrollable::Status) -> scrollable::Style {
-    let base = scrollable::default(theme, status);
-    // No visible rail: on a 56px strip a scrollbar is most of the width, and
-    // the dock is scrolled by wheel rather than by dragging.
-    let rail = scrollable::Rail {
-        background: None,
-        border: Border::default(),
-        scroller: scrollable::Scroller {
-            background: Background::Color(Color::TRANSPARENT),
-            border: Border::default(),
-        },
-    };
-    scrollable::Style {
-        container: container::Style::default(),
-        vertical_rail: rail,
-        horizontal_rail: rail,
-        ..base
-    }
-}

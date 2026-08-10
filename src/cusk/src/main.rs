@@ -1008,7 +1008,7 @@ impl Cusk {
     /// is underneath would activate something on the workspace being left.
     fn panel_click(&mut self, at: Point<i32, Logical>) -> bool {
         let output = Size::from((self.output_size.0, self.output_size.1));
-        if !panel::contains(output, self.panel_height, at) {
+        if !panel::contains(output, self.panel_height, self.panel_span(), at) {
             return false;
         }
         let pills = panel::pills(
@@ -1036,6 +1036,14 @@ impl Cusk {
     /// The layer map's zone is intersected rather than replaced: a client that
     /// reserves nothing must not be able to hand back the strip the panel is
     /// already drawing in.
+    /// The horizontal span the panel may use: whatever no layer-shell client
+    /// has reserved. A right-hand dock takes width out of this, which is what
+    /// stops the bar from being drawn across its top icon.
+    fn panel_span(&self) -> (i32, i32) {
+        let zone = layer_map_for_output(&self.output).non_exclusive_zone();
+        (zone.loc.x, zone.size.w)
+    }
+
     fn usable_area(&self) -> Rectangle<i32, Logical> {
         let after_panel = panel::usable_area(
             Size::from((self.output_size.0, self.output_size.1)),
@@ -1610,6 +1618,8 @@ fn run_on_tty(
     // missed and cusk does not draw over a VT it no longer owns.
     let (mut session_events, mut active) = tty::watch_session(notifier)?;
 
+    spawn_session_program(&cfg.dock, &socket_name, "dock");
+
     // Armed before the display is taken, so a hang anywhere after this point
     // still ends with a usable console. `seconds == 0` means no limit, which
     // is only safe now that a VT switch releases the display — before
@@ -2147,6 +2157,37 @@ fn set_output_mode(space: &mut Space<Window>, output: &Output, size: (i32, i32),
     space.map_output(output, (0, 0));
 }
 
+/// Start a session program — the dock, and anything like it.
+///
+/// Resolved the way the launcher is: a bare name is looked for beside cusk
+/// before `PATH`, because in development the crates build into separate target
+/// directories and anything on `PATH` is a stale install.
+///
+/// Started by the compositor rather than left to the user. A dock that only
+/// appears when someone remembers to run it in a second terminal with
+/// `WAYLAND_DISPLAY` set is not a dock — it was reported missing twice, and
+/// both times it was working and simply not running.
+fn spawn_session_program(name: &str, socket_name: &str, what: &str) {
+    let name = name.trim();
+    if name.is_empty() {
+        return;
+    }
+    let program = resolve_launcher(name);
+    match std::process::Command::new(&program)
+        .env("WAYLAND_DISPLAY", socket_name)
+        .spawn()
+    {
+        Ok(child) => {
+            tracing::info!("{what} {program} (pid {})", child.id());
+            std::thread::spawn(move || {
+                let mut child = child;
+                let _ = child.wait();
+            });
+        }
+        Err(e) => tracing::warn!("could not start the {what} {program}: {e}"),
+    }
+}
+
 /// Everything the render loop needs that outlives a single frame.
 ///
 /// Gathered into one place because the loop used to thread ten separate
@@ -2633,7 +2674,7 @@ fn draw_frame(
         // top or it disappears under the first window someone moves up.
         if state.panel_height > 0 {
             let output = Size::from((logical_size.w, logical_size.h));
-            let bar = to_physical(panel::panel_area(output, state.panel_height));
+            let bar = to_physical(panel::panel_area(output, state.panel_height, state.panel_span()));
             let bg = cusk::theme::premultiplied([
                 cusk::theme::BG[0],
                 cusk::theme::BG[1],
@@ -3190,6 +3231,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "auto" => pick_terminal().map(str::to_owned),
             named => Some(named.to_string()),
         });
+
+    spawn_session_program(&cfg.dock, &socket_name, "dock");
 
     if !no_spawn {
         match terminal.as_deref() {

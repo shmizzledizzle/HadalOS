@@ -415,6 +415,18 @@ settings! {
         apply: Live,
         default: 3, min: 1, max: 5
     },
+    dock_pinned: Text {
+        key: "dock.pinned",
+        doc: "Applications pinned to the dock, by desktop id, comma separated. Empty pins none.",
+        apply: Restart,
+        default: ""
+    },
+    dock: Text {
+        key: "commands.dock",
+        doc: "Dock started with the session. Empty runs none.",
+        apply: Restart,
+        default: "cusk-dock"
+    },
     launcher: Text {
         key: "commands.launcher",
         doc: "Program the launcher binding runs. A bare name is looked for beside cusk, then on PATH.",
@@ -1145,7 +1157,7 @@ mod-key = \"alt\"
     #[test]
     fn sections_are_in_schema_order_and_unique() {
         let sections = sections();
-        assert_eq!(sections, vec!["layout", "workspaces", "input", "appearance", "commands"]);
+        assert_eq!(sections, vec!["layout", "workspaces", "input", "appearance", "dock", "commands"]);
         let unique: std::collections::HashSet<_> = sections.iter().collect();
         assert_eq!(unique.len(), sections.len());
     }
