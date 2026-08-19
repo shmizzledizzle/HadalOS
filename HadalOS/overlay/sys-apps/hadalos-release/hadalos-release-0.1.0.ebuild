@@ -62,6 +62,28 @@ pkg_preinst() {
 	fi
 }
 
+# ── Known hazard: re-merging over an existing instance ────────────────────
+# Two packages claim /etc/os-release — baselayout as `sym`, this one as `obj` —
+# and that dual ownership is the part that bites, not the symlink itself.
+#
+# Observed 2026-08-19 on `emerge -1 sys-apps/hadalos-release` over an already
+# installed copy, with FEATURES="protect-owned": Portage merged the new file,
+# then cleaned up the old instance and removed that path on the way out. The
+# result was CONTENTS recording `obj /etc/os-release` with a fresh mtime and no
+# file on disk — the package database and the filesystem disagreeing, silently,
+# with `. /etc/os-release` failing outright.
+#
+# A fresh merge does not hit this; the cleanup step is what does it. If the
+# file goes missing after a reinstall, the repair is a clean unmerge and merge
+# rather than another `-1`:
+#
+#     emerge -C sys-apps/hadalos-release
+#     emerge -1 sys-apps/baselayout        # restores its symlink
+#     emerge    sys-apps/hadalos-release   # preinst removes it, file lands
+#
+# scripts/test-overlay.sh asserts the end state, so this is detectable rather
+# than something to remember.
+
 pkg_postinst() {
 	elog "Confirm the identity with:"
 	elog "  . /etc/os-release && echo \"\$PRETTY_NAME (\$ID, like \$ID_LIKE)\""

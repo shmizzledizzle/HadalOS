@@ -195,10 +195,18 @@ if [[ -e /var/db/pkg/sys-apps/hadalos-release-0.1.0 ]]; then
 	# config-protected. `. /etc/os-release` reports HadalOS either way, so the
 	# only visible difference is that the next baselayout upgrade silently
 	# reverts the identity.
+	# Three distinct end states, and only one is right. The missing case is the
+	# one that passed a naive `test -L` check while `. /etc/os-release` failed
+	# outright — Portage's CONTENTS claimed the file and the filesystem did not
+	# have it.
 	if [[ -L /etc/os-release ]]; then
 		bad "/etc/os-release is a symlink — the identity will revert on the next baselayout upgrade"
+	elif [[ ! -e /etc/os-release ]]; then
+		bad "/etc/os-release does not exist, but hadalos-release records it — see the ebuild's re-merge hazard"
+	elif ! grep -q '^ID=hadalos' /etc/os-release; then
+		bad "/etc/os-release exists but does not identify as HadalOS"
 	else
-		ok "/etc/os-release is a real file"
+		ok "/etc/os-release is a real file identifying as HadalOS"
 	fi
 
 	if command -v md5sum >/dev/null && [[ -e /usr/lib/os-release ]]; then
