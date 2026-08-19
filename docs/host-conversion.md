@@ -63,6 +63,65 @@ auto-sync = no
 
 Verify with `emerge --info 2>&1 | grep hadalos` — silence is success.
 
+### What the broken path had already cost
+
+Running the boot layer's own regression suite the way its documentation says to
+run it reports a failure on this machine:
+
+```
+$ bash scripts/test-limine-hook.sh
+FAIL  refusing to remove the pinned kernel exits 1: got '0', want '1'
+FAIL  PINNED KERNEL WAS DELETED
+...
+9/15 passed
+```
+
+That reads like the last-known-good pin has stopped protecting anything, which
+would be the most serious possible failure in this layer. It is not what
+happened, and the real explanation is worth following because it is a
+consequence of the repos.conf breakage above.
+
+The suite defaults to the **installed** copies — `/usr/bin/hadalos-limine-update`
+and `/usr/lib/kernel/install.d/90-hadalos-limine.install` — so that it doubles
+as a post-merge smoke test. Against the repo copies it still passes:
+
+```
+$ bash scripts/test-limine-hook.sh \
+    overlay/sys-boot/hadalos-limine-hook/files/90-hadalos-limine.install \
+    overlay/sys-boot/hadalos-limine-hook/files/hadalos-limine-update
+15/15 passed
+```
+
+The installed copies predate the `$HADALOS_ETC` fix and still hardcode
+`LASTGOOD_FILE=/etc/hadalos/lastgood`. So the test's temporary pin is ignored,
+the script reads *this machine's real pin* instead, and six assertions fail
+against a file the test never wrote:
+
+```
+hadalos-limine-update: recorded last-known-good 6.18.43-gentoo-dist-bin
+                       is no longer installed; ignoring
+```
+
+**The boot layer itself is fine.** `/etc/hadalos` is the correct production
+path and both versions use it, the two scripts differ in nothing else, and
+`hadalos-mark-boot-good`, its service and its timer are byte-identical to the
+repo. There is no functional regression on this machine.
+
+What there is: an installed package that no longer matches its source, because
+the overlay it was built from could not be read, because a path in repos.conf
+was stale. Rebuilding it is the fix, and rebuilding it required fixing the path
+first:
+
+```bash
+emerge -av1 sys-boot/hadalos-limine-hook
+bash scripts/test-limine-hook.sh     # should be 15/15 against the installed copies
+```
+
+The lesson is the one this layer keeps teaching. The fix that made the crisis
+path testable was written, committed and never installed, and the only thing
+that noticed was a test suite whose failure looked like something far worse
+than the truth.
+
 ---
 
 ## 1. Identity

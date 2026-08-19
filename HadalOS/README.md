@@ -134,12 +134,28 @@ a syntax check. The one thing it did catch: `ReadWritePaths=` must name the
 same boot root the service actually writes to, or `ProtectSystem=strict`
 silently blocks the write.
 
-141 checks currently pass, on real Linux, across six suites:
+Measured on this machine, 2026-08-19 — unprivileged, no network:
+
+| Suite | Result |
+|---|---|
+| `cargo test` in `src/cusk` | 180/180 |
+| `cargo test` in `HadalOS/src` (broker + CLI) | 36/36 |
+| `scripts/test-overlay.sh` | 83/83 |
+| `scripts/test-limine-hook.sh` *(against repo copies)* | 15/15 |
+| `scripts/check-consistency.py` | consistent |
+| `scripts/check-kernel-config.py` | matches units |
+| `scripts/check-catalyst-specs.py` | chain consistent |
 
 ```bash
-wsl -d Debian -u root -- bash scripts/wsl-verify.sh
+bash scripts/test-overlay.sh              # no root, no network, no Portage
 bash scripts/test-limine-hook.sh          # no root, no ESP, no kernel needed
 ```
+
+`test-limine-hook.sh` with no arguments tests the **installed** copies, so it
+doubles as a post-merge smoke test. That is also why it currently reports 9/15
+here: the installed `sys-boot/hadalos-limine-hook` predates the `$HADALOS_ETC`
+fix, because a stale path in `repos.conf` meant the package could not be
+rebuilt. The boot layer is not broken — see `docs/host-conversion.md` §0.
 
 Then, as root on a systemd machine: `scripts/integration-test.sh`,
 `scripts/e2e-test.sh` and `scripts/test-mkiso.sh`.
