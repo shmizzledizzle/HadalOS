@@ -85,11 +85,12 @@ Foundation. **The boot layer boots a machine.**
 | `cusk` — layer-shell, dmabuf, panel, chrome, workspaces | working; layer-shell verified against waybar |
 | `cusk-dock` (dock, pinning, StatusNotifierItem tray) | working; tray needs an app to volunteer |
 | `cusk-launcher`, `cusk-settings` | working |
-| `cusk` as a display-manager session | **ebuild + session file written, never selected at a login screen** |
+| `cusk` as a display-manager session | **installed and offered by SDDM; never yet selected** |
 | `hadald` — remote-backed model host | working; 15 unit + 10 end-to-end |
 | `hadald` — local reflex model, tier routing | designed in `docs/tier-routing.md`, **not built** |
-| ebuilds for cusk / shell / broker / hadald | **written, never merged** |
-| `sys-apps/hadalos-release` (os-release identity) | **written, never merged** |
+| ebuilds for cusk / dock / launcher / settings | **merged on hardware**, 2026-08-19 |
+| ebuilds for broker / hadald | written, **never merged** |
+| `sys-apps/hadalos-release` (os-release identity) | **merged** — `hostnamectl` reports HadalOS |
 | catalyst specs | written, chain validated, **never run** |
 
 Everything marked *untested on hardware* has been syntax-checked only.

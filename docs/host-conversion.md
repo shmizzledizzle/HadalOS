@@ -17,26 +17,39 @@ installs itself, and let the machine identify as what it is.
 
 ## Status of this document
 
-**Nothing here has been merged.** The ebuilds are written and the sources they
-build are known to compile in release mode on this machine, but no `emerge` has
-run against any of them, so every step below is unverified.
-
-That is stated first because this project has now produced, twice, a component
-that was correct in every part and wrong in composition — six boot-layer bugs,
-five silent; and a flagship feature whose result reached the user and never the
-model. A runbook that reads as though it has been executed is the same mistake
-in prose.
+Executed on this machine 2026-08-19, except where marked. Steps that have run
+say so; steps that have not are called out rather than left ambiguous.
 
 | Piece | State |
 |---|---|
-| `sys-apps/hadalos-release` | written, **never merged** |
-| `gui-wm/cusk` | written; source builds release clean (3m36s) |
-| `gui-apps/cusk-{dock,launcher,settings}` | written; source builds release clean |
-| `sys-apps/hadal-brokerd` | written, **never merged**, source not rebuilt since 2026-08-07 |
+| `sys-apps/hadalos-release` | **merged** — `hostnamectl` reports `Operating System: HadalOS` |
+| `gui-wm/cusk` | **merged** |
+| `gui-apps/cusk-{dock,launcher,settings}` | **merged** |
+| `sys-boot/hadalos-limine-hook` | **rebuilt** — suite now 15/15 against the installed copies |
+| `sys-apps/hadal-brokerd` | written, **never merged** |
 | `sys-apps/hadald` | written, **never merged** |
 | `acct-{user,group}/hadal` | written, **never merged** |
 | `app-misc/hadalos{,-base,-desktop,-assistant}` | written, **never merged** |
-| `cusk` as a login session | `.desktop` + wrapper written, **never selected at a login screen** |
+| `cusk` as a login session | installed and offered by SDDM, **never yet selected** |
+
+The desktop is installed. Nobody has logged into it. Those are different
+claims and this project has a history of eliding exactly that difference.
+
+### What running it actually cost
+
+Four bugs, found by merging rather than by reading:
+
+| Found | How it presented |
+|---|---|
+| no `RUST_MIN_VER` | QA notice; merges here, fails mid-compile on an older rustc naming a crate |
+| `/etc/os-release` merged over baselayout's symlink | **looked like success** — identity correct, bytes in baselayout's file, silent revert on its next upgrade |
+| re-merge with `protect-owned` reaped the file | CONTENTS recorded a file that was not on disk |
+| a check helper named `head` | shadowed `/usr/bin/head`; six `ok` lines asserting nothing |
+
+Two of those four were *silent successes* — output that read as working. That
+ratio is the same one the boot layer produced, and it is the argument for
+`scripts/test-overlay.sh` asserting the end state on the machine rather than
+only the shape of the ebuilds.
 
 ---
 
