@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=HadalOS (Cusk)
+Comment=Floating and dynamic tiling in one Wayland compositor
+Exec=cusk-session
+TryExec=cusk
+Type=Application
+DesktopNames=HadalOS
+Keywords=tiling;wayland;compositor;

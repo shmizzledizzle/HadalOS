@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# Start cusk as a desktop session, under a display manager.
+#
+# Cusk has, until now, only ever been started by hand from a VT. That is a
+# different environment from the one a display manager provides, and three of
+# the differences are silent:
+#
+#   1. `cusk --tty` defaults to --seconds=30 and then exits cleanly. It was a
+#      watchdog for a compositor that could strand a display, and as a session
+#      it is a desktop that vanishes after half a minute and reports success.
+#      `--seconds=0` means no limit. It is not optional here.
+#
+#   2. The dock hosts org.kde.StatusNotifierWatcher on the *session* bus. With
+#      no session bus the dock still starts, still draws, and has an
+#      permanently empty tray with nothing logged to say why.
+#
+#   3. Output from a session started by a display manager goes wherever that
+#      display manager decided. Routing it to the journal under a known
+#      identifier means `journalctl --user -t cusk -b` is a real answer to
+#      "why did my session not start" rather than a hunt through ~/.local.
+#
+# This script is what the .desktop file runs. Running the bare binary works and
+# is fine for testing; it just gives you a desktop with a timer on it.
+set -euo pipefail
+
+# Identifies the session to clients that ask. Nothing in cusk reads this, but
+# xdg-desktop-portal picks its backend from it, and toolkits use it to decide
+# which platform theme and which window-decoration mode to ask for.
+export XDG_CURRENT_DESKTOP=HadalOS
+export XDG_SESSION_DESKTOP=cusk
+export XDG_SESSION_TYPE=wayland
+
+# A compositor is the thing that gets blamed for every client's slow startup,
+# so make the common toolkits pick the Wayland path rather than falling back to
+# XWayland and looking like cusk's fault.
+export QT_QPA_PLATFORM="${QT_QPA_PLATFORM:-wayland;xcb}"
+export GDK_BACKEND="${GDK_BACKEND:-wayland,x11}"
+export MOZ_ENABLE_WAYLAND="${MOZ_ENABLE_WAYLAND:-1}"
+
+cusk=(cusk --tty --seconds=0)
+
+# systemd-cat gives the session an identifier in the journal and propagates the
+# exit status, so a failed start is greppable instead of being wherever the
+# display manager put it.
+if command -v systemd-cat >/dev/null 2>&1; then
+	cusk=(systemd-cat --identifier=cusk --stderr-priority=warning "${cusk[@]}")
+fi
+
+# See (2). A user session started by a systemd-aware display manager already has
+# a bus and this branch is not taken; it exists because the failure when there
+# is no bus is an empty tray rather than an error.
+if [[ -z ${DBUS_SESSION_BUS_ADDRESS:-} ]]; then
+	if command -v dbus-run-session >/dev/null 2>&1; then
+		exec dbus-run-session -- "${cusk[@]}"
+	fi
+	echo "cusk-session: no session bus and no dbus-run-session;" >&2
+	echo "cusk-session: the dock's system tray will stay empty." >&2
+fi
+
+exec "${cusk[@]}"

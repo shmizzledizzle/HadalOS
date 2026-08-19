@@ -25,8 +25,28 @@ interpreter — it proposes typed actions from a closed enum, and a separate
 privileged broker containing no model code validates them, asks polkit, and
 executes via direct API.
 
-The daemon holding the model runs in a network namespace with no route out.
-"Local" is a kernel guarantee here, not a marketing claim.
+The unit for the daemon holding the model carries `PrivateNetwork=yes`, so that
+*can* be a kernel guarantee rather than a marketing claim.
+
+**It is not one today.** `hadald` is currently backed by a remote inference
+endpoint, which needs egress, which needs that directive relaxed by a
+deliberate drop-in. Stated precisely, because the difference matters:
+
+| Property | Status |
+|---|---|
+| **Safety** — no path from model output to a command interpreter | **intact** |
+| **Privacy** — system data never leaves the machine | **broken** |
+
+Safety survives because the broker was built not to trust the model. Proposals
+are typed, validated and polkit-gated wherever the model runs. Privacy does not
+survive, and the payloads are the sharp end: Portage build logs and journal
+excerpts carry hostnames, usernames, absolute paths and occasionally tokens.
+`/var/log/hadal/egress.log` exists so that *"what left this machine"* has an
+answer that is not a promise.
+
+The route back is a resident local model for anything touching system state,
+with the tier chosen from the capability table rather than by whoever calls —
+designed in [docs/tier-routing.md](../docs/tier-routing.md), not yet built.
 
 The feature that justifies the whole project: **Portage build failures.**
 Dense, structured, high-volume logs are exactly what a small local model
@@ -58,9 +78,19 @@ Foundation. **The boot layer boots a machine.**
 | Limine ISO assembly | 25/25 — real ISO built and inspected |
 | Limine hook regression suite | 15/15 — `scripts/test-limine-hook.sh`, unprivileged |
 | Static consistency checks (capability / kernel / catalyst) | passing, all negative-tested |
-| `hadalwm` | not started |
-| HadalOS Shell | not started |
-| catalyst specs | not started |
+| ~~`hadalwm`~~ (X11) | **abandoned** — replaced by cusk, ARCHITECTURE.md §0 |
+| ~~HadalOS Shell~~ (C#/Avalonia) | **abandoned** — replaced by the cusk shell clients |
+| `cusk` — nested compositor, floating, tiling | working, 33 milestones in `docs/cusk.md` |
+| `cusk` — tty backend: DRM, libseat, libinput, VT switch | **verified from a VT on this laptop** |
+| `cusk` — layer-shell, dmabuf, panel, chrome, workspaces | working; layer-shell verified against waybar |
+| `cusk-dock` (dock, pinning, StatusNotifierItem tray) | working; tray needs an app to volunteer |
+| `cusk-launcher`, `cusk-settings` | working |
+| `cusk` as a display-manager session | **ebuild + session file written, never selected at a login screen** |
+| `hadald` — remote-backed model host | working; 15 unit + 10 end-to-end |
+| `hadald` — local reflex model, tier routing | designed in `docs/tier-routing.md`, **not built** |
+| ebuilds for cusk / shell / broker / hadald | **written, never merged** |
+| `sys-apps/hadalos-release` (os-release identity) | **written, never merged** |
+| catalyst specs | written, chain validated, **never run** |
 
 Everything marked *untested on hardware* has been syntax-checked only.
 
@@ -139,8 +169,16 @@ sudo ./scripts/bootstrap-buildhost.sh --root /var/hadalos/build --enter
 
 ## Workflow
 
-Authoring happens on the Windows dev laptop; execution happens on the build
-host; git is the transport. Same loop `hadal sync` already runs.
+This changed. Authoring used to happen on a Windows laptop with execution on a
+separate build host and git as the transport. It now happens on the machine
+being converted: a Gentoo laptop, systemd, booted by Limine through the
+HadalOS entries, carrying the `::hadalos` overlay.
+
+That is a better arrangement than it sounds like an accident. The boot layer's
+six bugs were all found by running it on hardware and five of them were silent;
+authoring somewhere that cannot execute is what let them stay silent. The
+9800X3D host in ARCHITECTURE.md §0 is still the right home for `catalyst` and
+for anything needing 60 GB, and neither of those is the daily loop.
 
 `.gitattributes` pins LF on everything that executes on Linux. Do not relax
 it — a CRLF shebang fails as `bad interpreter: /bin/bash^M`.

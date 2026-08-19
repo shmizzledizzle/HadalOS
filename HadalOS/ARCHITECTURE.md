@@ -17,15 +17,66 @@ Everything here is a decision that has been made. Open questions live in
 | Init | systemd — required for D-Bus system services, socket activation, and the sandboxing directives that make the capability broker enforceable | 2026-08-01 |
 | Bootloader | Limine (`sys-boot/limine`, 12.x) | 2026-08-01 |
 | Kernel | mainline `torvalds/linux`, pinned per release, via `sys-kernel/hadalos-sources` | 2026-08-01 |
-| X server | **XLibre** (`X11Libre/ports-gentoo` overlay), not Xorg | 2026-08-01 |
-| WM core | Rust + `x11rb` | 2026-08-01 |
-| Shell UI | C# / Avalonia | 2026-08-01 |
+| ~~X server~~ | ~~**XLibre**, not Xorg~~ — **superseded**, see below | ~~2026-08-01~~ |
+| ~~WM core~~ | ~~Rust + `x11rb`~~ — **superseded**, see below | ~~2026-08-01~~ |
+| ~~Shell UI~~ | ~~C# / Avalonia~~ — **superseded**, see below | ~~2026-08-01~~ |
+| Display protocol | **Wayland**, not X11 | 2026-08-07 |
+| WM core | Rust + `smithay` — **cusk** | 2026-08-07 |
+| Shell UI | Rust + `iced` — dock, launcher, settings, as Wayland clients | 2026-08-07 |
+| Legacy apps | XWayland, rootless | 2026-08-07 |
 | Broker | Rust + `zbus` | 2026-08-01 |
-| Greeter | custom, against `greetd` | 2026-08-01 |
+| Greeter | ~~custom, against `greetd`~~ — SDDM for now, see below | 2026-08-19 |
 | Release eng | `catalyst` (stage1→3 + livecd) + binhost | 2026-08-01 |
+| Delivery | **conversion of a running Gentoo install**, ahead of any ISO | 2026-08-19 |
 | Build host | Ryzen 9800X3D / 32 GB DDR5 / RX 9060 | 2026-08-01 |
 
-### Why XLibre and not Xorg
+### The X11 rows above are superseded
+
+Three rows in that table describe a plan that was abandoned on 2026-08-07, and
+the decision record is [docs/cusk.md](../docs/cusk.md) §1. They are struck
+through rather than deleted because the reasoning that produced them was sound
+and is worth being able to find.
+
+The short version: the original argument was not "legacy X vs. modern Wayland",
+it was that writing a *compliant X11 window manager* is tractable where writing
+a *Wayland compositor* is "a categorically larger job". The X11 half of that
+still stands. What changed is that `smithay` means a Wayland compositor is no
+longer a matter of implementing the protocol — surfaces, seats, outputs,
+xdg-shell, layer-shell and XWayland glue come with it, and two shipping
+desktops are built on it. The job became "implement window management on top of
+a display server", which is the job the X11 plan already was. It is still the
+larger option; it is no longer *categorically* larger, and that word was
+carrying the decision.
+
+The Shell UI row went with it for a plainer reason: the panel is drawn by the
+compositor, and `iced` cannot speak layer-shell, so the shell became Wayland
+clients in the same language as everything else rather than a C# process.
+
+What this costs is recorded in cusk.md §2 and is not hidden here: the
+compositor owns every frame, owns input, needs `xdg-desktop-portal` for
+anything privileged, hosts XWayland as a second window-management code path,
+and — the one that raises the bar on error handling from *should* to *must* —
+**a compositor crash takes every client with it.**
+
+### The greeter row, and delivery
+
+`greetd` with a custom greeter is still the intended end state. It is not what
+is installed, and recording the intent as though it were the state is how this
+project produced six silent boot-layer bugs. Today cusk is offered as one
+session among others by the display manager that was already there, and the
+existing desktop stays installed and stays default. That ordering is the same
+two-entry principle as the Limine layout in §3: the recovery path exists before
+it is needed, not after.
+
+Delivery changed with it. §5 of this document describes authoring on a Windows
+laptop and building elsewhere; the actual route to a running HadalOS turned out
+to be converting a Gentoo install in place — this laptop now boots through
+Limine with last-known-good pinning and carries the HadalOS overlay. An ISO
+still matters and `catalyst/` still describes it, but a distribution that has
+converted one real machine is further along than one that has produced an image
+nobody has booted.
+
+### Why XLibre and not Xorg — superseded, retained for its reasoning
 
 This is the load-bearing justification for choosing X11 in 2026. Xorg upstream
 has become effectively unmaintained — major releases stopped and even bugfix
@@ -54,12 +105,14 @@ carries at least two entries — newest and last-known-good.** See §3.
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│  HadalOS Shell (C#/Avalonia)                                 │
-│  panel · launcher · settings · Hadal overlay (hotkey)       │
+│  Shell clients (Rust/iced, layer-shell)                     │
+│  cusk-dock · cusk-launcher · cusk-settings                  │
 ├─────────────────────────────────────────────────────────────┤
-│  hadalwm (Rust/x11rb)          │  hadalos-greeter (greetd)  │
+│  cusk (Rust/smithay)           │  SDDM  (greetd: intended)  │
+│  compositor · panel · tiling   │                            │
+│  and floating · XWayland       │                            │
 ├─────────────────────────────────┴───────────────────────────┤
-│  XLibre X server                                            │
+│  Wayland  ·  wlr-layer-shell  ·  xdg-shell  ·  dmabuf       │
 ├─────────────────────────────────────────────────────────────┤
 │  D-Bus system bus                                           │
 │     org.hadal.Broker1  ←── the OS-component boundary        │
@@ -67,9 +120,10 @@ carries at least two entries — newest and last-known-good.** See §3.
 │  hadal-brokerd (Rust/zbus)   ── policy · capabilities       │
 │       │                          polkit-gated execution     │
 │       ↓                                                     │
-│  hadald  ── model host (Ollama), sandboxed, resource-capped │
+│  hadald  ── model host, unprivileged, resource-capped       │
 │       ↓                                                     │
-│  reflex model (1–3B, resident) │ deep model (on demand/LAN) │
+│  reflex model (1–3B, resident)  ── INTENDED, not built      │
+│  deep model  ── today a REMOTE endpoint, not LAN, not local │
 ├─────────────────────────────────────────────────────────────┤
 │  systemd · Portage · mainline kernel · Limine               │
 └─────────────────────────────────────────────────────────────┘

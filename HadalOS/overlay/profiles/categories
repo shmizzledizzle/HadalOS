@@ -1,6 +1,9 @@
+acct-group
+acct-user
+app-admin
+app-misc
+gui-apps
+gui-wm
+sys-apps
 sys-boot
 sys-kernel
-sys-apps
-gui-wm
-gui-apps
-app-misc

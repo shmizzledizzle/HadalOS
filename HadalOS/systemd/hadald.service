@@ -6,7 +6,21 @@ Before=hadal-brokerd.service
 
 [Service]
 Type=exec
-ExecStart=/usr/bin/hadald --serve --config /etc/hadal/hadald.toml
+# hadald has no --config flag. It never did: config.rs parses arguments with a
+# closed match whose fallback is `unknown argument: {other}`, so the previous
+# ExecStart here — `--serve --config /etc/hadal/hadald.toml` — exited with a
+# usage error before opening a socket. The unit was written before the daemon
+# and the two had never been started together.
+#
+# The model id is the one setting that genuinely varies per machine, so it comes
+# from an environment file rather than being baked in. The key deliberately does
+# not: it stays a file with an owner and a mode, because a process environment is
+# readable through /proc/<pid>/environ, is inherited by children, and appears in
+# `systemctl show`.
+EnvironmentFile=/etc/hadal/hadald.env
+ExecStart=/usr/bin/hadald --serve --model ${HADAL_MODEL} \
+    --key-file /etc/hadal/upstream.key \
+    --egress-log /var/log/hadal/egress.log
 Restart=on-failure
 RestartSec=2s
 
@@ -14,6 +28,17 @@ User=hadal
 Group=hadal
 StateDirectory=hadal
 ConfigurationDirectory=hadal
+# ProtectSystem=strict below makes /var read-only, so --egress-log would fail
+# to open a path that plainly exists. LogsDirectory creates /var/log/hadal with
+# the right owner AND punches it through the read-only mount; ReadWritePaths on
+# its own would do the second without the first.
+#
+# This is the boot layer's finding again — "ReadWritePaths= must name the same
+# boot root the service actually writes to, or ProtectSystem=strict silently
+# blocks the write" — and the egress log is the worst possible place to
+# rediscover it, because a privacy record that silently fails to open is
+# indistinguishable from one with nothing to report.
+LogsDirectory=hadal
 # Models are large and immutable once pulled.
 Environment=HADAL_MODELS=/var/lib/hadal/models
 

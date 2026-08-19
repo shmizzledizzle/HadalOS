@@ -1,0 +1,15 @@
+NAME="HadalOS"
+ID=hadalos
+# Everything underneath is still Gentoo — Portage, the profiles, the ebuild
+# tree, `emerge`. Tools that branch on distribution should take the Gentoo
+# path, and ID_LIKE is how they are told to. Dropping this does not produce an
+# error, it produces tools that quietly stop recognising the system.
+ID_LIKE=gentoo
+PRETTY_NAME="HadalOS"
+VERSION="0.1 (foundation)"
+VERSION_ID="0.1"
+# The cyan in cusk::theme::ACCENT (#11C1C6), as close as a terminal gets.
+ANSI_COLOR="1;36"
+HOME_URL="https://github.com/shmizzledizzle/HadalOS"
+SUPPORT_URL="https://github.com/shmizzledizzle/HadalOS"
+BUG_REPORT_URL="https://github.com/shmizzledizzle/HadalOS/issues"

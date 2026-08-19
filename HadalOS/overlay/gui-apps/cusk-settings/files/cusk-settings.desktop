@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=HadalOS Settings
+Comment=Configure the Cusk compositor
+Exec=cusk-settings
+Icon=preferences-desktop
+Type=Application
+Categories=Settings;DesktopSettings;
+Keywords=cusk;compositor;wayland;tiling;
+OnlyShowIn=HadalOS;
