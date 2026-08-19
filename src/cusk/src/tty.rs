@@ -1116,7 +1116,6 @@ pub fn libinput_for(session: &LibSeatSession, seat: &str) -> Result<input::Libin
 /// What draining libinput produced.
 #[derive(Default)]
 pub struct Input {
-    pub escape: bool,
     /// Key presses and releases, as evdev codes.
     pub keys: Vec<(u32, bool)>,
     /// Accumulated pointer movement since the last drain.
@@ -1151,9 +1150,12 @@ pub fn drain(libinput: &mut input::Libinput) -> Input {
         match event {
             Event::Keyboard(KeyboardEvent::Key(key)) => {
                 let pressed = key.key_state() == input::event::keyboard::KeyState::Pressed;
-                if pressed && key.key() == KEY_ESC {
-                    out.escape = true;
-                }
+                // Escape is no longer decided here. Modifier state has to
+                // survive between drains — libinput can deliver the Ctrl press
+                // and the Escape press in different batches — and `Chord`
+                // already holds exactly that state for the VT switch. Tracking
+                // it a second time in this function would be a copy that is
+                // correct only while both stay in step.
                 out.keys.push((key.key(), pressed));
             }
             Event::Pointer(PointerEvent::Motion(motion)) => {
@@ -1328,9 +1330,32 @@ pub struct Chord {
     alt: bool,
 }
 
+/// What a completed Ctrl+Alt chord asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Chorded {
+    /// Ctrl+Alt+F<n> — hand the display to another VT.
+    SwitchVt(i32),
+    /// Ctrl+Alt+Escape — end the session.
+    ///
+    /// This was a **bare** Escape until 2026-08-19, and that was right for what
+    /// it was written for: a time-boxed run from a VT, which needs one obvious
+    /// way out and has no clients that care.
+    ///
+    /// It is wrong for a login session. Every client uses Escape — vim, a
+    /// browser dialog, a file chooser — and on Wayland a compositor exiting
+    /// takes every client with it. Bare Escape meant one keystroke, in the
+    /// most reflexive place a user can put it, destroying the session and all
+    /// unsaved work in it.
+    ///
+    /// The modifiers match the VT switch beside it, so both are the chord a
+    /// user's hands already read as "talk to the session, not the
+    /// application".
+    Exit,
+}
+
 impl Chord {
-    /// Feed a key. Returns the VT to switch to, if this completes the chord.
-    pub fn key(&mut self, code: u32, pressed: bool) -> Option<i32> {
+    /// Feed a key. Returns what the chord asks for, if this completes one.
+    pub fn key(&mut self, code: u32, pressed: bool) -> Option<Chorded> {
         match code {
             KEY_LEFTCTRL | KEY_RIGHTCTRL => {
                 self.ctrl = pressed;
@@ -1342,7 +1367,12 @@ impl Chord {
             }
             // On press only. Acting on the release as well would switch away
             // and immediately back.
-            code if pressed && self.ctrl && self.alt => vt_for_key(code),
+            //
+            // Escape lives here rather than in `drain` for the reason the
+            // struct exists at all: the modifiers have to be remembered across
+            // drains, and this is where they are remembered.
+            KEY_ESC if pressed && self.ctrl && self.alt => Some(Chorded::Exit),
+            code if pressed && self.ctrl && self.alt => vt_for_key(code).map(Chorded::SwitchVt),
             _ => None,
         }
     }
@@ -1422,6 +1452,61 @@ mod tests {
     fn the_far_edge_stays_clickable() {
         let at = super::clamp_pointer((0.0, 0.0), (9999.0, 9999.0), (1920, 1080));
         assert_eq!(at, (1919.0, 1079.0));
+    }
+
+    /// The property this guards is destructive and one keystroke away: a bare
+    /// Escape used to end the session, and on Wayland that takes every client
+    /// and everything unsaved in them. Escape is also the single most
+    /// reflexively pressed key there is.
+    #[test]
+    fn a_bare_escape_does_not_end_the_session() {
+        let mut chord = super::Chord::default();
+        assert_eq!(chord.key(super::KEY_ESC, true), None);
+        assert_eq!(chord.key(super::KEY_ESC, false), None);
+    }
+
+    /// Each modifier alone is still not enough, or the chord is one accident
+    /// away from the thing it replaced.
+    #[test]
+    fn one_modifier_is_not_enough_to_end_the_session() {
+        let mut ctrl_only = super::Chord::default();
+        ctrl_only.key(super::KEY_LEFTCTRL, true);
+        assert_eq!(ctrl_only.key(super::KEY_ESC, true), None);
+
+        let mut alt_only = super::Chord::default();
+        alt_only.key(super::KEY_LEFTALT, true);
+        assert_eq!(alt_only.key(super::KEY_ESC, true), None);
+    }
+
+    #[test]
+    fn ctrl_alt_escape_ends_the_session() {
+        let mut chord = super::Chord::default();
+        chord.key(super::KEY_LEFTCTRL, true);
+        chord.key(super::KEY_LEFTALT, true);
+        assert_eq!(chord.key(super::KEY_ESC, true), Some(super::Chorded::Exit));
+    }
+
+    /// Releasing a modifier disarms it. Otherwise the chord stays armed after
+    /// the user lets go, and a later bare Escape ends the session — which is
+    /// the original bug wearing a delay.
+    #[test]
+    fn releasing_a_modifier_disarms_the_exit() {
+        let mut chord = super::Chord::default();
+        chord.key(super::KEY_LEFTCTRL, true);
+        chord.key(super::KEY_LEFTALT, true);
+        chord.key(super::KEY_LEFTALT, false);
+        assert_eq!(chord.key(super::KEY_ESC, true), None);
+    }
+
+    /// Exit and VT switching share the modifiers, so neither may shadow the
+    /// other: Ctrl+Alt+F2 must still switch once Escape is in the same match.
+    #[test]
+    fn the_exit_chord_does_not_shadow_a_vt_switch() {
+        let mut chord = super::Chord::default();
+        chord.key(super::KEY_LEFTCTRL, true);
+        chord.key(super::KEY_LEFTALT, true);
+        // 60 is F2; the file defines only F1/F10/F11/F12 as constants.
+        assert_eq!(chord.key(60, true), Some(super::Chorded::SwitchVt(2)));
     }
 
     #[test]
@@ -1545,7 +1630,7 @@ mod tests {
         assert_eq!(chord.key(59, true), None, "ctrl alone");
 
         chord.key(56, true);
-        assert_eq!(chord.key(59, true), Some(1), "ctrl+alt+F1");
+        assert_eq!(chord.key(59, true), Some(super::Chorded::SwitchVt(1)), "ctrl+alt+F1");
     }
 
     /// Releasing a modifier disarms it, or the chord stays live for the rest
@@ -1555,7 +1640,7 @@ mod tests {
         let mut chord = super::Chord::default();
         chord.key(29, true);
         chord.key(56, true);
-        assert_eq!(chord.key(60, true), Some(2));
+        assert_eq!(chord.key(60, true), Some(super::Chorded::SwitchVt(2)));
 
         chord.key(56, false);
         assert_eq!(chord.key(60, true), None, "alt released");
@@ -1567,7 +1652,7 @@ mod tests {
         let mut chord = super::Chord::default();
         chord.key(29, true);
         chord.key(56, true);
-        assert_eq!(chord.key(59, true), Some(1));
+        assert_eq!(chord.key(59, true), Some(super::Chorded::SwitchVt(1)));
         assert_eq!(chord.key(59, false), None, "release must do nothing");
     }
 
@@ -1577,7 +1662,7 @@ mod tests {
         let mut chord = super::Chord::default();
         chord.key(97, true);
         chord.key(100, true);
-        assert_eq!(chord.key(61, true), Some(3));
+        assert_eq!(chord.key(61, true), Some(super::Chorded::SwitchVt(3)));
     }
 
     #[test]

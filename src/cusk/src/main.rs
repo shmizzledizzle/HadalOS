@@ -1660,7 +1660,10 @@ fn run_on_tty(
     let deadline = (seconds > 0).then(|| start + std::time::Duration::from_secs(seconds));
 
     let outcome = (|| -> Result<(), Box<dyn std::error::Error>> {
-        while deadline.is_none_or(|deadline| std::time::Instant::now() < deadline) {
+        // Labelled because the exit chord is recognised inside the per-key
+        // loop, and an unlabelled break there would leave the session running
+        // having only stopped reading the rest of that batch of keys.
+        'session: while deadline.is_none_or(|deadline| std::time::Instant::now() < deadline) {
             // Zero timeout: this is a poll inside the render loop, not the
             // loop itself.
             session_events.dispatch(Some(std::time::Duration::ZERO), &mut active)?;
@@ -1687,9 +1690,6 @@ fn run_on_tty(
             }
 
             let input = tty::drain(&mut libinput);
-            if input.escape {
-                break;
-            }
 
             let time = start.elapsed().as_millis() as u32;
             for (code, pressed) in input.keys {
@@ -1698,15 +1698,23 @@ fn run_on_tty(
                 // Ctrl+Alt+F<n>, so a compositor that does not implement it
                 // traps the user on its VT — which is what happened on the
                 // first unbounded run.
-                if let Some(vt) = chord.key(code, pressed) {
-                    tracing::info!("switching to VT {vt}");
-                    if let Err(e) = smithay::backend::session::Session::change_vt(&mut session, vt)
-                    {
-                        tracing::warn!("could not switch to VT {vt}: {e}");
+                match chord.key(code, pressed) {
+                    Some(tty::Chorded::SwitchVt(vt)) => {
+                        tracing::info!("switching to VT {vt}");
+                        if let Err(e) =
+                            smithay::backend::session::Session::change_vt(&mut session, vt)
+                        {
+                            tracing::warn!("could not switch to VT {vt}: {e}");
+                        }
+                        // Not forwarded. A client receiving the F-key as well
+                        // would act on it while the screen is being handed away.
+                        continue;
                     }
-                    // Not forwarded. A client receiving the F-key as well would
-                    // act on it while the screen is being handed away.
-                    continue;
+                    Some(tty::Chorded::Exit) => {
+                        tracing::info!("Ctrl+Alt+Escape — ending the session");
+                        break 'session;
+                    }
+                    None => {}
                 }
 
                 // The same table the winit driver uses, so a binding cannot
