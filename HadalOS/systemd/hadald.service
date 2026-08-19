@@ -1,0 +1,86 @@
+[Unit]
+Description=Hadal model host
+Documentation=https://github.com/shmizzledizzle/HadalOS
+After=network.target
+Before=hadal-brokerd.service
+
+[Service]
+Type=exec
+ExecStart=/usr/bin/hadald --serve --config /etc/hadal/hadald.toml
+Restart=on-failure
+RestartSec=2s
+
+User=hadal
+Group=hadal
+StateDirectory=hadal
+ConfigurationDirectory=hadal
+# Models are large and immutable once pulled.
+Environment=HADAL_MODELS=/var/lib/hadal/models
+
+# ── Resource ceiling ───────────────────────────────────────────────────
+# The assistant is a feature of the desktop, not a claimant against it. A
+# model host that can OOM your session is a model host that will, on the day
+# you most need the session. These are ceilings, not reservations.
+MemoryMax=60%
+MemoryHigh=45%
+CPUWeight=20
+IOWeight=20
+# Never let inference win a scheduling fight against interactive work.
+Nice=10
+OOMPolicy=stop
+OOMScoreAdjust=500
+
+# ── Isolation ──────────────────────────────────────────────────────────
+# hadald holds the model and nothing else. It has no privilege, no route to
+# the filesystem, and — critically — no network. HadalOS's claim that the
+# assistant is local is enforced by the kernel here, not by a promise in a
+# README.
+#
+# hadal-brokerd sets JoinsNamespaceOf=hadald.service, so the two share this
+# private namespace and reach each other over loopback while remaining
+# unable to reach anything else.
+#
+# Running a deep model on another machine (Hadal's deepHost) is incompatible
+# with this as written. The intended path is NOT to drop PrivateNetwork, but
+# to add a systemd-socket-proxyd unit in the host namespace pinned to exactly
+# one upstream address — so egress stays limited to one host by unit
+# configuration rather than by trusting the daemon. Until that exists, a
+# LAN deep host requires a documented, deliberate drop-in.
+PrivateNetwork=yes
+IPAddressDeny=any
+
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateUsers=yes
+ProtectProc=invisible
+ProcSubset=pid
+ProtectClock=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=no
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+# GPU access for ROCm/RDNA4. PrivateDevices=yes masks these, so they are
+# re-added explicitly — an allowlist of two nodes rather than a blanket
+# unmask.
+DeviceAllow=/dev/kfd rw
+DeviceAllow=char-drm rw
+SupplementaryGroups=video render
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,52 @@
+#!/bin/bash
+# hadalos-mark-boot-good — record the running kernel as last known good.
+#
+# Run late in boot by hadalos-mark-boot-good.service. Without this, the
+# fallback entry in limine.conf is a guess; with it, "last known good"
+# literally means "this kernel reached a usable system at least once."
+#
+# Deliberately conservative: a boot that came up degraded is not proof the
+# kernel is fine, so we decline to promote it. Better to keep pointing at an
+# older kernel we trust than to overwrite the escape hatch.
+
+set -euo pipefail
+
+LASTGOOD_FILE="/etc/hadalos/lastgood"
+RUNNING="$(uname -r)"
+BOOT_ROOT="${KERNEL_INSTALL_BOOT_ROOT:-/boot}"
+
+log() { printf 'hadalos-mark-boot-good: %s\n' "$*" >&2; }
+
+# is-system-running exits non-zero for degraded, which we want to inspect
+# rather than die on.
+state="$(systemctl is-system-running 2>/dev/null || true)"
+
+case "$state" in
+running)
+    ;;
+degraded)
+    log "system is degraded; not promoting $RUNNING to last known good"
+    exit 0
+    ;;
+*)
+    log "system state is '$state'; not promoting $RUNNING"
+    exit 0
+    ;;
+esac
+
+if [[ ! -e $BOOT_ROOT/hadalos/$RUNNING/vmlinuz ]]; then
+    log "running kernel $RUNNING is not in the HadalOS boot layout; nothing to record"
+    exit 0
+fi
+
+if [[ -r $LASTGOOD_FILE ]] && [[ "$(tr -d '[:space:]' <"$LASTGOOD_FILE")" == "$RUNNING" ]]; then
+    exit 0
+fi
+
+install -d -m 0755 "$(dirname "$LASTGOOD_FILE")"
+printf '%s\n' "$RUNNING" >"$LASTGOOD_FILE.tmp"
+mv "$LASTGOOD_FILE.tmp" "$LASTGOOD_FILE"
+log "recorded $RUNNING as last known good"
+
+# Relabel the menu so the entry reflects the new pin.
+command -v hadalos-limine-update >/dev/null 2>&1 && hadalos-limine-update || true

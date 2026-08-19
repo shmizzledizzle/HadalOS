@@ -1,0 +1,157 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC
+ "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<!--
+  Capability policy for hadal-brokerd.
+
+  Every capability Hadal can exercise is a distinct polkit action. That is
+  deliberate: it means the Settings surface can offer per-capability
+  allow / ask / never without inventing a parallel policy store, and it means
+  a site admin can lock any single capability down with a standard polkit rule
+  file instead of patching HadalOS.
+
+  Tiers (see ARCHITECTURE.md §2.3):
+    Read     — allow for the active local session
+    Inspect  — allow for the active local session, no side effects
+    Mutate   — auth_admin, every time, never retained
+    Egress   — deny by default
+
+  Note on `allow_active` for the Read tier: these actions expose system state
+  to a *local, active* session that could already read most of it directly.
+  The gate that matters is not "may Hadal read the journal" but "may Hadal
+  change anything" — and that is uniformly auth_admin below.
+-->
+<policyconfig>
+
+  <vendor>HadalOS</vendor>
+  <vendor_url>https://github.com/shmizzledizzle/HadalOS</vendor_url>
+  <icon_name>hadalos-hadal</icon_name>
+
+  <!-- ══ Read tier ═════════════════════════════════════════════════════ -->
+
+  <action id="org.hadal.broker.read-journal">
+    <description>Let Hadal read the system journal</description>
+    <message>Hadal needs to read the system journal to diagnose this.</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>yes</allow_active>
+    </defaults>
+  </action>
+
+  <action id="org.hadal.broker.read-portage-log">
+    <description>Let Hadal read Portage build logs</description>
+    <message>Hadal needs to read the build log to explain this failure.</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>yes</allow_active>
+    </defaults>
+  </action>
+
+  <!--
+    Constrained by prefix allowlist in the broker, not by polkit. The policy
+    question is "may Hadal read files at all"; *which* files is a broker
+    concern, because polkit cannot express path scoping.
+  -->
+  <action id="org.hadal.broker.read-path">
+    <description>Let Hadal read files you point it at</description>
+    <message>Hadal needs to read this file.</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>yes</allow_active>
+    </defaults>
+  </action>
+
+  <action id="org.hadal.broker.query-package">
+    <description>Let Hadal query installed packages</description>
+    <message>Hadal needs to look up package information.</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>yes</allow_active>
+    </defaults>
+  </action>
+
+  <!-- ══ Inspect tier ══════════════════════════════════════════════════ -->
+
+  <action id="org.hadal.broker.unit-status">
+    <description>Let Hadal inspect service status</description>
+    <message>Hadal needs to check the status of a system service.</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>yes</allow_active>
+    </defaults>
+  </action>
+
+  <!-- emerge in pretend mode: resolves, changes nothing.
+       (Note for editors: XML forbids a double hyphen inside a comment. Writing
+       the flag out literally here silently truncated this file at parse time,
+       and polkit dropped every action below it.) -->
+  <action id="org.hadal.broker.emerge-pretend">
+    <description>Let Hadal simulate a package operation</description>
+    <message>Hadal needs to work out what a package change would do.</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>yes</allow_active>
+    </defaults>
+  </action>
+
+  <!-- ══ Mutate tier ═══════════════════════════════════════════════════
+       auth_admin, not auth_admin_keep. Authorization is never retained:
+       each mutating action is confirmed on its own merits, because the
+       proposal that follows the one you approved is not the one you saw.
+  -->
+
+  <action id="org.hadal.broker.restart-unit">
+    <description>Let Hadal restart a system service</description>
+    <message>Hadal wants to restart a system service.</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+  </action>
+
+  <action id="org.hadal.broker.emerge-apply">
+    <description>Let Hadal install or remove packages</description>
+    <message>Hadal wants to change installed packages.</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+  </action>
+
+  <action id="org.hadal.broker.write-config">
+    <description>Let Hadal change a system configuration setting</description>
+    <message>Hadal wants to change a system configuration setting.</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+  </action>
+
+  <!-- ══ Egress tier ═══════════════════════════════════════════════════
+       HadalOS's premise is that the assistant is local. Network egress is
+       therefore off unless the user turns it on, and hadald runs with
+       PrivateNetwork=yes until it is.
+  -->
+
+  <action id="org.hadal.broker.network-lookup">
+    <description>Let Hadal look things up online</description>
+    <message>Hadal wants to search online documentation. This is the only
+    point at which anything leaves your machine.</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_self</allow_active>
+    </defaults>
+  </action>
+
+</policyconfig>

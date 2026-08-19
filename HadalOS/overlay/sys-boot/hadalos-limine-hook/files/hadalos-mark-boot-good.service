@@ -1,0 +1,42 @@
+[Unit]
+Description=Record the running kernel as last known good
+Documentation=man:hadalos-limine-update(8)
+# Deliberately NOT WantedBy=multi-user.target, and deliberately not ordered
+# After= it either. Started by hadalos-mark-boot-good.timer instead.
+#
+# The obvious construction — After=multi-user.target plus
+# WantedBy=multi-user.target plus a sleep — cannot work. Such a unit is part
+# of the boot transaction, so `systemctl is-system-running` reports "starting"
+# for as long as it runs, and the script's own check refuses to promote. The
+# system cannot finish booting until this unit exits, and this unit refuses to
+# act until the system has finished booting. Measured on hardware: the refusal
+# was logged 1.2 ms before "Startup finished".
+#
+# A timer takes it out of the transaction entirely, and removes the minute the
+# ExecStartPre sleep used to add to every boot.
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/hadalos-mark-boot-good
+RemainAfterExit=no
+
+# hadalos-mark-boot-good derives its boot root from this, exactly as the
+# kernel-install plugin does. Without it the script defaults to /boot, finds no
+# kernel there on an ESP-at-/efi machine, and exits 0 having recorded nothing.
+# Set by the installer to match KERNEL_INSTALL_BOOT_ROOT.
+Environment=KERNEL_INSTALL_BOOT_ROOT=/boot
+
+# Touches exactly one file plus the generated bootloader config. ReadWritePaths
+# must name the same boot root as the Environment above.
+ProtectSystem=strict
+ReadWritePaths=/etc/hadalos /boot
+ProtectHome=yes
+PrivateNetwork=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM

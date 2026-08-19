@@ -1,0 +1,7 @@
+# Limine needs both firmware paths: the ISO boots on UEFI machines and on the
+# older hardware people actually reach for when testing a new distribution.
+sys-boot/limine binary bios efi64
+
+# installkernel drives our Limine hook via kernel-install, which is the
+# systemd-style layout rather than the Debian-style postinst.d one.
+sys-kernel/installkernel systemd dracut

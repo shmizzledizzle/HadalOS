@@ -1,0 +1,21 @@
+[Unit]
+Description=Record the running kernel as last known good, once boot has settled
+Documentation=man:hadalos-limine-update(8)
+
+# Only meaningful once the system has settled far enough that "it booted" is a
+# claim worth making. This is the condition the service used to carry; it
+# belongs on the timer so a machine without the HadalOS boot layout never even
+# schedules the job.
+ConditionPathExists=/boot/hadalos
+
+[Timer]
+# Comfortably past the point where the boot transaction completes, so that
+# `systemctl is-system-running` can return "running" rather than "starting".
+# The service is not part of that transaction, so this delay costs nothing —
+# unlike the ExecStartPre=sleep 60 it replaces, which added a full minute to
+# every boot while still never seeing a settled system.
+OnBootSec=90s
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

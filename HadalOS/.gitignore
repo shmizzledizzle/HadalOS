@@ -1,0 +1,34 @@
+# Build output
+/build/
+/out/
+*.iso
+*.img
+*.tar.xz
+*.tar.gz
+
+# Rust
+target/
+**/*.rs.bk
+Cargo.lock.orig
+
+# .NET
+bin/
+obj/
+*.user
+
+# Portage-generated metadata (thin manifests are committed; caches are not)
+overlay/metadata/md5-cache/
+overlay/metadata/pkg_desc_index
+overlay/metadata/timestamp*
+
+# Per-machine state — must never sync. Same rule as the Hadal repo:
+# a tracked template lives beside each of these.
+/local.conf
+/scripts/local/
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+.DS_Store

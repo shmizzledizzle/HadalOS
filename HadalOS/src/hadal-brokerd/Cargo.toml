@@ -1,0 +1,30 @@
+[package]
+name = "hadal-brokerd"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "HadalOS capability broker — org.hadal.Broker1"
+
+[dependencies]
+zbus.workspace = true
+zvariant.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+futures-util.workspace = true
+tracing.workspace = true
+
+tokio = { version = "1", features = [
+    "rt-multi-thread", "macros", "process", "time", "sync", "io-util", "signal",
+] }
+getrandom = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# default-features = false drops TLS entirely. This daemon speaks plaintext
+# HTTP to 127.0.0.1 inside a network namespace with no route out; linking a
+# TLS stack into the privileged component would add attack surface it has no
+# use for.
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }
+
+[dev-dependencies]
+tempfile = "3"

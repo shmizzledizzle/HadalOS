@@ -1,6 +1,9 @@
-# Upstream desktop repo, vendored here for reference only. It has its own
-# history and is not built by this project — see ARCHITECTURE.md §6.
-/HadalOS/
+# HadalOS/ was ignored here on the premise that it was a vendored copy of a
+# repo that "has its own history". It has no .git, this repo has no remote,
+# and there is no second copy on disk — so the premise was false and the
+# desktop broker, the CLI, the ebuilds installed on this machine, the D-Bus
+# and polkit policy, the units and the catalyst specs were all unversioned.
+# A `git clean -xfd` would have deleted them. It is tracked now.
 
 # Rust
 target/

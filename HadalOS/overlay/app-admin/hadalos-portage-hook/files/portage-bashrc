@@ -1,0 +1,16 @@
+# /etc/portage/bashrc — HadalOS
+#
+# Portage has no bashrc.d convention of its own; this establishes one, so that
+# HadalOS can ship a hook without owning a file admins routinely edit. Add your
+# own snippets as /etc/portage/bashrc.d/*.bashrc — they are sourced in sorted
+# order, and this file can then be replaced by an update without touching them.
+#
+# Sourced for EVERY ebuild phase of EVERY package. Keep it cheap.
+
+if [[ -d /etc/portage/bashrc.d ]]; then
+    for _hadalos_snippet in /etc/portage/bashrc.d/*.bashrc; do
+        # The glob is literal when nothing matches.
+        [[ -r $_hadalos_snippet ]] && source "$_hadalos_snippet"
+    done
+    unset _hadalos_snippet
+fi
