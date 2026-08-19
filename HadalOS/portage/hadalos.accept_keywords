@@ -1,0 +1,52 @@
+# HadalOS live packages.
+#
+# Copy to /etc/portage/package.accept_keywords/hadalos (a file, in the
+# directory form — Portage accepts either, and the directory form is what lets
+# this be dropped in and removed as a unit).
+#
+# These carry KEYWORDS="" rather than ~amd64, which is not an oversight. A
+# keyworded live ebuild gets pulled in by ordinary dependency resolution and
+# rebuilt from a moving target without anyone asking for it. Empty keywords
+# mean a live package is installed only because someone named it, and `**` is
+# how that opt-in is spelled — it is the one accept_keywords value that matches
+# a package with no keywords at all, so ~amd64 here would do nothing.
+#
+# The consequence to know about: `emerge -uDN @world` will happily rebuild all
+# of these from whatever is committed at that moment. That is the intended
+# behaviour of a live ebuild and the reason these are separated from the
+# versioned packages below.
+
+# The compositor and its shell.
+gui-wm/cusk **
+gui-apps/cusk-dock **
+gui-apps/cusk-launcher **
+gui-apps/cusk-settings **
+
+# The assistant.
+sys-apps/hadal-brokerd **
+sys-apps/hadald **
+
+# The versioned HadalOS packages are ~amd64 and need the usual accept, if the
+# system is not already accepting ~amd64 globally.
+sys-apps/hadalos-release ~amd64
+sys-boot/hadalos-limine-hook ~amd64
+app-admin/hadalos-portage-hook ~amd64
+acct-user/hadal ~amd64
+acct-group/hadal ~amd64
+
+# The kernel. Deliberately NOT pulled in by any metapackage: this laptop boots
+# gentoo-kernel-bin through the HadalOS Limine layout, and switching it to
+# mainline-tip is a decision about this machine's kernel, not part of becoming
+# HadalOS. sys-kernel/hadalos-kernel has never been built — see the README's
+# status table — so accepting it here makes it installable on purpose and
+# nothing more.
+sys-kernel/hadalos-kernel ~amd64
+sys-kernel/hadalos-kernel **
+
+# The metapackages. hadalos-desktop, hadalos-assistant and hadalos pull in live
+# packages, so they carry empty keywords too rather than implying a stability
+# their dependencies do not have.
+app-misc/hadalos-base ~amd64
+app-misc/hadalos-desktop **
+app-misc/hadalos-assistant **
+app-misc/hadalos **

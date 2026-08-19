@@ -124,6 +124,37 @@ than the truth.
 
 ---
 
+## 0b. The live packages have to be accepted
+
+Six of the packages are `-9999` live ebuilds and carry `KEYWORDS=""`. Portage
+reports them as
+
+```
+!!! All ebuilds that could satisfy "gui-wm/cusk" have been masked.
+```
+
+which reads like a policy decision somewhere in the profile rather than a
+missing line in this repo. Empty keywords are deliberate: a keyworded live
+ebuild gets pulled into ordinary dependency resolution and rebuilt from a
+moving target without anyone asking for it.
+
+```bash
+sudo install -d /etc/portage/package.accept_keywords
+sudo install -m 0644 HadalOS/portage/hadalos.accept_keywords \
+                     /etc/portage/package.accept_keywords/hadalos
+```
+
+`**` is the only accept_keywords value that matches a package with no keywords
+at all — `~amd64` on a live ebuild silently matches nothing and looks exactly
+like not having listed it. `scripts/test-overlay.sh` asserts both that every
+package in the overlay appears in that file and that every live one is
+accepted with `**`; it caught `sys-kernel/hadalos-kernel` missing from the list
+on its first run.
+
+Know what this signs up for: **`emerge -uDN @world` will rebuild all six from
+whatever is committed at that moment.** That is what a live ebuild is, and it
+is the reason to cut versioned ebuilds before anyone else installs this.
+
 ## 1. Identity
 
 ```bash

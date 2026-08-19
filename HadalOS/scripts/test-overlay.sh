@@ -110,6 +110,25 @@ for f in ${ebuilds}; do
 	fi
 done
 
+head "every package is listed in portage/hadalos.accept_keywords"
+# A package in this overlay is unusable until it is accepted, and the failure
+# is "All ebuilds that could satisfy X have been masked" — which reads as a
+# Portage policy decision rather than as a file in this repo missing a line.
+# Live ebuilds specifically need `**`; `~amd64` matches nothing on a package
+# with no keywords, so getting this wrong looks identical to not listing it.
+accept="portage/hadalos.accept_keywords"
+for f in ${ebuilds}; do
+	atom=$(dirname "${f#"${overlay}"/}")
+	line=$(grep -E "^${atom//\//\\/}[[:space:]]" "${accept}" 2>/dev/null)
+	if [[ -z ${line} ]]; then
+		bad "${atom} is not listed in ${accept}"
+	elif [[ ${f} == *-9999.ebuild ]] && [[ ${line} != *'**'* ]]; then
+		bad "${atom} is a live ebuild but is not accepted with ** (got: ${line#"${atom}" })"
+	else
+		ok "${atom}"
+	fi
+done
+
 head "metapackage dependencies resolve inside this overlay or ::gentoo"
 # A metapackage naming a package that does not exist is the failure this whole
 # layer is for: `emerge app-misc/hadalos` stops on the first missing atom and
