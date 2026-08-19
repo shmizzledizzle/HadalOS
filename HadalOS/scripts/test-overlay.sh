@@ -15,12 +15,17 @@ overlay="overlay"
 pass=0 fail=0
 ok()   { printf '  ok      %s\n' "$1"; pass=$((pass + 1)); }
 bad()  { printf '  FAIL    %s\n' "$1"; fail=$((fail + 1)); }
-head() { printf '\n%s\n' "$1"; }
+# NOT named `head`. A helper by that name shadows /usr/bin/head for the whole
+# script, and a `grep ... | head -1` inside a check then silently calls this
+# instead — consuming no stdin and printing "-1". The RUST_MIN_VER check did
+# exactly that: it compared "-1" against "-1", took the pass branch for every
+# file, and printed six confident `ok` lines while asserting nothing.
+section() { printf '\n%s\n' "$1"; }
 
 ebuilds=$(find "${overlay}" -name '*.ebuild' | sort)
 [[ -n ${ebuilds} ]] || { echo "no ebuilds under ${overlay}"; exit 1; }
 
-head "ebuilds parse as bash"
+section "ebuilds parse as bash"
 # An ebuild with a syntax error fails at metadata generation, which is loud —
 # but it fails for every package in the repo at once, which is not obvious.
 for f in ${ebuilds}; do
@@ -31,7 +36,7 @@ for f in ${ebuilds}; do
 	fi
 done
 
-head "every \${FILESDIR} reference exists"
+section "every \${FILESDIR} reference exists"
 # doins/dobin on a missing file dies, so this one is loud. It is cheap to check
 # and it is the most common edit-time mistake: renaming a file in files/ and
 # not the ebuild.
@@ -48,7 +53,7 @@ for f in ${ebuilds}; do
 	done
 done
 
-head "every category is declared in profiles/categories"
+section "every category is declared in profiles/categories"
 # An undeclared category is NOT an error. Portage simply does not see the
 # packages in it — `emerge` reports "there are no ebuilds to satisfy", which
 # reads like a typo in the atom rather than a missing line in a metadata file.
@@ -63,7 +68,7 @@ for c in $(find "${overlay}" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' \
 	fi
 done
 
-head "declared categories are not stale"
+section "declared categories are not stale"
 for c in ${declared}; do
 	if [[ -d ${overlay}/${c} ]]; then
 		ok "${c} exists"
@@ -72,7 +77,7 @@ for c in ${declared}; do
 	fi
 done
 
-head "live ebuilds declare PROPERTIES=live"
+section "live ebuilds declare PROPERTIES=live"
 # Without it Portage applies the network sandbox to src_unpack, and
 # cargo_live_src_unpack's fetch fails with a network error inside a phase that
 # is not obviously doing networking.
@@ -85,7 +90,7 @@ for f in ${ebuilds}; do
 	fi
 done
 
-head "live ebuilds are not keyworded"
+section "live ebuilds are not keyworded"
 # A keyworded live ebuild will be pulled in by a normal dependency resolution
 # and rebuilt from a moving target without anyone asking for it.
 for f in ${ebuilds}; do
@@ -97,7 +102,7 @@ for f in ${ebuilds}; do
 	fi
 done
 
-head "cargo ebuilds inherit cargo and unpack the git tree"
+section "cargo ebuilds inherit cargo and unpack the git tree"
 # cargo_live_src_unpack dies unless git-r3_src_unpack has produced ${S} first.
 # Getting this wrong fails at merge, loudly — but only for whoever merges it.
 for f in ${ebuilds}; do
@@ -110,7 +115,7 @@ for f in ${ebuilds}; do
 	fi
 done
 
-head "every package is listed in portage/hadalos.accept_keywords"
+section "every package is listed in portage/hadalos.accept_keywords"
 # A package in this overlay is unusable until it is accepted, and the failure
 # is "All ebuilds that could satisfy X have been masked" — which reads as a
 # Portage policy decision rather than as a file in this repo missing a line.
@@ -129,7 +134,27 @@ for f in ${ebuilds}; do
 	fi
 done
 
-head "metapackage dependencies resolve inside this overlay or ::gentoo"
+section "cargo ebuilds set RUST_MIN_VER, before inherit"
+# Portage emits this as a QA notice, which merges anyway. The cost lands on a
+# machine with an older rustc than a vendored crate needs: the build fails
+# mid-compile with an error naming the crate, not the toolchain requirement.
+# RUST_MIN_VER is @PRE_INHERIT — set after `inherit`, it is read too late and
+# silently does nothing, which looks exactly like setting it correctly.
+for f in ${ebuilds}; do
+	grep -q 'inherit.*cargo' "${f}" || continue
+	name=${f#"${overlay}"/}
+	minver_line=$(grep -n '^RUST_MIN_VER=' "${f}" | head -1 | cut -d: -f1)
+	inherit_line=$(grep -n '^inherit ' "${f}" | head -1 | cut -d: -f1)
+	if [[ -z ${minver_line} ]]; then
+		bad "${name} has no RUST_MIN_VER"
+	elif [[ ${minver_line} -gt ${inherit_line} ]]; then
+		bad "${name} sets RUST_MIN_VER after inherit — it is PRE_INHERIT and will be ignored"
+	else
+		ok "${name} ($(grep '^RUST_MIN_VER=' "${f}" | cut -d'"' -f2))"
+	fi
+done
+
+section "metapackage dependencies resolve inside this overlay or ::gentoo"
 # A metapackage naming a package that does not exist is the failure this whole
 # layer is for: `emerge app-misc/hadalos` stops on the first missing atom and
 # says nothing about the rest.
@@ -145,7 +170,7 @@ for f in $(find "${overlay}/app-misc" -name '*.ebuild' 2>/dev/null | sort); do
 	done
 done
 
-head "unit files referenced by ebuilds exist"
+section "unit files referenced by ebuilds exist"
 # systemd_dounit on a missing path dies. The subtler version of this bug already
 # happened here once: systemd_dounit without `inherit systemd` is a QA notice,
 # the package merges, and the unit is silently never installed.

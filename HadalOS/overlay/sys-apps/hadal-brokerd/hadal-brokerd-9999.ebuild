@@ -3,6 +3,12 @@
 
 EAPI=8
 
+# A vendored dependency requires this. Without it the ebuild builds against
+# whatever rustc the system happens to have and fails mid-compile on an older
+# one, with an error naming a crate rather than a version requirement.
+# Portage reports the needed value as a QA notice; the workspace declares the same.
+RUST_MIN_VER="1.87"
+
 inherit cargo git-r3 systemd
 
 DESCRIPTION="HadalOS capability broker (org.hadal.Broker1) and its client"

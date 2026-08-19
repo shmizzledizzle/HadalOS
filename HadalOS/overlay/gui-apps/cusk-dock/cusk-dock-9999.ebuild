@@ -3,6 +3,12 @@
 
 EAPI=8
 
+# A vendored dependency requires this. Without it the ebuild builds against
+# whatever rustc the system happens to have and fails mid-compile on an older
+# one, with an error naming a crate rather than a version requirement.
+# Portage reports the needed value as a QA notice; derived from Cargo.lock.
+RUST_MIN_VER="1.89"
+
 inherit cargo git-r3
 
 DESCRIPTION="The HadalOS dock — pinned applications and a system tray"
