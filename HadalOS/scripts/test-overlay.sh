@@ -184,5 +184,38 @@ for f in ${ebuilds}; do
 	fi
 done
 
+section "installed state matches what the ebuilds intend"
+# Only meaningful on a machine that has merged these. Skipped elsewhere rather
+# than failed, so the suite still runs on a build host.
+if [[ -e /var/db/pkg/sys-apps/hadalos-release-0.1.0 ]]; then
+	# The bug this exists for: merging a regular file over baselayout's
+	# /etc/os-release symlink does not replace it. Portage stages a ._cfg file,
+	# etc-update follows the symlink, and the content lands in
+	# /usr/lib/os-release — a baselayout-owned file in a directory that is NOT
+	# config-protected. `. /etc/os-release` reports HadalOS either way, so the
+	# only visible difference is that the next baselayout upgrade silently
+	# reverts the identity.
+	if [[ -L /etc/os-release ]]; then
+		bad "/etc/os-release is a symlink — the identity will revert on the next baselayout upgrade"
+	else
+		ok "/etc/os-release is a real file"
+	fi
+
+	if command -v md5sum >/dev/null && [[ -e /usr/lib/os-release ]]; then
+		recorded=$(grep -h '^obj /usr/lib/os-release ' /var/db/pkg/sys-apps/baselayout-*/CONTENTS 2>/dev/null \
+			| awk '{print $3}' | head -n1)
+		actual=$(md5sum /usr/lib/os-release | cut -d' ' -f1)
+		if [[ -z ${recorded} ]]; then
+			ok "baselayout does not record /usr/lib/os-release; nothing to compare"
+		elif [[ ${recorded} == "${actual}" ]]; then
+			ok "/usr/lib/os-release still matches baselayout's checksum"
+		else
+			bad "/usr/lib/os-release was modified — it belongs to baselayout and is not config-protected"
+		fi
+	fi
+else
+	ok "hadalos-release not merged here; skipping installed-state checks"
+fi
+
 printf '\n%d passed, %d failed\n' "${pass}" "${fail}"
 [[ ${fail} -eq 0 ]]

@@ -20,11 +20,12 @@ KEYWORDS="~amd64"
 # vendor identity without owning the vendor file. So this installs a real file
 # at /etc/os-release and leaves baselayout's copy untouched.
 #
-# The consequence, stated so it is not a surprise: /etc is under CONFIG_PROTECT,
-# so the file lands as /etc/._cfg0000_os-release and does nothing at all until
-# etc-update or dispatch-conf is run. pkg_postinst says so. Every future
-# baselayout upgrade will offer to put its symlink back, and declining is the
-# correct answer.
+# Getting there requires removing baselayout's symlink first — see pkg_preinst
+# for what happens if you do not, which is worse than it looks.
+#
+# Every future baselayout upgrade will offer to put its symlink back over the
+# real file. /etc is config-protected, so that arrives as a ._cfg file and a
+# prompt rather than silently; declining is the correct answer.
 RDEPEND="sys-apps/baselayout"
 
 src_install() {
@@ -32,17 +33,43 @@ src_install() {
 	doins "${FILESDIR}"/os-release
 }
 
+pkg_preinst() {
+	# Remove baselayout's symlink before merging, or this package does the
+	# opposite of what it intends.
+	#
+	# baselayout ships /etc/os-release as a symlink to ../usr/lib/os-release.
+	# Merging a regular file over it does not replace it: /etc is
+	# config-protected, Portage sees an existing file *through* the symlink,
+	# and stages ._cfg0000_os-release. etc-update then merges that — and it
+	# follows the symlink too, writing HadalOS's content into
+	# /usr/lib/os-release, which belongs to baselayout.
+	#
+	# Observed on this machine 2026-08-19. It looks like it worked, because
+	# `. /etc/os-release` reports HadalOS either way. What it actually leaves
+	# behind is a baselayout-owned file whose checksum no longer matches its
+	# CONTENTS, in /usr/lib — which is NOT in CONFIG_PROTECT. The next
+	# baselayout upgrade overwrites it with Gentoo's version, without a
+	# prompt, and the identity silently reverts.
+	#
+	# Unlinking first means there is nothing for CONFIG_PROTECT to protect, so
+	# the regular file merges directly and os-release(5) precedence — /etc
+	# wins over /usr/lib — does the rest, with each file owned by the package
+	# that ships it.
+	if [[ -L ${EROOT}/etc/os-release ]]; then
+		elog "Removing baselayout's /etc/os-release symlink so this package's"
+		elog "file can be a real file. /usr/lib/os-release is left to baselayout."
+		rm -f "${EROOT}/etc/os-release" || die
+	fi
+}
+
 pkg_postinst() {
-	elog "This package does NOT take effect on merge."
-	elog
-	elog "/etc is config-protected, so the new identity was written to"
-	elog "  /etc/._cfg0000_os-release"
-	elog "and /etc/os-release is still baselayout's symlink until you run:"
-	elog "  etc-update      (or dispatch-conf)"
-	elog "and accept the change."
-	elog
-	elog "Confirm with:"
+	elog "Confirm the identity with:"
 	elog "  . /etc/os-release && echo \"\$PRETTY_NAME (\$ID, like \$ID_LIKE)\""
+	elog
+	elog "and confirm it is a real file rather than a symlink, which is the"
+	elog "difference between an identity that survives a baselayout upgrade"
+	elog "and one that silently reverts on the next one:"
+	elog "  test -L /etc/os-release && echo WRONG || echo 'real file, correct'"
 	elog
 	elog "ID becomes 'hadalos' and ID_LIKE stays 'gentoo'. Portage does not"
 	elog "read os-release at all, so emerge is unaffected; anything that does"
