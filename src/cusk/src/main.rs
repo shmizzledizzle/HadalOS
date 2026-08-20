@@ -1608,7 +1608,7 @@ fn run_on_tty(
     println!();
     println!("  cusk on {seat_name}, {}x{}", drm.size.0, drm.size.1);
     println!("  WAYLAND_DISPLAY={socket_name}");
-    println!("  escape to quit    ctrl+alt+F1..F12 to switch terminal");
+    println!("  ctrl+alt+escape to quit    ctrl+alt+F1..F12 to switch terminal");
     if seconds > 0 {
         println!("  {seconds}s limit");
     }
@@ -1627,7 +1627,7 @@ fn run_on_tty(
     if seconds > 0 {
         drm.arm_watchdog(seconds + 3);
     } else {
-        println!("  no time limit — escape is the way out");
+        println!("  no time limit — ctrl+alt+escape is the way out");
     }
     drm.take_display();
 
