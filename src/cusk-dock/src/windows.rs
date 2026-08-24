@@ -30,7 +30,6 @@
 //! facing the other way.
 
 use std::collections::HashMap;
-use std::os::fd::FromRawFd;
 use std::sync::{Arc, Mutex};
 
 use wayland_client::protocol::wl_registry;
@@ -108,8 +107,13 @@ pub enum Request {
 /// loop rather than on the next unrelated event.
 pub struct Outbox {
     queue: Mutex<Vec<(u32, Request)>>,
-    /// Write end of the wake-up pipe.
-    waker: std::os::fd::OwnedFd,
+    /// Write end of the wake-up pipe, absent when no event thread is listening.
+    ///
+    /// `Option` rather than an invalid descriptor: `OwnedFd` is a *live* fd by
+    /// construction, and `from_raw_fd(-1)` asserts rather than building one. It
+    /// is `#[track_caller]`, so the panic reads as a bug on the line that asked
+    /// for the outbox. There is no in-band "no fd" value to reach for here.
+    waker: Option<std::os::fd::OwnedFd>,
 }
 
 impl Outbox {
@@ -120,7 +124,7 @@ impl Outbox {
     pub fn inert() -> Arc<Self> {
         Arc::new(Outbox {
             queue: Mutex::new(Vec::new()),
-            waker: unsafe { std::os::fd::OwnedFd::from_raw_fd(-1) },
+            waker: None,
         })
     }
 
@@ -131,8 +135,11 @@ impl Outbox {
         }
         // One byte, and a failure is ignored deliberately. If the pipe is full
         // the thread is already awake with work pending, which is the state the
-        // write was trying to produce.
-        let _ = rustix::io::write(&self.waker, &[1u8]);
+        // write was trying to produce. No waker means no thread to wake, and the
+        // queue is drained by nobody — inert, as documented.
+        if let Some(waker) = &self.waker {
+            let _ = rustix::io::write(waker, &[1u8]);
+        }
     }
 
     fn drain(&self) -> Vec<(u32, Request)> {
@@ -239,7 +246,7 @@ pub fn start() -> (Shared, Arc<Outbox>) {
     };
     let outbox = Arc::new(Outbox {
         queue: Mutex::new(Vec::new()),
-        waker: write_end,
+        waker: Some(write_end),
     });
     let (thread_published, thread_outbox) = (published.clone(), outbox.clone());
 
@@ -566,6 +573,21 @@ mod tests {
 
     fn encode(states: &[u32]) -> Vec<u8> {
         states.iter().flat_map(|s| s.to_ne_bytes()).collect()
+    }
+
+    /// The right-hand strip builds an inert outbox on every start, so a panic
+    /// here is not a missing taskbar — it is the whole dock gone before it maps
+    /// a surface, with `cusk` reporting only that it spawned a pid. It was:
+    /// `inert` held its waker as `OwnedFd::from_raw_fd(-1)`, and that asserts.
+    #[test]
+    fn an_inert_outbox_builds_and_swallows_a_push() {
+        let outbox = Outbox::inert();
+        outbox.push(1, Request::Activate);
+        assert_eq!(
+            outbox.drain(),
+            vec![(1, Request::Activate)],
+            "the queue still records, it is only the wake-up that goes nowhere"
+        );
     }
 
     #[test]
