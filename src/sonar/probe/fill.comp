@@ -1,0 +1,21 @@
+#version 450
+
+// Touch every page of the buffer from the GPU, with a grid-stride loop so one
+// dispatch covers an allocation of any size without exceeding
+// maxComputeWorkGroupCount.
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) buffer Data {
+    uint v[];
+};
+
+layout(push_constant) uniform P {
+    uint n;
+} p;
+
+void main() {
+    uint stride = gl_NumWorkGroups.x * 256u;
+    for (uint i = gl_GlobalInvocationID.x; i < p.n; i += stride) {
+        v[i] = i + 1u;
+    }
+}

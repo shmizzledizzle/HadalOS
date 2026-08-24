@@ -1,0 +1,31 @@
+#version 450
+
+// Saturate memory bandwidth rather than execution units. This is the contention
+// mode that matters for docs/compute.md §5: LLM inference is bandwidth-bound,
+// and on an iGPU the bandwidth in question is the same bus the display
+// controller scans out of. spin.comp deliberately tests the opposite variable.
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) buffer Data {
+    uint v[];
+};
+
+layout(push_constant) uniform P {
+    uint n;
+    uint iters;
+} p;
+
+void main() {
+    uint stride = gl_NumWorkGroups.x * 256u;
+    uint acc = 0u;
+    for (uint pass = 0u; pass < p.iters; pass++) {
+        for (uint i = gl_GlobalInvocationID.x; i < p.n; i += stride) {
+            acc += v[i];
+        }
+    }
+    // Conditional store so the reads cannot be optimised away, but which
+    // essentially never fires.
+    if (acc == 0xFFFFFFFFu) {
+        v[gl_GlobalInvocationID.x] = acc;
+    }
+}

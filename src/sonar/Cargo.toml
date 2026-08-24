@@ -1,0 +1,18 @@
+[package]
+name = "sonar"
+version = "0.1.0"
+edition = "2021"
+description = "Compute inventory for HadalOS — enumerate and print, nothing else"
+
+# Deliberately empty. docs/compute.md step 1 is "enumerate and print": read
+# sysfs, format a table. serde would be the reflex for --json and it is not
+# earned by four record types with no input parsing — the output here is
+# written by hand and the escaping is exercised by tests. A component whose
+# whole argument is dependency minimalism should not open with a dependency
+# tree it does not need.
+[dependencies]
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
