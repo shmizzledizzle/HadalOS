@@ -74,7 +74,9 @@ use smithay::reexports::wayland_server::protocol::wl_buffer;
 use smithay::reexports::wayland_server::protocol::wl_seat;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::backend::{ClientData, ClientId, DisconnectReason};
-use smithay::reexports::wayland_server::{Client, Display, ListeningSocket};
+// `Resource` for `WlSurface::id()`, which `focus_changed` needs to find the
+// client a surface belongs to.
+use smithay::reexports::wayland_server::{Client, Display, ListeningSocket, Resource};
 use smithay::utils::{Logical, Physical, Point, Rectangle, Serial, Size, Transform, SERIAL_COUNTER};
 use smithay::wayland::buffer::BufferHandler;
 use smithay::wayland::compositor::{
@@ -82,7 +84,8 @@ use smithay::wayland::compositor::{
     SurfaceAttributes, TraversalAction,
 };
 use smithay::wayland::selection::data_device::{
-    ClientDndGrabHandler, DataDeviceHandler, DataDeviceState, ServerDndGrabHandler,
+    set_data_device_focus, ClientDndGrabHandler, DataDeviceHandler, DataDeviceState,
+    ServerDndGrabHandler,
 };
 use smithay::wayland::selection::SelectionHandler;
 use smithay::desktop::{layer_map_for_output, LayerSurface};
@@ -713,7 +716,33 @@ impl SeatHandler for Cusk {
         // the reason for the second.
         self.cursor = image;
     }
-    fn focus_changed(&mut self, _seat: &Seat<Self>, _focused: Option<&WlSurface>) {}
+    /// Hand the clipboard to whoever now holds the keyboard.
+    ///
+    /// This was an empty stub, and copy/paste did not work anywhere in the
+    /// session — which reads as "the clipboard is unimplemented" and is not
+    /// what was wrong. `DataDeviceState` was constructed, the global was
+    /// advertised, `delegate_data_device!` was in place, and every client
+    /// bound `wl_data_device` successfully. The one missing piece is here.
+    ///
+    /// smithay does not infer the selection's owner from keyboard focus. A
+    /// `wl_data_device` only receives `selection` events — and a
+    /// `wl_data_offer` to read from — while its client is the seat's *data
+    /// device focus*, and nothing sets that but this call. With no client ever
+    /// focused, a copy stored a source the compositor then offered to nobody,
+    /// and a paste asked for a selection that, as far as the protocol was
+    /// concerned, did not exist. Both sides fail silently: there is no error
+    /// for "you are not focused", just an event that never arrives.
+    ///
+    /// Keyed off keyboard focus rather than pointer focus because that is what
+    /// the protocol means by focus here, and it is what makes Ctrl+V paste into
+    /// the window the keystroke went to rather than the one under the pointer.
+    fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&WlSurface>) {
+        // Resolved through the display rather than held on the surface: a
+        // client that has disconnected between losing focus and this call has
+        // no `Client` left, and `None` is the correct focus for it.
+        let client = focused.and_then(|surface| self.display.get_client(surface.id()).ok());
+        set_data_device_focus(&self.display, seat, client);
+    }
 }
 
 impl SelectionHandler for Cusk {
@@ -1534,6 +1563,22 @@ impl Cusk {
     /// - **Already-focused windows are skipped.** `focus` raises, and raising
     ///   on every motion event re-stacks the space hundreds of times a second.
     fn focus_under_pointer(&mut self, location: Point<f64, smithay::utils::Logical>) {
+        // The same test `press` makes, for the same reason. `surface_under`
+        // asks *which window*, and a layer surface is not one — so it looks
+        // straight through the launcher to whichever tile is behind it, and
+        // focusing that tile calls `release_layer_keyboard`. The panel then
+        // loses the keyboard to a window the pointer is not even over, on the
+        // first motion event after it opens.
+        //
+        // Pointer routing is unaffected — `pointer_focus` checks the layers
+        // first — so the failure is not that the launcher stops working. It
+        // stops *listening*: clicks still land and still launch things while
+        // typing goes to the tile underneath. Only reachable with
+        // focus-follows-mouse on, which is why it outlived the focus work in
+        // `grant_layer_keyboard` that was meant to fix exactly this symptom.
+        if self.layer_under_pointer().is_some() {
+            return;
+        }
         let Some((window, _, _)) = self.surface_under(location) else { return };
         if self.focused().as_ref() == Some(&window) {
             return;
