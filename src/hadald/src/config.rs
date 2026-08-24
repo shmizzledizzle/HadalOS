@@ -17,12 +17,99 @@ pub const DEFAULT_UPSTREAM: &str = "https://integrate.api.nvidia.com/v1";
 /// model built the current index.
 pub const DEFAULT_EMBED_MODEL: &str = "nvidia/nemotron-3-embed-1b";
 
+/// Whether the configured upstream is on this machine.
+///
+/// This exists because `llama-server` speaks the same OpenAI-compatible API as
+/// the remote endpoint, so hosting a model locally is a change of *address*,
+/// not of protocol. Three things then have to become conditional, and each was
+/// unconditionally wrong for a local upstream before this type existed:
+///
+/// 1. **The API key.** A local server needs none, and `read_key` refuses to
+///    start without one.
+/// 2. **The egress log.** `/var/log/hadal/egress.log` answers "what left this
+///    machine". Writing a line for a request to loopback makes it answer
+///    something else, and quietly — the failure mode this project keeps
+///    finding.
+/// 3. **The startup warning.** "This daemon sends system logs to a third
+///    party" is false when pointed at loopback, and a warning that cries wolf
+///    is a warning people learn to skip.
+///
+/// This is the mechanism `docs/tier-routing.md` needs and does not have. That
+/// document routes on whether data *must stay here*; it cannot route anywhere
+/// until there are two places to route to, and hadald has had exactly one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Locality {
+    Local,
+    Remote,
+}
+
+/// The host part of a URL, without pulling in a URL parser for one field.
+///
+/// Handles `scheme://user:pass@host:port/path` and `[::1]:port`. Returns `None`
+/// on anything it does not understand, which the caller must treat as remote.
+fn host_of(url: &str) -> Option<&str> {
+    let rest = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
+    let authority = rest.split(['/', '?', '#']).next()?;
+    // Userinfo may itself contain '@' in a password; the host is after the last.
+    let authority = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    if authority.is_empty() {
+        return None;
+    }
+    if let Some(after) = authority.strip_prefix('[') {
+        // Bracketed IPv6 literal: [::1]:11434
+        return after.split_once(']').map(|(h, _)| h).filter(|h| !h.is_empty());
+    }
+    authority.split(':').next().filter(|h| !h.is_empty())
+}
+
+impl Locality {
+    /// Derived from the upstream URL, never from a flag.
+    ///
+    /// A flag could disagree with the URL, and the URL is what decides where
+    /// the bytes actually go. `sonar`'s `contends_with_display` makes the same
+    /// choice for the same reason.
+    ///
+    /// **Unparseable, or a name that merely resolves to loopback, is treated as
+    /// remote.** A hostname in `/etc/hosts` pointing at 127.0.0.1 is classified
+    /// `Remote` here, which costs a needless key and a needless egress line —
+    /// the harmless direction. Guessing `Local` and being wrong would suppress
+    /// the record of a real egress, which is the direction that cannot be
+    /// allowed to happen silently. Same shape as tier-routing.md §4: when the
+    /// safe answer is unavailable, take the conservative one.
+    pub fn of(upstream: &str) -> Locality {
+        let Some(host) = host_of(upstream) else {
+            return Locality::Remote;
+        };
+        let host = host.to_ascii_lowercase();
+        if host == "localhost" || host.ends_with(".localhost") {
+            return Locality::Local;
+        }
+        match host.parse::<std::net::IpAddr>() {
+            Ok(ip) if ip.is_loopback() => Locality::Local,
+            _ => Locality::Remote,
+        }
+    }
+
+    pub fn is_local(self) -> bool {
+        self == Locality::Local
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Locality::Local => "local",
+            Locality::Remote => "remote",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     /// Where the broker reaches us. Loopback only, by default and by intent.
     pub listen: SocketAddr,
     /// OpenAI-compatible base URL.
     pub upstream: String,
+    /// Whether `upstream` is on this machine. Derived from it, not configured.
+    pub locality: Locality,
     /// Model id passed through to the upstream.
     pub model: String,
     /// Retrieval model for /api/embed. Separate from `model` because
@@ -150,9 +237,13 @@ impl Config {
             )));
         }
 
+        let upstream = upstream.trim_end_matches('/').to_string();
+        let locality = Locality::of(&upstream);
+
         Ok(Config {
             listen,
-            upstream: upstream.trim_end_matches('/').to_string(),
+            locality,
+            upstream,
             model,
             embed_model,
             index_dir,
@@ -232,5 +323,75 @@ mod tests {
         assert!(read_key(&empty).is_err(), "empty key must be refused");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn nvidia_default_is_remote() {
+        let c = Config::from_args(args(&["--model", "m"])).unwrap();
+        assert_eq!(c.locality, Locality::Remote);
+    }
+
+    /// The case that makes a local reflex model possible at all: llama-server
+    /// on loopback speaks the same protocol as the remote endpoint.
+    #[test]
+    fn loopback_upstreams_are_local() {
+        for url in [
+            "http://127.0.0.1:8080/v1",
+            "http://localhost:8080/v1",
+            "http://[::1]:8080/v1",
+            "http://127.1.2.3:8080/v1",
+            "https://localhost/v1",
+            "http://foo.localhost:8080/v1",
+        ] {
+            let c = Config::from_args(args(&["--model", "m", "--upstream", url])).unwrap();
+            assert_eq!(c.locality, Locality::Local, "{url} should be local");
+        }
+    }
+
+    #[test]
+    fn everything_else_is_remote() {
+        for url in [
+            "https://integrate.api.nvidia.com/v1",
+            "http://192.168.1.50:8080/v1",
+            "https://api.openai.com/v1",
+            "http://10.0.0.1/v1",
+            // Resolves to loopback in many setups, but we cannot know that
+            // without resolving, and guessing local would suppress a real
+            // egress record.
+            "http://localhost.evil.example/v1",
+        ] {
+            let c = Config::from_args(args(&["--model", "m", "--upstream", url])).unwrap();
+            assert_eq!(c.locality, Locality::Remote, "{url} should be remote");
+        }
+    }
+
+    /// A URL this code cannot parse must not be optimistically called local.
+    #[test]
+    fn unparseable_upstream_is_remote() {
+        for url in ["", "://", "http://", "http://@/v1"] {
+            assert_eq!(Locality::of(url), Locality::Remote, "{url:?} should be remote");
+        }
+    }
+
+    #[test]
+    fn userinfo_does_not_hide_the_host() {
+        // The host is after the *last* '@', so a password containing '@' or a
+        // username shaped like a hostname cannot spoof the classification.
+        assert_eq!(Locality::of("http://user:p@ss@127.0.0.1:8080/v1"), Locality::Local);
+        assert_eq!(
+            Locality::of("http://127.0.0.1@evil.example/v1"),
+            Locality::Remote,
+            "a loopback-looking username must not make a remote host local"
+        );
+    }
+
+    #[test]
+    fn host_extraction() {
+        assert_eq!(host_of("https://a.example/v1"), Some("a.example"));
+        assert_eq!(host_of("https://a.example:443/v1"), Some("a.example"));
+        assert_eq!(host_of("http://[::1]:8080/v1"), Some("::1"));
+        assert_eq!(host_of("http://[::1]"), Some("::1"));
+        assert_eq!(host_of("a.example/v1"), Some("a.example"));
+        assert_eq!(host_of("http://a.example?x=1"), Some("a.example"));
     }
 }

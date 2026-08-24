@@ -4,6 +4,7 @@ app-admin
 app-misc
 gui-apps
 gui-wm
+sci-ml
 sys-apps
 sys-boot
 sys-kernel

@@ -45,18 +45,31 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 
-use config::Config;
+use config::{Config, Locality};
 use upstream::{Delta, SseDecoder};
 
 struct Ctx {
     cfg: Config,
-    key: String,
+    /// `None` when the upstream is local — a loopback server needs no key.
+    key: Option<String>,
     http: reqwest::Client,
     /// None when no index is configured, or when loading failed. Retrieval is
     /// an enhancement, so a broken index degrades to answering without it —
     /// but loudly, because silently unretrieved is exactly the failure this
     /// index exists to prevent.
     index: Option<retrieve::Index>,
+}
+
+impl Ctx {
+    /// Attach the API key if there is one. Sending `Bearer` to a loopback
+    /// llama-server would be noise; omitting it against the remote endpoint
+    /// would be a 401.
+    fn auth(&self, rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match &self.key {
+            Some(k) => rb.bearer_auth(k),
+            None => rb,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -90,12 +103,21 @@ async fn main() -> std::process::ExitCode {
         }
     };
 
-    let key = match config::read_key(&cfg.key_file) {
-        Ok(k) => k,
-        Err(e) => {
-            eprintln!("hadald: {e}");
-            return std::process::ExitCode::FAILURE;
+    // A local upstream needs no credential, and requiring one would make the
+    // local tier impossible to run without inventing a dummy key file — which
+    // is how a real key ends up mode 0644 in someone's notes.
+    let key = match cfg.locality {
+        Locality::Local => {
+            tracing::info!("upstream is local ({}); no API key required", cfg.upstream);
+            None
         }
+        Locality::Remote => match config::read_key(&cfg.key_file) {
+            Ok(k) => Some(k),
+            Err(e) => {
+                eprintln!("hadald: {e}");
+                return std::process::ExitCode::FAILURE;
+            }
+        },
     };
 
     let index = match &cfg.index_dir {
@@ -148,17 +170,30 @@ async fn main() -> std::process::ExitCode {
         }
     };
 
+    // Say which tier is serving, unprompted. docs/tier-routing.md §5: a reader
+    // cannot tell from a model name whether it ran here or in someone else's
+    // datacentre, and locality is the part that matters.
     tracing::info!(
-        "hadald listening on {} — model {} via {}",
+        "hadald listening on {} — model {} via {} [{}]",
         cfg.listen,
         cfg.model,
-        cfg.upstream
+        cfg.upstream,
+        cfg.locality.as_str()
     );
-    if cfg.egress_log.is_none() {
-        tracing::warn!(
-            "no --egress-log: outbound prompts will not be recorded anywhere. \
-             This daemon sends system logs to a third party."
-        );
+    if cfg.locality == Locality::Remote {
+        if cfg.egress_log.is_none() {
+            tracing::warn!(
+                "no --egress-log: outbound prompts will not be recorded anywhere. \
+                 This daemon sends system logs to a third party."
+            );
+        }
+        if cfg.upstream.starts_with("http://") {
+            tracing::warn!(
+                "upstream {} is remote and plaintext — the API key and every prompt \
+                 cross the network unencrypted",
+                cfg.upstream
+            );
+        }
     }
 
     if let Err(e) = axum::serve(listener, app)
@@ -180,13 +215,23 @@ async fn tags(State(ctx): State<Arc<Ctx>>) -> impl IntoResponse {
         "models": [{
             "name": ctx.cfg.model,
             "model": ctx.cfg.model,
-            "details": { "family": "hadald-upstream", "upstream": ctx.cfg.upstream },
+            "details": {
+                "family": "hadald-upstream",
+                "upstream": ctx.cfg.upstream,
+                "locality": ctx.cfg.locality.as_str(),
+            },
         }]
     }))
 }
 
 /// Record one outbound request. Appends; never truncates.
 fn note_egress(cfg: &Config, prompt: &str, system: &str) {
+    // Nothing left the machine, so nothing belongs in the record of what left
+    // the machine. A log that answers a different question than its name is
+    // worse than no log.
+    if cfg.locality.is_local() {
+        return;
+    }
     let Some(path) = &cfg.egress_log else { return };
     use std::io::Write;
 
@@ -246,9 +291,7 @@ async fn embed(
     note_egress_embed(&ctx.cfg, &req.input, kind.as_str());
 
     let resp = ctx
-        .http
-        .post(format!("{}/embeddings", ctx.cfg.upstream))
-        .bearer_auth(&ctx.key)
+        .auth(ctx.http.post(format!("{}/embeddings", ctx.cfg.upstream)))
         .json(&body)
         .send()
         .await
@@ -292,6 +335,9 @@ async fn embed(
 }
 
 fn note_egress_embed(cfg: &Config, inputs: &[String], kind: &str) {
+    if cfg.locality.is_local() {
+        return;
+    }
     let Some(path) = &cfg.egress_log else { return };
     use std::io::Write;
     let stamp = std::time::SystemTime::now()
@@ -347,9 +393,7 @@ async fn retrieve_handler(
         &[format!("search_query: {}", req.query)],
     );
     let resp = ctx
-        .http
-        .post(format!("{}/embeddings", ctx.cfg.upstream))
-        .bearer_auth(&ctx.key)
+        .auth(ctx.http.post(format!("{}/embeddings", ctx.cfg.upstream)))
         .json(&body)
         .send()
         .await
@@ -406,9 +450,7 @@ async fn generate(
 
     let body = upstream::chat_body(&ctx.cfg.model, &req.system, &req.prompt);
     let resp = ctx
-        .http
-        .post(format!("{}/chat/completions", ctx.cfg.upstream))
-        .bearer_auth(&ctx.key)
+        .auth(ctx.http.post(format!("{}/chat/completions", ctx.cfg.upstream)))
         .json(&body)
         .send()
         .await
@@ -500,5 +542,66 @@ mod async_stream {
             "{}\n",
             serde_json::json!({ "response": text, "done": done })
         )
+    }
+}
+
+#[cfg(test)]
+mod egress_tests {
+    use super::*;
+
+    fn cfg_for(upstream: &str, log: &std::path::Path) -> Config {
+        Config::from_args(
+            [
+                "hadald",
+                "--model",
+                "m",
+                "--upstream",
+                upstream,
+                "--egress-log",
+                log.to_str().unwrap(),
+            ]
+            .iter()
+            .map(|s| s.to_string()),
+        )
+        .expect("config")
+    }
+
+    fn tmp(name: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!("hadald-egress-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        p
+    }
+
+    /// The record of what left the machine must not contain things that did
+    /// not leave it. Verified live 2026-08-23 and pinned here: `note_egress`
+    /// runs *before* the upstream request, so this fires even with nothing
+    /// listening.
+    #[test]
+    fn a_local_upstream_writes_no_egress_line() {
+        let log = tmp("local");
+        let cfg = cfg_for("http://127.0.0.1:8080/v1", &log);
+        assert_eq!(cfg.locality, Locality::Local);
+        note_egress(&cfg, "why did my build fail", "you are hadal");
+        note_egress_embed(&cfg, &["a chunk of the journal".to_string()], "query");
+        assert!(
+            !log.exists() || std::fs::read_to_string(&log).unwrap().is_empty(),
+            "a local request must leave the egress log untouched"
+        );
+        let _ = std::fs::remove_file(&log);
+    }
+
+    /// The other half: the skip must be conditional, not a silent disabling of
+    /// the log. A test that only asserted the local case would pass if
+    /// `note_egress` had simply been broken.
+    #[test]
+    fn a_remote_upstream_still_writes_one() {
+        let log = tmp("remote");
+        let cfg = cfg_for("https://integrate.api.nvidia.com/v1", &log);
+        assert_eq!(cfg.locality, Locality::Remote);
+        note_egress(&cfg, "why did my build fail", "you are hadal");
+        let body = std::fs::read_to_string(&log).expect("egress log must exist");
+        assert!(body.contains("upstream=https://integrate.api.nvidia.com/v1"));
+        assert!(body.contains("prompt_bytes=21"));
+        let _ = std::fs::remove_file(&log);
     }
 }

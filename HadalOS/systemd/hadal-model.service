@@ -1,0 +1,161 @@
+[Unit]
+# The inference runtime. hadald is the model *host* — the API surface, the
+# egress record, the tier decision. This is the thing that actually multiplies
+# matrices, and it is a separate unit for two reasons that are not tidiness.
+#
+# 1. It may need the GPU; hadald must never. hadald sets PrivateDevices=yes
+#    precisely so that it cannot reach a device node, and that is worth
+#    keeping: the daemon holding the API key should not also hold /dev/dri.
+#    Splitting them means at most one process has the render node, and it is
+#    the one with no credential.
+#
+#    "May" is doing real work in that sentence. HADAL_MODEL_NGL defaults to 0
+#    on this hardware — docs/compute.md §5e measured GPU offload *losing* to
+#    the CPU for the reflex tier — so on the reference laptop this unit holds a
+#    device grant it does not use. That is deliberate but not free: it means
+#    the split is justified by the *hadald* side of it, not by this side. A
+#    CPU-only deployment should drop the DeviceAllow below via a drop-in, and
+#    acct-user/hadal's ebuild already argues for exactly that shape — device
+#    access granted by the unit that needs it, when it needs it.
+#
+# 2. The memory cap belongs on whoever allocates. docs/compute.md §3.2a
+#    measured that GPU-resident pages *are* charged to the calling process's
+#    cgroup — so a MemoryMax= on hadald governs nothing once the model lives
+#    here. See the ceiling section below for why that cap is dangerous to
+#    tighten.
+Description=Hadal inference runtime (llama.cpp, Vulkan)
+Documentation=file:///usr/share/doc/hadalos/compute.md
+After=hadald.service
+BindsTo=hadald.service
+
+[Service]
+Type=exec
+User=hadal
+Group=hadal
+
+# The render node, and nothing else on the GPU. acct-user/hadal is in `render`
+# for this; on a stock udev /dev/dri/renderD128 is 0660 root:render, and the
+# 0666 seen on some desktop-oriented setups is not something to depend on.
+#
+# renderD128 is the compute path. card0 is the *display* path — KMS, mode
+# setting, DRM master — and the assistant has no business there. cusk owns
+# that. This is the same split docs/compute.md §4.1b draws between compute
+# contention and the display pipeline, expressed as a device policy.
+SupplementaryGroups=render
+PrivateDevices=no
+DevicePolicy=closed
+DeviceAllow=/dev/dri/renderD128 rw
+
+StateDirectory=hadal
+Environment=HADAL_MODELS=/var/lib/hadal/models
+# Layers to offload, and threads. Both default to the values measured best on
+# the reference laptop, which are not the values anyone would guess.
+#
+# docs/compute.md §5e, Qwen3-1.7B Q8_0 on Iris Xe:
+#
+#   CPU  -t 8    16.22 tok/s generation
+#   GPU  -ngl 99 13.17 tok/s generation
+#
+# GPU offload *loses* token generation by ~23%. Generating a token streams the
+# whole model, and with a unified memory architecture the GPU shares the same
+# DRAM controller — it brings no extra bandwidth to a bandwidth-bound problem.
+# It wins prompt processing (~1.5x), which matters for the deep tier's build-log
+# job and not for the reflex tier's short prompts.
+#
+# CPU-only is also gentler on the desktop (frame-latency p99 0.804 ms vs
+# 1.577 ms, both against a 16.67 ms budget), cannot hit §3.2a's
+# VK_ERROR_DEVICE_LOST, and needs no render node at all — see the device
+# comment above, which becomes moot at NGL=0.
+#
+# -t 8 rather than 12: this part is 2 P-cores + 8 E-cores, and the last four
+# threads make it *slower* (14.84 tok/s) once memory bandwidth saturates. That
+# is the asymmetry sonar's CoreClass exists to describe.
+#
+# None of this generalises. A discrete GPU has its own VRAM bandwidth and
+# should win. These are defaults for one machine, and choosing them per machine
+# is what sonar is for.
+Environment=HADAL_MODEL_NGL=0
+Environment=HADAL_MODEL_THREADS=8
+EnvironmentFile=/etc/hadal/model.env
+
+ExecStart=/usr/bin/llama-server \
+    --model ${HADAL_MODELS}/${HADAL_MODEL_FILE} \
+    --host 127.0.0.1 \
+    --port 8080 \
+    --n-gpu-layers ${HADAL_MODEL_NGL} \
+    --threads ${HADAL_MODEL_THREADS} \
+    --ctx-size 4096 \
+    --no-warmup
+
+# ── Network ────────────────────────────────────────────────────────────
+# Joins hadald's namespace, the same way hadal-brokerd.service does. That is
+# what makes 127.0.0.1:8080 mean *this* loopback and not the host's, and it is
+# the point: the runtime is reachable by hadald and by nothing else, enforced
+# by the kernel rather than by a bind address.
+#
+# It also, for the first time, makes hadald.service's own isolation coherent.
+# That unit carries PrivateNetwork=yes and IPAddressDeny=any while the daemon's
+# default upstream is a public HTTPS endpoint — the unit and the daemon
+# disagreed, and the unit had never been started. A local upstream is the
+# configuration those directives were always describing.
+#
+# Ordering note, stated because it is a real consequence and not a nicety:
+# hadald owns the namespace, so it starts first and will answer 502 until this
+# unit is listening. That is the honest failure mode and better than making the
+# API surface depend on the model being loaded.
+JoinsNamespaceOf=hadald.service
+PrivateNetwork=yes
+IPAddressDeny=any
+
+# ── Resource ceiling ───────────────────────────────────────────────────
+# Read docs/compute.md §3.2a before tightening this.
+#
+# Measured on the reference laptop: exceeding a cgroup memory limit with
+# GPU-resident pages does **not** reclaim and does not swap. The submission
+# fails and Vulkan returns VK_ERROR_DEVICE_LOST, which invalidates the whole
+# device — every resource must be recreated. A cap set slightly too low
+# therefore does not make inference slow, it makes inference stop.
+#
+# So this ceiling is sized generously against the model rather than tightly
+# against the machine: Qwen3-1.7B at Q8_0 is 1.71 GiB on disk and allocates
+# somewhat more once resident. 25% of 15.2 GiB is ~3.8 GiB, which is margin,
+# not a target. The blast radius of getting it wrong was measured and is
+# contained to this process — no GPU reset, no effect on the compositor — but
+# "contained" still means the assistant is gone until restarted.
+MemoryMax=25%
+MemoryHigh=20%
+Restart=on-failure
+RestartSec=2s
+
+# Inference must never win a scheduling fight against interactive work.
+# docs/compute.md §4.3b measured the GPU side of this and found the kernel's
+# GuC scheduler already handles it — a saturating compute load cost a
+# frame-sized job about 2 ms against a 16.67 ms budget. These are the CPU side,
+# which was not measured and where no such preemption guarantee exists.
+CPUWeight=20
+IOWeight=20
+Nice=10
+OOMPolicy=stop
+OOMScoreAdjust=500
+
+# ── Isolation ──────────────────────────────────────────────────────────
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=no
+RestrictRealtime=yes
+# The weights are read. Nothing here writes them, and a runtime that can
+# rewrite its own model is a runtime that can be persuaded to.
+ReadOnlyPaths=/var/lib/hadal/models
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

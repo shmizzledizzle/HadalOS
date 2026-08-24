@@ -35,6 +35,19 @@ app-admin/hadalos-portage-hook ~amd64
 acct-user/hadal ~amd64
 acct-group/hadal ~amd64
 
+# The model runtime, and the first package in ::hadalos that is not HadalOS's
+# own code. Not in ::gentoo, which carries the standalone sci-ml/ggml tensor
+# library and sci-ml/ollama but no llama.cpp, so this shadows nothing. It is
+# here for one reason: the Vulkan compute backend, which is the only compute
+# path that works on both halves of the reference hardware with no vendor
+# userspace (docs/compute.md §3.1).
+#
+# Not pulled in by app-misc/hadalos-assistant, on purpose. A model runtime with
+# no weights cannot answer anything, and no weights are packaged, so making
+# this a hard dependency would force a long build for a component that cannot
+# yet do its job.
+sci-ml/llama-cpp ~amd64
+
 # The kernel. Deliberately NOT pulled in by any metapackage: this laptop boots
 # gentoo-kernel-bin through the HadalOS Limine layout, and switching it to
 # mainline-tip is a decision about this machine's kernel, not part of becoming

@@ -147,6 +147,14 @@ model has to be.
 - Where does the policy live? The broker knows the capability table; the MCP
   server knows the tiers. One of them has to learn the other's vocabulary, and
   the broker is the one with the security boundary.
+- **The mechanism now exists; the policy still does not.** As of 2026-08-23
+  `hadald` classifies its upstream as local or remote (derived from the URL,
+  not declared), drops the key requirement for local, keeps the egress log to
+  actual egress, and reports the tier on `/api/tags`. See compute.md §5a. That
+  removes the reason routing was unimplementable — there was only ever one
+  destination — and changes nothing about §3, which is still unwritten. Note
+  also that no local model exists on any machine yet, so the local tier is
+  addressable and empty.
 - `UnitStatus` is marked `false` above on the grounds that unit names leak
   system shape. Arguable, and the first thing to revisit if local turns out to
   be too weak to be useful.

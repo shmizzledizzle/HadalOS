@@ -100,12 +100,29 @@ SystemCallFilter=@system-service
 SystemCallErrorNumber=EPERM
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 
-# GPU access for ROCm/RDNA4. PrivateDevices=yes masks these, so they are
-# re-added explicitly — an allowlist of two nodes rather than a blanket
-# unmask.
-DeviceAllow=/dev/kfd rw
-DeviceAllow=char-drm rw
-SupplementaryGroups=video render
+# No GPU access. Removed 2026-08-24, and worth recording why rather than
+# leaving a shorter file behind.
+#
+# This unit used to carry `DeviceAllow=/dev/kfd rw`, `DeviceAllow=char-drm rw`
+# and `SupplementaryGroups=video render`, described as "an allowlist of two
+# nodes rather than a blanket unmask". Three things were wrong with that:
+#
+#  - `/dev/kfd` is the ROCm compute device. docs/compute.md §3.1 rejected ROCm
+#    outright — AMD-only, forfeits the Iris Xe half of the reference hardware —
+#    so this granted access for a stack the project decided not to use, and one
+#    that does not exist on the reference laptop at all.
+#  - `char-drm` is not a node. It is the whole DRM char-device major, so that
+#    line granted *every* DRM device, `card0` included — the display and
+#    mode-setting path that cusk owns. The comment described an allowlist and
+#    the directive wrote a blanket unmask.
+#  - hadald no longer holds a model. The runtime is hadal-model.service, which
+#    takes exactly `/dev/dri/renderD128` and gets `render` from its own
+#    SupplementaryGroups — the arrangement acct-user/hadal's ebuild already
+#    described as the intent: device access granted by the unit that needs it,
+#    not baked into the account.
+#
+# The result is the split worth having: the process holding the API key has no
+# device access, and the process with the GPU has no credential.
 
 [Install]
 WantedBy=multi-user.target

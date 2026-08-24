@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE pkgmetadata SYSTEM "https://www.gentoo.org/dtd/metadata.dtd">
+<pkgmetadata>
+	<maintainer type="person">
+		<email>bamatangelo@hadalpoint.com</email>
+		<name>HadalOS</name>
+	</maintainer>
+	<longdescription>
+		llama.cpp provides local LLM inference. HadalOS packages it for the
+		Vulkan compute backend specifically: it is the model runtime behind
+		hadald's local tier, and Vulkan is the one compute path that works on
+		both halves of the reference hardware (RDNA4 and Iris Xe) with no
+		vendor userspace. Not in ::gentoo, which carries only the standalone
+		sci-ml/ggml tensor library and sci-ml/ollama.
+	</longdescription>
+	<use>
+		<flag name="vulkan">
+			Build the ggml Vulkan compute backend. This is the reason the
+			package exists; disabling it leaves a CPU-only build.
+		</flag>
+		<flag name="server">
+			Build <pkg>sci-ml/llama-cpp</pkg>'s HTTP server, which exposes an
+			OpenAI-compatible API. This is what hadald talks to over loopback.
+			Implies tools.
+		</flag>
+		<flag name="tools">
+			Build the command-line tools, including llama-bench and
+			llama-quantize.
+		</flag>
+		<flag name="system-ggml">
+			Link against <pkg>sci-ml/ggml</pkg> instead of the vendored copy.
+			Pinned to the exact vendored version because upstream's
+			find_package(ggml) carries no version check, so a mismatch fails
+			as a link error rather than a refusal.
+		</flag>
+		<flag name="openmp">
+			Use OpenMP for CPU threading in the vendored ggml.
+		</flag>
+	</use>
+	<upstream>
+		<remote-id type="github">ggml-org/llama.cpp</remote-id>
+	</upstream>
+</pkgmetadata>
