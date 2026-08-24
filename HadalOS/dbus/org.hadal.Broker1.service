@@ -1,0 +1,34 @@
+[D-BUS Service]
+Name=org.hadal.Broker1
+Exec=/usr/libexec/hadal-brokerd
+User=root
+SystemdService=hadal-brokerd.service
+
+# D-Bus *activation*, which is a different file from the bus policy next to it
+# and is the one that was missing.
+#
+#   system.d/org.hadal.Broker1.conf       who may talk to the name
+#   system-services/org.hadal.Broker1.service   how the name comes to exist
+#
+# With only the first, the bus knows the broker is allowed to own a name that
+# nothing provides. Calling it fails with
+#
+#   org.freedesktop.DBus.Error.ServiceUnknown:
+#   The name org.hadal.Broker1 was not provided by any .service files
+#
+# which reads like a missing package rather than a missing file inside one.
+# Found 2026-08-24, on the first `hadal explain` ever run — the CLI worked, the
+# spool record was found and read, and the call to the broker failed at the
+# last step.
+#
+# hadal-brokerd.service is already Type=dbus with BusName=org.hadal.Broker1, so
+# it was written expecting to be started this way. SystemdService= hands the
+# activation to systemd rather than letting dbus-daemon fork the binary itself,
+# which is what keeps the unit's sandboxing — ProtectSystem, the capability
+# bounding set, the namespace it shares with hadald — applied. A bus-daemon
+# fork would run the broker with none of it.
+#
+# The consequence worth knowing: `systemctl enable hadal-brokerd.service` is
+# now optional rather than required. The broker starts when something asks for
+# it and not before, which is the right shape for a component that spends most
+# of its life idle.

@@ -66,6 +66,18 @@ src_install() {
 	insinto /usr/share/dbus-1/system.d
 	doins "${S}"/../dbus/org.hadal.Broker1.conf
 
+	# The activation file, which is a different thing from the policy above and
+	# was missing until 2026-08-24. Policy says who may talk to the name;
+	# activation says how the name comes to exist. With only the policy, the
+	# first `hadal explain` reached the broker's bus name and got
+	# ServiceUnknown — "not provided by any .service files" — which reads like
+	# a missing package rather than a missing file inside this one.
+	#
+	# hadal-brokerd.service is Type=dbus with BusName=org.hadal.Broker1, so it
+	# was always written to be started this way.
+	insinto /usr/share/dbus-1/system-services
+	doins "${S}"/../dbus/org.hadal.Broker1.service
+
 	# The polkit actions. Without these every Mutate-tier capability is denied
 	# with an authorization error that looks like a bug in the broker.
 	insinto /usr/share/polkit-1/actions

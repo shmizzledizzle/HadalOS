@@ -90,6 +90,78 @@ for f in ${ebuilds}; do
 	fi
 done
 
+section "acct-user ebuilds call acct-user_add_deps in global scope"
+# acct-user.eclass generates RDEPEND from ACCT_USER_GROUPS inside this
+# function, and acct-user_pkg_pretend checks a flag only it sets. Omitting the
+# call does not lose a dependency quietly — it dies in the *pretend* phase,
+# before anything is built, with a message about global scope.
+#
+# Nothing caught this because acct-user/hadal had never been merged: the first
+# attempt was 2026-08-24, and it failed on exactly this. A static check is the
+# right shape for it, since the failure is visible in the file.
+for f in ${ebuilds}; do
+	case ${f} in
+		"${overlay}"/acct-user/*) ;;
+		*) continue ;;
+	esac
+	if ! grep -q '^ACCT_USER_GROUPS=' "${f}"; then
+		# No groups means the call is not required by the eclass.
+		ok "${f#"${overlay}"/} (no ACCT_USER_GROUPS)"
+	elif grep -qE '^acct-user_add_deps[[:space:]]*$' "${f}"; then
+		ok "${f#"${overlay}"/}"
+	else
+		bad "${f#"${overlay}"/} sets ACCT_USER_GROUPS but never calls acct-user_add_deps — dies in pkg_pretend"
+	fi
+done
+
+section "acct-user ebuilds do not hand-write RDEPEND"
+# The eclass uses `RDEPEND+=`, so an assignment after the call silently
+# discards what it added, and one before it is duplicated.
+for f in ${ebuilds}; do
+	case ${f} in
+		"${overlay}"/acct-user/*) ;;
+		*) continue ;;
+	esac
+	if grep -qE '^RDEPEND=' "${f}"; then
+		bad "${f#"${overlay}"/} assigns RDEPEND; let acct-user_add_deps generate it"
+	else
+		ok "${f#"${overlay}"/}"
+	fi
+done
+
+section "Type=dbus units have a D-Bus activation file"
+# A unit with Type=dbus and BusName= is started *by the bus*, not by
+# multi-user.target. Without a matching file in system-services/, the name is
+# never provided and every call fails with ServiceUnknown — an error that names
+# the bus, not the package that forgot the file.
+#
+# The bus policy in system.d/ is a different file and does not substitute: it
+# says who may talk to a name, not how the name comes to exist. Both were
+# present except the activation one, which is why this check exists.
+for unit in systemd/*.service; do
+	[[ -e ${unit} ]] || continue
+	grep -q '^Type=dbus' "${unit}" || continue
+	name=$(grep -E '^BusName=' "${unit}" | head -1 | cut -d= -f2)
+	if [[ -z ${name} ]]; then
+		bad "${unit} is Type=dbus but sets no BusName"
+	elif [[ -e dbus/${name}.service ]]; then
+		ok "${unit} -> dbus/${name}.service"
+	else
+		bad "${unit} is Type=dbus but dbus/${name}.service does not exist — calls will get ServiceUnknown"
+	fi
+done
+
+section "D-Bus activation files are installed by an ebuild"
+for f in dbus/*.service; do
+	[[ -e ${f} ]] || continue
+	base=$(basename "${f}")
+	if grep -rqF "${base}" ${ebuilds}; then
+		ok "${base}"
+	else
+		bad "${base} exists but no ebuild installs it"
+	fi
+done
+
 section "live ebuilds are not keyworded"
 # A keyworded live ebuild will be pulled in by a normal dependency resolution
 # and rebuilt from a moving target without anyone asking for it.
