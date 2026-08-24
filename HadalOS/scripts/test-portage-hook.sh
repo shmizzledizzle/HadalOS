@@ -123,5 +123,85 @@ else
     ok "hostile package name produced no forged record"
 fi
 
+# ── registration must be idempotent ──
+printf '\n\033[1;36m══ registration\033[0m\n'
+
+# /etc/portage/bashrc.d is sourced for every phase and Portage carries the
+# environment between them, so a bare `EBUILD_DEATH_HOOKS+=` accumulates. By
+# the install phase the hook was registered seven times and ran seven times on
+# one failure — visible in the 2026-08-24 llama-cpp merge as the same message
+# printed seven times, and before that as seven identical ACCESS DENIED lines
+# that read as noise.
+for _ in 1 2 3 4 5 6 7; do source "$HOOK"; done
+count=$(printf '%s' " $EBUILD_DEATH_HOOKS " | grep -o 'hadalos_record_build_failure' | wc -l)
+if [[ $count -eq 1 ]]; then
+    ok "registers exactly once when sourced repeatedly"
+else
+    bad "registered $count times after 7 sourcings — will fire $count times per failure"
+fi
+
+# ── the sandbox, which is where this hook actually failed ──
+printf '\n\033[1;36m══ sandbox declaration\033[0m\n'
+
+# EBUILD_DEATH_HOOKS run inside the sandbox, so the spool and log directories
+# have to be declared writable or every write is denied. This is the regression
+# test for 2026-08-24: sci-ml/llama-cpp died on a file collision and the hook
+# recorded nothing, because addwrite was never called. The build output showed
+# only an ACCESS DENIED line in a sandbox summary.
+addwrite_calls="$TMP/addwrite.calls"
+: > "$addwrite_calls"
+(
+    # Stub the sandbox helper the way Portage defines it, and record the paths.
+    addwrite() { printf '%s\n' "$@" >> "$addwrite_calls"; }
+    export -f addwrite 2>/dev/null || true
+    hadalos_record_build_failure >/dev/null 2>&1
+)
+if grep -qF "$HADALOS_SPOOL" "$addwrite_calls" 2>/dev/null \
+   && grep -qF "$HADALOS_LOGDIR" "$addwrite_calls" 2>/dev/null; then
+    ok "declares the spool and log directories writable to the sandbox"
+else
+    bad "did not addwrite the spool/log directories — sandbox will deny the write"
+fi
+
+# ── a failure to record must be visible ──
+printf '\n\033[1;36m══ failure to record is reported\033[0m\n'
+
+# The original hook returned silently on every failure path. That is why the
+# sandbox denial went unnoticed: `hadal explain` finding no recorded failure is
+# indistinguishable from there having been no failure. Staying silent is a
+# worse bug than the denial it hid.
+out=$(
+    export HADALOS_SPOOL=/proc/definitely/not/writable
+    export HADALOS_LOGDIR=/proc/definitely/not/writable
+    hadalos_record_build_failure 2>&1
+)
+if printf '%s' "$out" | grep -qi 'could NOT record'; then
+    ok "says so when it cannot record"
+else
+    bad "failed silently — the class of bug this hook exists to avoid"
+fi
+
+# ...and must not claim success in the same breath.
+if printf '%s' "$out" | grep -qi 'recorded this failure'; then
+    bad "reported both success and failure"
+else
+    ok "does not also claim success"
+fi
+
+# An empty record is a failure even if every command returned 0. The product is
+# the record, not the exit status.
+(
+    export HADALOS_SPOOL="$TMP/emptyspool"
+    mkdir -p "$HADALOS_SPOOL"
+    # Make the spool a directory that swallows writes: a path that exists but
+    # where the record file cannot be created.
+    chmod 500 "$HADALOS_SPOOL"
+    out2=$(hadalos_record_build_failure 2>&1)
+    chmod 700 "$HADALOS_SPOOL"
+    printf '%s' "$out2" | grep -qi 'could NOT record'
+)
+[[ $? -eq 0 ]] && ok "an unwritten record counts as failure, not success" \
+              || bad "reported success without writing a record"
+
 printf '\n\033[1m══ %d passed, %d failed\033[0m\n' "$pass" "$fail"
 exit $(( fail > 0 ? 1 : 0 ))
