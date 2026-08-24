@@ -158,3 +158,68 @@ case " ${EBUILD_DEATH_HOOKS} " in
     *" hadalos_record_build_failure "*) ;;
     *) EBUILD_DEATH_HOOKS+=" hadalos_record_build_failure" ;;
 esac
+
+# ── System identity, after a baselayout merge ─────────────────────────────
+#
+# sys-apps/baselayout ships /etc/os-release as a symlink to ../usr/lib/os-release.
+# sys-apps/hadalos-release replaces it with a real file, which is what
+# os-release(5) precedence is for. A baselayout upgrade puts its symlink back,
+# and the system silently returns to identifying as Gentoo.
+#
+# Observed on this machine: baselayout-2.18-r1 merged 2026-08-19 16:49:12, and
+# /etc/os-release has been a symlink to Gentoo's copy ever since. Nothing
+# reported it. `emerge` does not read os-release, so nothing broke — the only
+# visible symptom is neofetch saying "Gentoo Linux" on a HadalOS install, which
+# reads as a neofetch quirk rather than as the identity having been reverted.
+#
+# scripts/test-overlay.sh already asserts the end state, but only when someone
+# runs it. This says so at the moment it happens, to the person who caused it.
+# It warns and does not repair: pkg_preinst in hadalos-release is where the
+# removal belongs, and a bashrc hook that rewrites /etc during someone else's
+# merge is the kind of surprise this tree does not want.
+_hadalos_check_identity() {
+    [[ ${CATEGORY}/${PN} == sys-apps/baselayout ]] || return 0
+    # Only meaningful where the identity was actually installed. compgen rather
+    # than `[[ -d ... ]]`, which does not expand globs and would be true for a
+    # literal path with a `*` in it — that is, never.
+    compgen -G "${EROOT:-}/var/db/pkg/sys-apps/hadalos-release-*" >/dev/null 2>&1 || return 0
+    [[ -L ${EROOT:-}/etc/os-release ]] || return 0
+
+    echo
+    echo " * HadalOS: baselayout has restored its /etc/os-release symlink."
+    echo " *   This system now identifies as Gentoo again. Restore it with:"
+    echo " *     emerge -C sys-apps/hadalos-release"
+    echo " *     emerge -1 sys-apps/baselayout"
+    echo " *     emerge    sys-apps/hadalos-release"
+    echo " *   See the hadalos-release ebuild for why a plain -1 is not enough."
+    echo
+    return 0
+}
+
+# post_pkg_postinst rather than a death hook: this is about a merge that
+# succeeded. Wrapped so that an existing definition from another bashrc.d
+# snippet is not clobbered — this file is one of several and is not entitled to
+# own the phase.
+#
+# Registered at most once, for the reason the death hook above is: this file is
+# sourced for every ebuild phase and Portage carries the environment between
+# them, so an unguarded wrapper chains onto its own previous wrapper and the
+# warning is printed once per phase already run. The flag is exported for the
+# same reason — the phases are separate bash processes, and a plain shell
+# variable does not survive between them.
+if [[ -z ${HADALOS_IDENTITY_HOOK_REGISTERED:-} ]]; then
+export HADALOS_IDENTITY_HOOK_REGISTERED=1
+if declare -F post_pkg_postinst >/dev/null 2>&1; then
+    eval "_hadalos_prev_post_pkg_postinst() { $(declare -f post_pkg_postinst | tail -n +2) }"
+    post_pkg_postinst() {
+        _hadalos_prev_post_pkg_postinst "$@"
+        _hadalos_check_identity
+        return 0
+    }
+else
+    post_pkg_postinst() {
+        _hadalos_check_identity
+        return 0
+    }
+fi
+fi

@@ -203,5 +203,57 @@ fi
 [[ $? -eq 0 ]] && ok "an unwritten record counts as failure, not success" \
               || bad "reported success without writing a record"
 
+# ── system identity, after a baselayout merge ──
+printf '\n\033[1;36m══ os-release identity guard\033[0m\n'
+
+# A fake root, so these cases do not depend on the state of the machine running
+# the suite — which is the whole point: the failure being guarded against is
+# invisible locally and has already happened here once.
+fakeroot="$TMP/root"
+mkdir -p "$fakeroot/etc" "$fakeroot/var/db/pkg/sys-apps/hadalos-release-0.1.0"
+ln -sf ../usr/lib/os-release "$fakeroot/etc/os-release"
+
+# Each case runs in its own bash, because the hook registers once per
+# environment and Portage gives each phase a fresh one.
+identity_out() {
+    env -u HADALOS_IDENTITY_HOOK_REGISTERED \
+        CATEGORY="$1" PN="$2" EROOT="$3" \
+        bash -c 'source "$1"; post_pkg_postinst 2>&1' _ "$HOOK"
+}
+
+identity_out sys-apps baselayout "$fakeroot" | grep -q 'restored its /etc/os-release symlink' \
+    && ok "warns when a baselayout merge reverts the identity" \
+    || bad "silent when baselayout put its symlink back"
+
+# The repair has to be in the message. A warning that says something is wrong
+# without saying what to run is how this got left for five days the first time.
+identity_out sys-apps baselayout "$fakeroot" | grep -q 'emerge -C sys-apps/hadalos-release' \
+    && ok "names the repair, not just the problem" \
+    || bad "warned without saying how to fix it"
+
+[[ -z "$(identity_out dev-libs glib "$fakeroot")" ]] \
+    && ok "says nothing when the merged package is not baselayout" \
+    || bad "fired on an unrelated package"
+
+# A real file at /etc/os-release is the correct end state.
+rm -f "$fakeroot/etc/os-release"
+printf 'ID=hadalos\n' > "$fakeroot/etc/os-release"
+[[ -z "$(identity_out sys-apps baselayout "$fakeroot")" ]] \
+    && ok "says nothing when the identity is intact" \
+    || bad "fired on a healthy /etc/os-release"
+
+# Not a HadalOS install: baselayout's symlink is simply correct there.
+ln -sf ../usr/lib/os-release "$fakeroot/etc/os-release"
+rm -rf "$fakeroot/var/db/pkg/sys-apps/hadalos-release-0.1.0"
+[[ -z "$(identity_out sys-apps baselayout "$fakeroot")" ]] \
+    && ok "says nothing where hadalos-release was never merged" \
+    || bad "fired on a system that never had the identity"
+
+# The rule the whole file is built on still holds for the new hook.
+env -u HADALOS_IDENTITY_HOOK_REGISTERED CATEGORY=sys-apps PN=baselayout EROOT="$fakeroot" \
+    bash -c 'source "$1"; post_pkg_postinst >/dev/null 2>&1' _ "$HOOK"
+[[ $? -eq 0 ]] && ok "returns 0, so it cannot fail a merge" \
+              || bad "returned non-zero and could fail someone else's merge"
+
 printf '\n\033[1m══ %d passed, %d failed\033[0m\n' "$pass" "$fail"
 exit $(( fail > 0 ? 1 : 0 ))
