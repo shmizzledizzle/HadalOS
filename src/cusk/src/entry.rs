@@ -796,6 +796,37 @@ Exec=firefox --private-window
         assert_eq!(pinned.len(), 2);
     }
 
+    /// A desktop entry's id keeps its extension; a *window's* `app_id` does
+    /// not. So anything matching an app_id against these has to append
+    /// `.desktop` first, and the failure is quiet: the id match never fires and
+    /// the binary-name fallback picks up the slack for exactly those
+    /// applications whose id happens to be their binary name.
+    ///
+    /// That is why the dock's pinned list — written as bare names like `konsole`
+    /// — always looked correct while every reverse-DNS app id fell through to a
+    /// lettered placeholder.
+    #[test]
+    fn ids_keep_the_desktop_extension_and_app_ids_do_not() {
+        let installed = vec![fake("org.kde.konsole.desktop", "Konsole", "konsole")];
+
+        assert!(
+            resolve_pinned("org.kde.konsole", &installed).is_empty(),
+            "a bare app id must not match an id that carries the extension"
+        );
+        assert_eq!(
+            resolve_pinned("org.kde.konsole.desktop", &installed).len(),
+            1,
+            "appending .desktop is what makes the id match"
+        );
+        // And the reason the omission stayed hidden this long.
+        assert_eq!(
+            resolve_pinned("konsole", &installed).len(),
+            1,
+            "the binary-name fallback masks it for applications named after \
+             their binary"
+        );
+    }
+
     #[test]
     fn an_empty_pin_list_pins_nothing() {
         assert!(resolve_pinned("", &catalogue()).is_empty());

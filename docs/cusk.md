@@ -3031,3 +3031,111 @@ right about a connection that did not own it. It now uses a name of its own.
 - **`fetch_menu` blocks the UI thread**, with a 700ms timeout as the safeguard.
   A wedged tray icon must not take the dock with it; the honest fix is a channel
   from the tray thread, which is the same plumbing a signal-driven tray needs.
+
+## Milestone 37: the left dock, 2026-08-24
+
+`cusk-dock --side left` — a second strip, on the opposite edge, listing the
+windows that are open. The right strip keeps the mark, the pinned launchers and
+the tray; the left one answers "what is running", which is the question milestone
+34 identified the dock as unable to answer.
+
+One binary, not a second crate. The two strips share the palette, the
+desktop-entry reader, the icon resolution and the tile styling; a second crate
+would have duplicated all of it to change an anchor and a view. What differs is
+the *contents*, and that is a `view` decision.
+
+Both reserve their own exclusive zone, so windows tile *between* them. Measured
+nested on 1280x800 with both running: the non-exclusive zone comes back as
+`x: 48, width: 1184`, which is 48 off each edge and the rest usable.
+
+Each side starts only the protocol it draws. Starting both everywhere would mean
+two D-Bus watchers fighting for one name and a Wayland connection nothing reads.
+
+### A second Wayland connection, on its own thread
+
+iced owns the main connection through `iced_layershell` and does not expose the
+registry, so `windows.rs` opens its own. That is ordinary — a client may connect
+as many times as it likes — and it is the same shape as `tray.rs`: a background
+thread that owns a protocol and publishes a snapshot the UI clones. The
+alternative is threading a wlr-foreign-toplevel handler through iced's event
+loop, which means forking `iced_layershell`.
+
+Events are deltas and `done` is what makes them a state, so handles accumulate
+into a pending record and are published only on `done`. Without that, a window
+appears with a title and no app id for a frame.
+
+Windows are listed in **first-seen order**. A taskbar that reorders itself as
+focus moves is unusable: the tile you are reaching for moves as you reach for it.
+
+### Three bugs, none of which a unit test could have found
+
+The decoding is pure and tested. Every bug was in the plumbing that delivers
+something to decode, and each needed a real compositor and a real window.
+`examples/probe.rs` exists because the dock cannot be run headless — without it
+all three would have presented identically, as an empty strip.
+
+**1. A missing `event_created_child` specialisation panicked inside
+wayland-client.** The `toplevel` event carries a *new object*, and the generated
+code cannot know which `Dispatch` impl should own it. The mapping has to be
+declared and there is no compile-time check that it was. The first window that
+opened took the thread down with `Missing event_created_child specialization for
+event opcode 0`.
+
+**2. Every icon fell back to a lettered tile**, because a desktop entry's id
+keeps its extension — `org.kde.konsole.desktop` — and a window's `app_id` does
+not. The exact-id match therefore never fired, and everything fell through to
+the binary-name attempt.
+
+That fallback is why this survived so long. It *works* for `konsole` and
+`alacritty`, which are named after their binaries, so the pinned dock has always
+looked correct. It fails for every reverse-DNS app id, which is most of them.
+Found with `examples/iconprobe.rs`, which prints what the strip would draw:
+before, six of six app ids resolved to a letter tile; after, `org.kde.konsole`
+resolves to `breeze/apps/64/utilities-terminal.svg`.
+
+**3. Queued requests were never sent.** The event thread waited on the Wayland
+socket with `blocking_dispatch`, and a queue the UI can push to does nothing
+while that thread is asleep — which on an idle desktop is always. A click was
+queued and sat there until the compositor next spoke unprompted.
+
+Not theorised: `examples/actprobe.rs` queued an `Activate`, waited two seconds,
+and the window's `activated` flag had not moved. The request had never left the
+process.
+
+So the outbox owns a pipe. Pushing writes a byte; the event thread polls the
+socket and the pipe together. After the fix the same probe reports
+`before: activated=false` / `after Activate: activated=true`.
+
+The loop also has to `flush` after draining, or it goes to sleep holding the
+requests it just took off the queue — and release the read guard without reading
+when only the pipe woke it, or the next `prepare_read` deadlocks against it.
+
+### What the tiles do
+
+Left-click focuses; on a minimised window it unminimises instead, because
+activating something the compositor is not showing moves focus to an invisible
+window — the classic "typing goes nowhere" bug, entered deliberately.
+Right-click minimises or restores. Middle-click asks the window to close, and
+the tile stays until the compositor reports it gone, since `close` is a request
+an application may prompt about and may refuse.
+
+### Minimise does nothing, and that is the compositor's half
+
+`R::SetMinimized(_) => {}` — cusk has no minimised state at all. A window is on a
+workspace or it is not. The probe confirms the request arrives and is ignored:
+`after Minimize: minimized=false`.
+
+**That is the gate for Stage Manager.** Set-aside windows need somewhere to be
+set aside *to*, and today there is no such state to put them in. The next piece
+is a real minimised state in the compositor — a window model change, before any
+strip can show it.
+
+### Not done
+
+- **No overflow.** Enough windows will run off the strip.
+- **No grouping by application.** Ten terminals are ten tiles.
+- **The window list is not filtered by workspace**, so it lists windows that are
+  on a workspace you cannot see. Whether that is right is a design question the
+  workspace pills already half-answer.
+- **`--side` is a flag, not a setting.** The session has to be told to start two
+  docks; `commands.dock` runs one.

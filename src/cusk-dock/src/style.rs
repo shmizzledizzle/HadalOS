@@ -146,6 +146,56 @@ pub fn tray_tile(open: bool, attention: bool) -> impl Fn(&Theme, button::Status)
     }
 }
 
+/// A running-window tile.
+///
+/// Three states, and the minimised one is the substance. A minimised window is
+/// still *there* — it has to be clickable to come back — so it is dimmed rather
+/// than hidden or removed. Drawing it identically to a visible window would make
+/// the strip unable to answer the one question a taskbar exists for: which of
+/// these can I currently see?
+pub fn window_tile(activated: bool, minimized: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |theme, status| {
+        let base = tile(theme, status);
+        if minimized && matches!(status, button::Status::Active) {
+            return button::Style {
+                // No fill at all, and the dimming is carried by the icon's own
+                // transparency being unavailable to us — so a faint surface is
+                // the honest signal we can actually draw.
+                background: Some(Background::Color(alpha(SURFACE, 0.35))),
+                ..base
+            };
+        }
+        if activated && matches!(status, button::Status::Active) {
+            return button::Style {
+                background: Some(Background::Color(alpha(ACCENT, 0.14))),
+                ..base
+            };
+        }
+        base
+    }
+}
+
+/// The focus bar beside the active window's tile.
+///
+/// A shape, not a colour alone: shape survives a bad monitor, a colourblind
+/// user, and a screenshot at low contrast — the same argument `panel.rs` makes
+/// for the active workspace pill being wider rather than merely a different
+/// colour.
+pub fn focus_marker(activated: bool) -> impl Fn(&Theme) -> container::Style {
+    move |_theme| container::Style {
+        background: Some(Background::Color(if activated {
+            ACCENT
+        } else {
+            Color::TRANSPARENT
+        })),
+        border: Border {
+            radius: border::Radius::new(999.0),
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
 /// The tray menu's panel.
 ///
 /// Opaque, unlike the dock itself. The dock is translucent because it sits over

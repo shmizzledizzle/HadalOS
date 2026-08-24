@@ -20,6 +20,7 @@
 gui-wm/cusk **
 gui-apps/cusk-dock **
 gui-apps/cusk-launcher **
+gui-apps/cusk-keys **
 gui-apps/cusk-settings **
 
 # The assistant.

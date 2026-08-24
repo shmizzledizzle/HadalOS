@@ -9,6 +9,14 @@ license = "GPL-2.0-only"
 name = "cusk-dock"
 path = "src/main.rs"
 
+# A library target as well as the binary, so `examples/probe.rs` can drive the
+# window-list client without a compositor to draw into. The dock cannot be run
+# headless, so without this a bug in the protocol client would only ever show up
+# as an empty strip on screen.
+[lib]
+name = "cusk_dock"
+path = "src/lib.rs"
+
 [dependencies]
 # The desktop-entry reader and the palette, shared with the launcher and the
 # compositor rather than reimplemented.
@@ -20,3 +28,13 @@ iced = { version = "0.14.0", features = ["tokio", "image", "svg"] }
 iced_layershell = "0.19.1"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync"] }
 zbus = { version = "5.19.0", default-features = false, features = ["tokio"] }
+# The window list. `zwlr_foreign_toplevel_management_v1` is what turns the dock
+# from a launcher into a taskbar; cusk serves it (see cusk::foreign_toplevel)
+# and this is the client half. Already in the graph via iced_layershell, but
+# named explicitly because this crate uses it directly rather than incidentally.
+wayland-client = "0.31"
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+# For polling the Wayland socket and a wake-up pipe together. Without a second
+# fd to wait on, a queued request sits unsent until the compositor happens to
+# say something — see windows.rs for the bug this fixes.
+rustix = { version = "1", features = ["event", "pipe"] }

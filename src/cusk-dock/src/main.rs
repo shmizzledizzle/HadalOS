@@ -17,6 +17,7 @@
 mod menu;
 mod style;
 mod tray;
+mod windows;
 
 use cusk::entry::{self, Entry};
 use iced::widget::{
@@ -57,24 +58,100 @@ const MENU_WIDTH: u32 = 260;
 /// The HadalOS mark, for the launcher button.
 const MARK: &[u8] = include_bytes!("../../cusk-launcher/assets/menu_icon.png");
 
+/// Which edge this instance occupies, and therefore what it shows.
+///
+/// One binary rather than two crates. The two strips share the palette, the
+/// desktop-entry reader, the icon resolution and the tile styling; a second
+/// crate would duplicate all of it to change an anchor and a view. The
+/// *contents* differ — the right strip is launchers and status, the left is
+/// what is currently running — and that is a `view` decision, not a program.
+///
+/// Both instances reserve their own exclusive zone, so windows tile between
+/// them rather than under either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Side {
+    /// Pinned launchers, the mark, and the tray. The original dock.
+    Right,
+    /// Running windows. A taskbar, in the sense milestone 34 meant.
+    Left,
+}
+
+impl Side {
+    /// Parsed from `--side left|right`.
+    ///
+    /// Defaults to `Right` on anything unrecognised, with a warning, because
+    /// that is the strip a session started before this flag existed expects to
+    /// get. Failing to start would take out the launcher button and the tray
+    /// over a typo in an argument.
+    fn from_args() -> Self {
+        let mut args = std::env::args().skip(1);
+        while let Some(arg) = args.next() {
+            let value = match arg.as_str() {
+                "--side" => args.next(),
+                other => other.strip_prefix("--side=").map(str::to_string),
+            };
+            let Some(value) = value else { continue };
+            return match value.as_str() {
+                "left" => Side::Left,
+                "right" => Side::Right,
+                other => {
+                    eprintln!("dock: --side {other:?} is not left or right; using right");
+                    Side::Right
+                }
+            };
+        }
+        Side::Right
+    }
+
+    fn anchor(self) -> Anchor {
+        // Top and bottom both, so the strip spans the screen rather than
+        // floating in the middle of it. Only the horizontal edge differs.
+        match self {
+            Side::Right => Anchor::Right | Anchor::Top | Anchor::Bottom,
+            Side::Left => Anchor::Left | Anchor::Top | Anchor::Bottom,
+        }
+    }
+
+    /// What cusk logs, and what a user reads when asking which client owns a
+    /// strip of their screen. Distinct per side, or two identical namespaces
+    /// make the compositor's log ambiguous about which one mapped.
+    fn namespace(self) -> String {
+        match self {
+            Side::Right => "cusk-dock".to_string(),
+            Side::Left => "cusk-dock-windows".to_string(),
+        }
+    }
+}
+
 fn main() -> Result<(), iced_layershell::Error> {
-    application(App::boot, App::namespace, App::update, App::view)
-        // The tray thread publishes a snapshot; this is what notices. A
-        // second is slow enough to cost nothing and fast enough that an icon
-        // appearing feels immediate.
+    // Read before the surface is created: the anchor is part of the settings
+    // that create it and cannot be changed afterwards without the strip
+    // visibly jumping from one edge to the other.
+    let side = Side::from_args();
+
+    application(
+        move || App::boot(side),
+        move || side.namespace(),
+        App::update,
+        App::view,
+    )
+        // The tray and window-list threads publish snapshots; this is what
+        // notices. A second is slow enough to cost nothing and fast enough that
+        // an icon appearing feels immediate.
         .subscription(|_state| {
             iced::time::every(std::time::Duration::from_secs(1)).map(|_| Message::Poll)
         })
         .style(|_state, theme| style::appearance(theme))
         .settings(Settings {
             layer_settings: LayerShellSettings {
-                // Right edge, full height. Top and bottom are anchored as well
-                // so the strip spans the screen rather than floating in the
-                // middle of it.
-                anchor: Anchor::Right | Anchor::Top | Anchor::Bottom,
+                // One horizontal edge, full height. Top and bottom are anchored
+                // as well so the strip spans the screen rather than floating in
+                // the middle of it.
+                anchor: side.anchor(),
                 layer: Layer::Top,
                 // Matching the width: this is what keeps maximised windows
-                // beside the dock instead of underneath it.
+                // beside the dock instead of underneath it. Both strips reserve
+                // their own, so windows tile *between* them.
                 exclusive_zone: WIDTH as i32,
                 size: Some((WIDTH, 0)),
                 // The dock is clicked, never typed into. Taking keyboard focus
@@ -100,9 +177,21 @@ enum Icon {
 }
 
 struct App {
+    side: Side,
     pinned: Vec<Pinned>,
     mark: image::Handle,
     launcher: String,
+    /// Every installed desktop entry, kept to resolve a window's `app_id` to an
+    /// icon. Held rather than re-read: `load_all` walks the filesystem, and the
+    /// window list changes far more often than the installed set does.
+    installed: Vec<Entry>,
+    /// Written by the window-list thread, read here — the same arrangement as
+    /// the tray, for the same reason.
+    windows: windows::Shared,
+    open_windows: Vec<windows::Window>,
+    /// Requests queued for the window-list thread. The protocol objects are not
+    /// reachable from here, so a click becomes an entry in this.
+    outbox: std::sync::Arc<windows::Outbox>,
     /// Written by the D-Bus thread, read here. Cloned into the view each tick
     /// rather than held borrowed, because the tray thread must never be
     /// blocked by a slow frame.
@@ -151,10 +240,16 @@ enum Message {
     ToggleSubmenu(i32),
     /// Dismiss the open menu without choosing anything.
     CloseMenu,
+    /// Left-click a window tile: focus it, or unminimise it if it is away.
+    FocusWindow(u32),
+    /// Right-click a window tile: minimise, or restore if already minimised.
+    ToggleMinimize(u32),
+    /// Middle-click a window tile: ask it to close.
+    CloseWindow(u32),
 }
 
 impl App {
-    fn boot() -> Self {
+    fn boot(side: Side) -> Self {
         let cfg = cusk::config::Config::load(&cusk::config::default_path())
             .map(|(cfg, _)| cfg)
             .unwrap_or_default();
@@ -181,22 +276,37 @@ impl App {
             })
             .collect();
 
+        // Each strip starts only the protocol it draws. The left one has no
+        // tray and the right one no window list, and starting both everywhere
+        // would mean two D-Bus watchers fighting for one name and two Wayland
+        // connections nothing reads.
+        let (windows_shared, outbox) = match side {
+            Side::Left => windows::start(),
+            Side::Right => (
+                std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+                windows::Outbox::inert(),
+            ),
+        };
+        let tray_shared = match side {
+            Side::Right => tray::start(),
+            Side::Left => std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        };
+
         App {
             pinned,
             // Built once. `Handle::from_bytes` stamps a fresh id on every call,
             // so building one per view uploads a new texture every frame.
             mark: image::Handle::from_bytes(MARK),
             launcher: cfg.launcher,
-            tray: tray::start(),
+            side,
+            installed,
+            windows: windows_shared,
+            open_windows: Vec::new(),
+            outbox,
+            tray: tray_shared,
             items: Vec::new(),
             open_menu: None,
         }
-    }
-
-    fn namespace() -> String {
-        // What cusk logs, and what a user reads when asking which client owns
-        // a strip of their screen.
-        "cusk-dock".to_string()
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
@@ -231,6 +341,10 @@ impl App {
                 // Compared before assigning: iced rebuilds the view whenever
                 // state changes, and copying an identical list every second
                 // would redraw the dock forever for nothing.
+                let open = self.windows.lock().map(|w| w.clone()).unwrap_or_default();
+                if open != self.open_windows {
+                    self.open_windows = open;
+                }
                 let fresh = self.tray.lock().map(|i| i.clone()).unwrap_or_default();
                 if fresh != self.items {
                     self.items = fresh;
@@ -323,6 +437,45 @@ impl App {
                 }
             }
             Message::CloseMenu => self.open_menu = None,
+            Message::FocusWindow(id) => {
+                // A minimised window is unminimised rather than activated.
+                // Activating one the compositor is not showing would move focus
+                // to something invisible — the classic "typing goes nowhere"
+                // bug, entered deliberately.
+                let minimized = self
+                    .open_windows
+                    .iter()
+                    .find(|w| w.id == id)
+                    .is_some_and(|w| w.minimized);
+                self.ask(
+                    id,
+                    if minimized {
+                        windows::Request::Unminimize
+                    } else {
+                        windows::Request::Activate
+                    },
+                );
+            }
+            Message::ToggleMinimize(id) => {
+                let minimized = self
+                    .open_windows
+                    .iter()
+                    .find(|w| w.id == id)
+                    .is_some_and(|w| w.minimized);
+                self.ask(
+                    id,
+                    if minimized {
+                        windows::Request::Unminimize
+                    } else {
+                        windows::Request::Minimize
+                    },
+                );
+            }
+            // `close` is a request, not a kill: the application may prompt
+            // about unsaved work and may refuse. The tile stays until the
+            // compositor reports the window gone, which is the honest
+            // indication that nothing has happened yet.
+            Message::CloseWindow(id) => self.ask(id, windows::Request::Close),
             // Generated by `to_layer_message` for the protocol's own actions;
             // the dock issues none of them.
             _ => {}
@@ -386,6 +539,124 @@ impl App {
             .into()
         }))
         .spacing(4)
+        .align_x(iced::Center)
+        .into()
+    }
+
+    /// Queue a request for the window-list thread.
+    ///
+    /// Fire-and-forget. The protocol objects live on that thread; this pushes an
+    /// intent and the next turn of its loop sends it. A failed lock is dropped
+    /// rather than retried — the alternative is blocking the frame on a mutex
+    /// held by a thread that is itself blocked on the compositor.
+    fn ask(&self, id: u32, request: windows::Request) {
+        // Wakes the event thread as well as queueing, which is the whole point
+        // of `Outbox` being a type rather than a `Vec` — see `windows.rs`.
+        self.outbox.push(id, request);
+    }
+
+    /// Resolve a window's `app_id` to an icon.
+    ///
+    /// Reuses `resolve_pinned`, which matches a desktop id, then the binary
+    /// name, then the visible name — but **`.desktop` has to be appended
+    /// first**, and that is not a detail worth discovering twice.
+    ///
+    /// A desktop entry's id keeps the extension: `org.kde.konsole.desktop`. A
+    /// window's `app_id` does not: `org.kde.konsole`. So the id match — the one
+    /// that should be exact and reliable — never fired, and every window fell
+    /// through to the binary-name attempt. That *happens* to work for
+    /// `alacritty` and `konsole`, which is why the pinned list has always looked
+    /// fine: those are written as bare binary names. It fails for every
+    /// reverse-DNS app id, which is most of them.
+    ///
+    /// Found with `examples/iconprobe.rs`, because the failure draws a lettered
+    /// tile rather than nothing — it reads as "icons do not work here" instead
+    /// of as a string with the wrong suffix.
+    ///
+    /// Built per view rather than cached, and that is a real cost: `svg::Handle`
+    /// and `image::Handle::from_path` are cheap because they key on the path,
+    /// unlike `from_bytes` which stamps a fresh id per call and grows the
+    /// texture cache forever. This is the mistake the launcher icon and the
+    /// cursor both made; `from_path` is the version that does not make it.
+    fn window_icon(&self, app_id: &str) -> Option<Icon> {
+        let app_id = app_id.trim();
+        if app_id.is_empty() {
+            return None;
+        }
+        // The suffixed form first, so the exact id match wins over a binary
+        // name that happens to collide with a different application.
+        let matched = entry::resolve_pinned(&format!("{app_id}.desktop"), &self.installed)
+            .into_iter()
+            .next()
+            .or_else(|| entry::resolve_pinned(app_id, &self.installed).into_iter().next())?;
+        let path = matched.icon.as_deref().and_then(entry::find_icon)?;
+        Some(if path.extension().is_some_and(|e| e == "svg") {
+            Icon::Vector(svg::Handle::from_path(path))
+        } else {
+            Icon::Raster(image::Handle::from_path(path))
+        })
+    }
+
+    /// The running-window strip.
+    ///
+    /// One tile per window, in the order they appeared. A taskbar that reorders
+    /// itself as focus moves is unusable — the tile you are reaching for moves
+    /// as you reach for it — so `windows.rs` publishes first-seen order and this
+    /// does not sort.
+    fn window_tiles(&self) -> Element<'_, Message> {
+        if self.open_windows.is_empty() {
+            // Deliberately empty rather than a placeholder. An empty desktop is
+            // a normal state, and a strip that said "no windows" would be
+            // furniture explaining itself.
+            return column![].into();
+        }
+
+        column(self.open_windows.iter().map(|window| {
+            let glyph: Element<Message> = match self.window_icon(&window.app_id) {
+                Some(Icon::Vector(handle)) => svg(handle)
+                    .width(Length::Fixed(ICON as f32))
+                    .height(Length::Fixed(ICON as f32))
+                    .into(),
+                Some(Icon::Raster(handle)) => image(handle)
+                    .width(Length::Fixed(ICON as f32))
+                    .height(Length::Fixed(ICON as f32))
+                    .into(),
+                None => letter_tile(window.label(), ICON),
+            };
+
+            // The focus marker is a bar beside the tile, not a border around it
+            // — the same choice the launcher's selected row makes, and for the
+            // same reason: one accent shape reads as "this one" where a
+            // rectangle reads as a second control.
+            let tile = row![
+                container(space())
+                    .width(Length::Fixed(3.0))
+                    .height(Length::Fixed(if window.activated { 26.0 } else { 0.0 }))
+                    .style(style::focus_marker(window.activated)),
+                mouse_area(
+                    button(glyph)
+                        .padding(5)
+                        .style(style::window_tile(window.activated, window.minimized)),
+                )
+                .on_press(Message::FocusWindow(window.id))
+                .on_right_press(Message::ToggleMinimize(window.id))
+                .on_middle_press(Message::CloseWindow(window.id)),
+            ]
+            .spacing(2)
+            .align_y(iced::Center);
+
+            tooltip(
+                tile,
+                container(text(window.label().to_string()).size(12))
+                    .padding(6)
+                    .style(style::tip),
+                // Opens away from the strip, or the tooltip covers the tiles it
+                // is describing.
+                tooltip::Position::Right,
+            )
+            .into()
+        }))
+        .spacing(6)
         .align_x(iced::Center)
         .into()
     }
@@ -478,6 +749,32 @@ impl App {
     }
 
     fn view(&self) -> Element<'_, Message> {
+        match self.side {
+            Side::Left => self.windows_view(),
+            Side::Right => self.launchers_view(),
+        }
+    }
+
+    /// The left strip: what is running.
+    ///
+    /// No mark and no tray — those belong to one strip, and duplicating the
+    /// launcher button on both would make the desktop look like it had two
+    /// docks by accident rather than two by design.
+    fn windows_view(&self) -> Element<'_, Message> {
+        container(
+            column![self.window_tiles(), space().height(Fill)]
+                .spacing(8)
+                .align_x(iced::Center),
+        )
+        .padding(5)
+        .width(Length::Fixed(WIDTH as f32))
+        .height(Fill)
+        .style(style::dock)
+        .into()
+    }
+
+    /// The right strip: the mark, pinned launchers, and the tray.
+    fn launchers_view(&self) -> Element<'_, Message> {
         let launcher = tooltip(
             // Both dimensions, like the pinned icons below. Setting only the
             // width leaves the height at iced's default of `Fill`, which
