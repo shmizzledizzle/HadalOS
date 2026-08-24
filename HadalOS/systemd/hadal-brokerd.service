@@ -5,6 +5,19 @@ Requires=hadald.service
 After=hadald.service dbus.service
 Requires=dbus.service
 
+# Shares hadald's network namespace. See the block above ExecStart= for why
+# that is what makes a root broker defensible.
+#
+# This directive lived in [Service] until 2026-08-24, where systemd does not
+# accept it: `Unknown key 'JoinsNamespaceOf' in section [Service], ignoring`,
+# logged once per start and never read. The unit therefore did not share
+# hadald's namespace at all. `PrivateNetwork=yes` meant the failure was
+# invisible — the broker got its *own* empty namespace, so it still had no
+# route to the network and still looked correctly confined, while the property
+# actually being relied on was absent. A comment describing a guarantee, and a
+# directive in the wrong section silently not providing it.
+JoinsNamespaceOf=hadald.service
+
 [Service]
 Type=dbus
 BusName=org.hadal.Broker1
@@ -26,7 +39,9 @@ RestartSec=2s
 #
 # The privilege lives in the component that has no language model in it.
 # That separation is the whole design.
-JoinsNamespaceOf=hadald.service
+#
+# JoinsNamespaceOf= is in [Unit] above — it is a unit property, not a service
+# one, and systemd ignores it here.
 PrivateNetwork=yes
 IPAddressDeny=any
 
