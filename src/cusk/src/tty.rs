@@ -45,6 +45,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use smithay::backend::drm::{DrmNode, NodeType};
 use smithay::backend::libinput::LibinputSessionInterface;
 use smithay::backend::session::libseat::LibSeatSession;
 use smithay::backend::session::Session;
@@ -902,6 +903,14 @@ pub struct Drm {
     pub size: (i32, i32),
     /// Render formats, for the dmabuf global the driver registers itself.
     pub formats: Vec<smithay::backend::allocator::Format>,
+    /// The node clients should allocate on, for the dmabuf global's feedback.
+    ///
+    /// The **render** node, not the card node this struct otherwise holds:
+    /// clients cannot open the card node, which needs DRM master, and a client
+    /// told to allocate on a device it cannot open is a client that renders in
+    /// software. `None` on a GPU exposing no render node, which is a
+    /// configuration cusk can still drive — it just cannot tell clients where.
+    pub render_node: Option<DrmNode>,
 }
 
 impl Drm {
@@ -960,6 +969,14 @@ impl Drm {
             connector,
         };
 
+        // Resolved from the card node rather than assumed to be renderD128:
+        // the numbering follows probe order, and on a machine with a second GPU
+        // the first card's render node is not necessarily the first render one.
+        let render_node = DrmNode::from_file(&card.file)
+            .ok()
+            .and_then(|node| node.node_with_type(NodeType::Render))
+            .and_then(|node| node.ok());
+
         let dup = |what: &str| {
             card.file
                 .try_clone()
@@ -1006,6 +1023,7 @@ impl Drm {
             previous,
             size: (width as i32, height as i32),
             formats,
+            render_node,
         })
     }
 

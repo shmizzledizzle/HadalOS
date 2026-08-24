@@ -1854,15 +1854,58 @@ fn run_on_tty(
 
     // The one global the driver registers itself, because it needs the
     // renderer's formats and only a driver has a renderer.
+    //
+    // # Formats are not enough: clients also need to be told the device
+    //
+    // Version 3 of the protocol advertises a format list and nothing else. It
+    // never says which *device* those formats belong to, and a client cannot
+    // infer it — so Mesa has nowhere to send its allocations, gives up on the
+    // GPU, and falls back to llvmpipe. The symptom is every client logging
+    //
+    //   libEGL warning: failed to get driver name for fd -1
+    //   libEGL warning: egl: failed to create dri2 screen
+    //
+    // and then rendering in software: a desktop that works, looks right, and is
+    // inexplicably slow. The `fd -1` is Mesa saying it never got a device.
+    //
+    // Version 4's default feedback carries `main_device`, which is the missing
+    // half. Clients that bind version 3 or lower still receive these formats
+    // from the main tranche, so this is additive rather than a version bump
+    // anything has to cope with.
     let _dmabuf_global = if drm.formats.is_empty() {
         tracing::warn!("no dmabuf render formats; clients will use shared memory");
         None
     } else {
         let count = drm.formats.len();
-        let global = state
-            .dmabuf_state
-            .create_global::<Cusk>(&dh, drm.formats.clone());
-        tracing::info!("dmabuf advertised with {count} formats");
+        let feedback = drm.render_node.and_then(|node| {
+            match DmabufFeedbackBuilder::new(node.dev_id(), drm.formats.clone()).build() {
+                Ok(feedback) => Some((node, feedback)),
+                Err(e) => {
+                    tracing::warn!("could not build dmabuf feedback: {e}");
+                    None
+                }
+            }
+        });
+        let global = match &feedback {
+            Some((node, feedback)) => {
+                tracing::info!("dmabuf advertised with {count} formats on {node}");
+                state
+                    .dmabuf_state
+                    .create_global_with_default_feedback::<Cusk>(&dh, feedback)
+            }
+            None => {
+                // Survivable, and worth saying plainly: everything still draws,
+                // just on the CPU. Silence here is what made this expensive to
+                // find the first time.
+                tracing::warn!(
+                    "no render node to advertise; clients will fall back to \
+                     software rendering"
+                );
+                state
+                    .dmabuf_state
+                    .create_global::<Cusk>(&dh, drm.formats.clone())
+            }
+        };
         Some(global)
     };
 
