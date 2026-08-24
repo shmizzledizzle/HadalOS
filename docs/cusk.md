@@ -2424,3 +2424,610 @@ hotplug and page-flip timing. on eDP-1, rendering a single colour, with a hard t
 2. libinput, so there is a keyboard.
 3. The render loop, abstracted over winit and DRM.
 4. udev hotplug and VT switching.
+
+## Milestone 34: what windows exist, 2026-08-24
+
+The dock looks rough. The first instinct was that this is a styling problem —
+it is partly, and the flat tiles and shadowless bar are fixed below — but the
+substance of it is that **cusk-dock is not a taskbar**. It knows the
+`.desktop` files it was configured with and whatever claims a tray icon. It has
+no idea which windows are open, so it cannot list them, indicate them, group
+them, or focus them. Compared against XFCE that is not a missing gradient, it
+is a missing protocol.
+
+### Which protocol, and why the cheap one is wrong
+
+Two exist, and the tempting one loses:
+
+| | `ext-foreign-toplevel-list-v1` | `zwlr_foreign_toplevel_management_v1` |
+|---|---|---|
+| standardised | yes | no, wlroots-originated |
+| in smithay 0.7 | **yes**, `wayland::foreign_toplevel_list` | no |
+| enumerate windows | yes | yes |
+| activate / close / minimise | **no** | yes |
+
+The `ext` one is already implemented for us, which makes it look like an
+afternoon's work. It is read-only. A taskbar whose entries cannot be clicked is
+a status display, and the whole complaint is that the dock does nothing.
+
+So: `zwlr_foreign_toplevel_management_v1`, written against
+`wayland-protocols-wlr`, which is already in the graph via layer-shell. It is
+what Plasma, Hyprland, niri and sway all speak, for the same reason.
+
+Worth stating rather than discovering: this protocol is **privileged in spirit
+and not in the specification**. Any client that binds the global can enumerate
+and control every window on the session. Nothing in the protocol restricts who
+may bind, and cusk will not either, because that is how every other compositor
+ships it — but a desktop whose whole thesis is that the assistant gets a
+capability broker should not pretend it did not notice.
+
+### The part that is written
+
+`cusk::toplevel` — the state model and the diff, and nothing else. It lives in
+the library rather than the binary for the reason `entry` does: the compositor
+produces this and the dock consumes it, and two descriptions of "what is a
+window" would drift into a taskbar that disagrees with the compositor about
+which window has focus.
+
+The diff is the load-bearing part and the reason this is a separate, pure
+module. The protocol is not "send the current state", it is "send what changed,
+then `done`", and both ways of getting that wrong are invisible in the good
+case: a redundant `title` event looks fine, and a missing `done` shows up as a
+dock that silently never updates. So it is tested without a display, the way
+`panel.rs` keeps its geometry testable. Eleven tests; the ones that matter:
+
+- **No change sends nothing at all** — not a bare `done`. The compositor calls
+  this on every commit, and an idle window must cost an idle dock nothing.
+- **Leave precedes enter** when a window moves between outputs, or for one
+  event it claims both and a dock grouping by output double-counts it.
+- **State is sent whole, not as a delta** — a window that gains `maximized`
+  must re-send `activated`, because the array is replaced wholesale.
+- **Losing the last state sends an empty array**, not nothing, or the client
+  goes on believing the window is still focused.
+- **Output order is not a change.** The compositor's iteration order is not
+  stable and must not generate traffic.
+
+### The plumbing, and it runs
+
+`cusk::foreign_toplevel` advertises the global and owns the objects;
+`main.rs` holds the state, implements the handler and drives it from the
+window lifecycle. Four decisions in that wiring:
+
+- **Registered on commit, not `new_toplevel`.** The reason `classify` already
+  gives: `set_title` and `set_app_id` are separate requests that have not
+  arrived when the toplevel is created. A dock registered there would show an
+  untitled entry and never learn better. `diff` makes the repeated per-commit
+  call free.
+- **`closed` is sent before `unmap_elem`**, while the id is still reachable.
+  Afterwards there is nothing to look it up from, and a handle that never
+  receives `closed` leaves a dead entry in every taskbar until the client is
+  restarted.
+- **States come from the toplevel's committed xdg state**, not from cusk's own
+  bookkeeping, so a dock is told what the client was told. Two sources for "is
+  this activated" would eventually disagree, and the symptom is a taskbar
+  highlighting the wrong window.
+- **`set_minimized`/`set_maximized`/`set_fullscreen` are accepted and
+  ignored.** cusk has no minimised state — a window is on a workspace or it is
+  not. The protocol has no failure reply, and approximating would be worse than
+  ignoring: a dock would show a window as minimised while it sat visible on
+  workspace 3. `activate` and `close` work.
+
+**Verified nested, 2026-08-24**, because "it compiles" is not evidence that a
+global reached the registry, let alone that anything was sent. `wayland-info`
+is not installed, so two throwaway C clients were written against
+`wayland-scanner` output: one to dump the registry, one to bind the manager and
+print every event.
+
+The registry shows `zwlr_foreign_toplevel_manager_v1 v3`. The client then
+receives, for a konsole started before it connected:
+
+```
+TOPLEVEL #1
+  title  "cusk : zsh — Konsole"
+  app_id "org.kde.konsole"
+  state  [activated]
+  done
+```
+
+That exercises the late-binder catch-up path — the client bound after the
+window existed and was still told about it. Opening a second window and
+reconnecting gives both, in appearance order, and the first now reads
+
+```
+  state  []
+```
+
+which is the protocol behaviour `toplevel::diff`'s
+`losing_the_last_state_sends_an_empty_array` test asserts, observed on real
+hardware: focus moved, and the window that lost it was sent an *empty array*
+rather than nothing. Had that been "send nothing when the set is empty", a dock
+would still be highlighting the first window.
+
+### What is not written
+
+The client half in cusk-dock: bind the manager, track toplevels, render them,
+click to activate. Everything the dock needs is now on the wire and observable
+with the two probes above.
+
+### And the panel comment that expired
+
+`panel.rs` said a clock and a window title were absent because "cusk cannot
+draw a glyph: there is no font rasteriser in the compositor". `text.rs` has
+existed since milestone 15 and says so itself — "cusk could not draw a glyph
+until now" — and `main.rs` loads a `text::Face` at startup. Two modules
+disagreed about what the compositor could do, and the one describing a
+limitation is the one nobody revisited after removing it.
+
+The panel is bare for no current reason. Corrected in place rather than
+quietly, because this is the same shape as the greeter row in ARCHITECTURE.md
+§0 and `/etc/os-release` reverting under host-conversion.md §1 — a state
+recorded once and then outlived. Note what `fontdue` will and will not do: no
+shaping, so Latin, Greek and Cyrillic are correct while Arabic and Devanagari
+come out visibly wrong. The clock is safe; a window title is precisely the
+string most likely to need shaping, and is the piece that wants `cosmic-text`.
+
+### The styling, since it was the presenting complaint
+
+- **Elevation tokens** in `cusk::theme` — `RAISED` for the dock and panel,
+  `OVERLAY` for tooltips and menus. Structure from Breeze's short fixed set of
+  elevations rather than per-widget shadows, so two surfaces at the same height
+  always match; values shaped by Hyprland's large-blur, small-offset, very-low
+  alpha. Near-black rather than a tinted accent, because on a background this
+  dark a coloured shadow reads as a halo instead of depth.
+- **Four button states instead of two.** The dock matched `Hovered | Pressed`
+  together, so clicking looked exactly like hovering and the bar felt
+  unresponsive — the pointer changed nothing on the way down. Pressed is now
+  stronger *and* flatter: a control being pushed should not also rise.
+- **The tooltip sits on `OVERLAY` with a hairline border.** On a dark theme a
+  shadow alone does not separate two near-black surfaces, which is why the old
+  tip disappeared into the bar behind it.
+
+A focus ring was written and then deleted. iced 0.14's `button::Status` has no
+`Focused` variant and the dock has no keyboard navigation to produce one, so it
+was a styling function nothing could call — a capability recorded as though it
+were the state. The gap is real and belongs stated: **the dock cannot be driven
+from the keyboard at all.** `theme::STATE_FOCUS` stays, because the settings
+editor has focusable widgets and should not invent its own.
+
+### Licences, because one of the three references is unusable
+
+cusk is `GPL-2.0-only` — explicit in `Cargo.toml`, not "or-later".
+
+| reference | licence | code into cusk |
+|---|---|---|
+| niri | GPL-3.0 | **no** — GPL-2.0-only cannot incorporate GPL-3 |
+| Hyprland | BSD-3-Clause | yes, with attribution |
+| plasma-desktop | GPL-2+/LGPL per file | yes |
+
+The irony is worth recording: niri is the only one of the three sharing cusk's
+stack — Rust and smithay — and it is the one from which no code may be taken.
+Ideas are not copyrightable and its approaches are fair game, but no lifted
+functions and no lifted shaders. Nothing above is copied from any of them.
+
+## Milestone 35: the launcher becomes a menu, 2026-08-24
+
+Three complaints about the launcher, reported together as one: in floating mode
+it does not sit against the dock, it does not go away once you stop using it,
+and it is a flat list of applications rather than a menu.
+
+They turned out to be three separate faults, and the mode was not one of them.
+
+### Floating mode is a red herring
+
+Nothing about the misplacement is mode-dependent. The launcher is a layer-shell
+surface; the `LayerMap` arranges it against the output and its anchors, and
+tiling has no input into that. It is misplaced identically in both modes.
+
+Floating is simply where it was seen from, because `layout.tile-by-default`
+defaults to `false` — so the mode named in the report is the default mode, not
+the cause. Worth recording as a shape: "it happens in X mode" is evidence about
+where someone was standing, and only sometimes about the bug.
+
+### The dock's width was subtracted twice
+
+The launcher anchored `Right | Top` with `exclusive_zone: 0` and then set a
+right margin of `DOCK` — 48, the dock's width, duplicated as a constant because
+a client cannot ask another client how wide it is.
+
+But a zone of 0 is `ExclusiveZone::Neutral`, and smithay arranges a Neutral
+surface inside the **non-exclusive** zone — `desktop/wayland/layer.rs:300`,
+`source = zone` — which is the output *minus what the dock already reserved*.
+The dock's 48 pixels had therefore already been taken off before the margin was
+applied. Adding it again put the panel one full dock-width clear of the dock it
+is meant to hang off, which is precisely the "not attached" in the report.
+
+The fix is that the margin animates to **0**, not to 48. Zero is against the
+dock, because the zone ends where the dock begins.
+
+Measured in a nested session on a 1280x800 output, which is the only way to be
+sure of an off-by-one-dock:
+
+```
+dock:     pos (1232, 0)  size 48x800     → occupies 1232..1280
+launcher: pos (532, 28)  size 700x520    → right edge 532+700 = 1232
+```
+
+Note what the constant's duplication cost: it was not merely redundant, it was
+*wrong to apply at all*, and the comment beside it explained why the value was
+duplicated rather than whether it should be used. The honest fix is still for
+cusk to publish its layout — but the sharper lesson is that a hardcoded
+copy of another client's geometry hid a double-count behind a plausible reason.
+
+### The top margin ignored the setting it was standing in for
+
+`TOP: i32 = 38`, against `appearance.panel-height`'s default of **28**. The
+compositor's bar is drawn in-process and reserves no exclusive zone, so the
+`LayerMap`'s zone still starts at `y=0` and the launcher does have to subtract
+the bar itself — but by the configured height, not a literal. At the default it
+was 10px adrift; at a configured 64 it was overlapped; at 0 it left a 38px gap
+below a bar that was not there. It now reads `panel_height`, with a small margin
+reserved for the case where the bar is disabled entirely.
+
+### Nothing could dismiss it because nothing had ever focused it
+
+The launcher asks for `KeyboardInteractivity::Exclusive`. **cusk honoured no
+keyboard interactivity at all.** `WlrLayerShellHandler::new_layer_surface`
+mapped and arranged the surface and never looked at the request, and `focus()`
+took a `Window` and read `window.toplevel()` — so no layer surface could hold
+the keyboard by construction.
+
+One unhandled request, four symptoms, which is why it read as several bugs:
+
+- the search field was inert, so the launcher was a list you could not filter —
+  **this is the third complaint**, not a separate missing feature;
+- `Escape` never arrived, so `Message::Cancel` was unreachable;
+- focus was never granted, so it was never lost, so there was no event that
+  could mean "you are done with me" — hence never disappearing;
+- and instances therefore accumulated. Two were live on the reporting session
+  (`/usr/bin/cusk-launcher` and `cusk-launcher`, from the keybinding and the
+  dock respectively, which resolve the name differently — the dock spawns the
+  bare config string while cusk resolves a path first).
+
+cusk now honours `Exclusive` on commit — not on creation, since
+`set_keyboard_interactivity` is a separate request and every surface looks like
+`None` when it is created, the same trap `classify` documents for `set_app_id`.
+`OnDemand` is deliberately *not* honoured on map: it means "focus me when the
+user interacts with me", and treating a map as interaction would let a status
+bar take the keyboard the moment it appeared.
+
+The dismissal then needs no timer and no polling. `wl_keyboard.leave` becomes
+`window::Event::Unfocused` in `iced_layershell`, and that arrives for every way
+of stopping using the launcher — clicking a window, clicking the desktop, or a
+second panel taking the keyboard. The compositor is the only party that knows,
+and it already says so.
+
+Two things had to be added for that not to misfire:
+
+- **Clicks on a layer surface are tested before focus is touched.**
+  `surface_under` asks *which window*, and a layer surface is not one, so a
+  click on the launcher fell through to the "clicked the background" branch,
+  cleared the keyboard, and dismissed the panel the click was aimed at. The
+  panel vanished on press and the row never activated.
+- **The previously focused window is remembered and restored.** Otherwise
+  dismissing the launcher leaves the keyboard focused on nothing and the
+  terminal you were working in stays inert until clicked — which reads as the
+  session having hung. Remembered only on the way in, and only once, so a
+  second panel taking the keyboard from the first cannot overwrite it with the
+  first panel.
+
+Verified in a nested session rather than argued: launcher maps and takes the
+keyboard at `18:55:57`; a window maps at `18:57:03.661`; `layer surface
+destroyed` at `18:57:03.928`. 267ms, unattended. Exactly one grant across the
+run — the dock asks for `None` and correctly got nothing.
+
+### Rows were never clickable either
+
+The flat list built its rows from `container`, which has no `on_press`. Enter
+was the only way to launch anything, and Enter needed keyboard focus, which
+never arrived. **The launcher as shipped could not start a single
+application by any means.** Rows are buttons now.
+
+This is worth separating from the focus bug because it survived it: fixing the
+compositor would have made Enter work and left the mouse dead, and the report
+would have come back as "clicking does nothing".
+
+### The menu
+
+`Categories=` was in the fixture and nowhere in the parser. It is parsed now,
+kept as written — the spec's trailing `;` dropped, since it otherwise yields an
+empty category and a menu section with no title — and mapped to a `Section` at
+presentation time rather than at parse time, so what the file said stays
+askable.
+
+The mapping is not the spec's list. Thirteen main categories and hundreds of
+additional ones, rendered faithfully, gives a menu with `Video` beside
+`AudioVideo` beside `Audio`: a directory listing of the specification rather
+than somewhere to find a music player. `Network` reads as "Internet" and
+`Utility` as "Utilities" because the spec's words are for the file and these are
+for the person reading the screen.
+
+**The precedence table decides, not the file's ordering.** Entries commonly
+declare several main categories — `Settings;System;` and `Utility;Network;` both
+occur — so "first match wins" only gives a stable answer if the table defines
+what first means. Taking the file's order would sort the same application
+differently on two machines depending on how its `.desktop` file was typed.
+`Settings` outranks `System`; `Development` is early, because an IDE declaring
+`Development;Utility;` is not a utility.
+
+Unrecognised and absent categories both land in `Other`, which is a real section
+rather than a silent drop: an installed, runnable application that the menu
+cannot reach is indistinguishable from one that failed to parse.
+
+Layout is a category sidebar with an application pane, the Kickoff shape.
+Sidebar rows carry a count, which is what makes the sidebar worth having — it
+says where things are before anything is clicked. `All` first, then
+`Favourites`, drawn from the **dock's existing pinned list** rather than a
+second setting: the applications someone pinned to the dock are by definition
+the ones they use, and two lists to say that once would be a worse menu.
+`Favourites` is dropped when nothing is pinned, as empty sections are.
+
+Typing searches everything and ignores the selected category. A query that
+returned nothing because the wrong sidebar row was highlighted would look like
+the application was not installed.
+
+**Tab cycles categories, not Left/Right.** The search field always has focus and
+Left/Right are how a cursor moves through what has been typed; binding them to
+the sidebar would make the query uneditable. A less obvious key is the better
+trade.
+
+On this machine, 171 entries: Games 49, Education 21, Utilities 21, Internet 19,
+System 13, Development 12, Multimedia 11, Graphics 8, Office 7, Settings 6,
+**Other 4**. The test asserts the distribution rather than the counts — that
+every entry appears exactly once, and that fewer than half fall through to
+`Other`, since a categoriser that files everything under `Other` has produced
+the flat list this replaced.
+
+### A comment that had outlived its code
+
+`OVERLAY_APP_ID` and the centring path in `classify` describe the launcher as
+"exempt from tiling, centred, focused on map". That stopped being true when the
+launcher became a layer-shell panel: it is never an xdg toplevel and never
+reaches `classify`. The code is a fallback for an xdg-shell launcher and nothing
+in the tree is one.
+
+Left in place, with the comment now saying so, because the failure it caused is
+the one worth preventing: anyone debugging where the launcher appears would read
+"centred", find that function, and be in the wrong file. Same shape as the
+greeter row in ARCHITECTURE.md §0 and `panel.rs`'s own opening — a state
+recorded once and then outlived.
+
+### Not done
+
+- **cusk still does not publish its layout.** The dock width no longer needs to
+  be guessed, but the bar height is still read from the same config file by two
+  processes that could disagree after a live change, and `Restart`-scoped
+  settings hide that. This is the third thing pointing at the same missing IPC.
+- **The launcher does not toggle.** Pressing the key while it is open spawns a
+  second instance, which takes the keyboard, which dismisses the first — so the
+  net effect is a launcher, not two, and no longer a pile of them. But it is a
+  replacement rather than a toggle, and a real toggle needs either single-
+  instance IPC or the compositor tracking that it started one.
+- **The dock and cusk resolve the launcher name differently.** cusk resolves
+  beside itself then `PATH`; the dock spawns the bare config string. They found
+  two different binaries on the reporting session. `resolve_launcher` belongs in
+  the library alongside `entry`.
+- **Selection following is proportional, not minimal.** `snap_to(selected /
+  last)` keeps the selection on screen without measuring row heights or the
+  viewport, neither of which `update` can see, but it scrolls more than needed.
+
+## Milestone 36: one binding table, and a tray that survives, 2026-08-24
+
+Two requests: build in the system tray, and add a key that shows the important
+shortcuts. The second turned out to be mostly a de-duplication job, and the
+first turned out to be a repair job — most of the tray was already written and
+none of it was dependable.
+
+### There were three lists of bindings and no way to notice they disagreed
+
+`binding_for`'s match, the startup banner, and a test enumerating what the
+banner advertised. Each maintained by hand. A binding could be implemented and
+undocumented, documented and unbound, or present only in the test, and nothing
+would say so — the test asserted that the *banner's* entries resolved, which
+proves nothing about entries the banner had never heard of.
+
+So the table moved to `cusk::bindings`, in the library for the reason `entry` is:
+the compositor executes it and `cusk-keys` draws it. Now there is one table and
+three renderers.
+
+The two directions are checked separately, because they fail separately:
+
+- `every_documented_chord_resolves` walks `DOCUMENTED` and asserts each row's
+  keysym resolves. Catches a documented key that does nothing.
+- `every_binding_variant_is_documented` requires a row per `Binding` variant,
+  through an exhaustive match with no wildcard — so **adding a variant and
+  forgetting the table fails to compile**, rather than failing a test someone
+  might not run.
+
+Rows that no single keysym covers — pointer gestures, `1..9`, the tty chords —
+carry `check: None` and are honestly the places an error can still hide.
+
+`ModKey` moved too, and that one is not tidiness. Every chord renders as
+"<label> + key", and the label depends on `CUSK_MOD`, which is an *environment
+variable*. A panel reading only `cusk.toml` would print "super" for a session
+actually running on alt — a shortcut list confidently wrong about every line.
+Verified: under `CUSK_MOD=ctrl-alt` the banner and the panel both render
+`ctrl + alt + d`.
+
+The banner also gained the two chords it had never mentioned —
+`ctrl + alt + f1..f12` and `ctrl + alt + escape`. They live in the tty driver's
+chord table, ignore `input.mod-key`, and are marked `Fixed` so they are never
+rendered with a modifier prefix. A shortcut list that omits how to leave the
+session is not a shortcut list.
+
+Column widths are computed from the rendered chords rather than hardcoded,
+because "ctrl + alt" is nine characters wider than "alt" and a fixed indent
+lines up under exactly one setting.
+
+### cusk-keys
+
+`Super + /`, and `Super + ?` — the shifted form of the same key. Matching only
+`slash` meant Shift+/ did nothing, which is what someone reaching for "help"
+presses about half the time.
+
+A layer-shell panel anchored to **nothing**, which is how smithay centres a
+surface: with neither `LEFT` nor `RIGHT` set, x becomes
+`(zone.w / 2) - (size.w / 2)`. Measured nested on 1280x800 with the dock
+running: `pos (306, 120) size 620x520`, and `(1232 - 620) / 2 = 306`. Centred in
+the space left by the dock rather than on the raw output, because a zone of 0 is
+`Neutral` and Neutral surfaces are arranged inside the non-exclusive zone —
+the same mechanism that put the launcher one dock-width off in milestone 35,
+working correctly this time.
+
+Dismissal is milestone 35's: `Unfocused` is `wl_keyboard.leave`. Verified — a
+window mapped at `19:41:55.750`, `layer surface destroyed` at `19:41:55.858`.
+
+### The tray was written and was not dependable
+
+`tray.rs` already had the watcher, registration, ARGB decoding, activation and
+tests. What it did not have was any way to survive the session it runs in.
+
+**The live session had already failed.** The dock logged `tray: watching for
+status notifier items` at 12:29:22, the process was still running hours later,
+and nothing owned `org.kde.StatusNotifierWatcher`. Empty tray, no log line, no
+recovery, for the rest of the session.
+
+The obvious explanation is wrong, and checking it changed the fix. The name
+cannot have been *stolen*: zbus requests names with `DoNotQueue` and without
+`AllowReplacement`, so another process asking with `ReplaceExisting` is refused —
+confirmed by reading `connection/builder.rs`, where `request_name_flags` starts
+as `BitFlags::default()`, which is empty. What is left is that the **connection
+died while the process lived**.
+
+That distinction decides everything, because `receive_name_lost` is delivered
+*on the connection*. A dead connection reports nothing. The first version of
+this fix watched for `NameLost` and **would not have caught the failure it was
+written for**. Ownership is now *verified* each tick against the bus — compare
+`GetNameOwner` to our own unique name — and a failed call counts as "no longer
+the watcher", because a connection that cannot ask the bus a question cannot
+receive registrations either. Losing it rebuilds the connection from scratch.
+
+Registrations are cleared on reconnect rather than carried over: they belonged
+to the previous connection's object. Applications re-register when a watcher
+appears, which is the same mechanism that fills the tray at login.
+
+### One slow reply used to lose an icon permanently
+
+`refresh` dropped any item whose `GetAll` did not answer, and **nothing ever
+re-registers it** — the watcher is told about an item once, when the application
+starts. So a single busy moment in a single-threaded application removed its
+icon for the rest of the session. That is the likeliest reason a tray looks
+empty while the applications are plainly running.
+
+Three consecutive failures now, and a failing item keeps its **last known good**
+properties in the meantime — an icon that flickers to a lettered placeholder
+every time its application is briefly busy is worse than one that holds.
+
+`Status` is read at last. `Passive` means "do not show me", and it is filtered in
+the snapshot rather than in the view so every consumer agrees what the tray
+contains. `NeedsAttention` swaps in `AttentionIconName` and tints the tile —
+a tint rather than a pulse, because an animation needs a timer running for as
+long as any item is asking for attention, and a bar that animates forever is
+always slightly distracting.
+
+### Right-click, which is the primary interaction for most tray items
+
+There is no menu in StatusNotifierItem. The `Menu` property is an **object path
+to a second, unrelated protocol** — `com.canonical.dbusmenu`, a whole tree with
+its own revision counter and event channel. So right-click is not one more
+property, it is a second protocol against a second object.
+
+`menu.rs` is the walk, and it is pure, so it is testable against hand-built trees
+with no bus and no application. That matters more here than anywhere else in the
+dock: a mis-decoded menu is not a blank space, it is *the wrong item where the
+user clicked* — "Quit" and "Preferences" trading places.
+
+Two decoding bugs, and the second is the interesting one:
+
+- **The layout arrives variant-wrapped** at levels the signature does not
+  mention. Matching `Value::Dict` directly returned an empty menu from a
+  perfectly well-formed tree. Found by probing what the values actually are
+  rather than by reading the spec — the spec describes the wire, and this has to
+  survive whatever the sender's binding did on top of it. `peel` now unwraps at
+  every level.
+- **`a{sv}` values are variants, and `bool::try_from` on a variant-wrapped bool
+  fails rather than unwrapping.** So every `enabled: false` and `visible: false`
+  fell through to its default of `true`. And because `<&str>::try_from` *does*
+  peel, the labels decoded correctly and **the menu looked entirely right** —
+  every row drawn, every row clickable, nothing greyed, nothing hidden. The
+  defaults being correct is what made the decoding bug invisible. There is a
+  test for it now that distinguishes a present `false` from an absent key,
+  which is the only shape of test that could have caught it.
+
+`AboutToShow` is called before reading, so applications that populate lazily —
+device lists, recent files — have built their contents. Its reply is
+deliberately ignored: the layout is read either way, and trusting a `false` from
+an application that had not in fact populated would produce an empty menu.
+
+Submenus draw **inline and indented**, not as flyouts. A flyout needs pointer
+tracking, a grab, and a decision about which way to open near a screen edge —
+none of which this has, and all of which are visibly wrong when they fail.
+
+`has_submenu` is read from `children-display`, not from the child count, so a
+submenu an application has not populated yet still shows an arrow. Without that,
+a menu looks like it has no submenus and the user never opens the one place the
+interesting options live.
+
+Validated against a real application. `kdeconnect-indicator`, read off the wire:
+
+```text
+u(ia{sv}av) 2 0 1 "children-display" s "submenu"
+                1 (ia{sv}av) 1 1 "label" s "Open app" 0
+```
+
+Note what a real menu does *not* contain: no `type`, no `enabled`, no `visible`,
+no `toggle-type`. It is mostly absent keys, which is why the defaults are the
+part most worth testing. That exact shape is now a test. The same application
+also confirmed `Menu` is an `o` and not an `s` — reading it with the string
+helper fails for every item that has a menu, which reads as "no item has a
+menu" and makes right-click universally dead — and that it reports
+`Status: Passive`, which is a real item that a correct tray must hide.
+
+### The menu had nowhere to be drawn
+
+The dock is a 48px strip. The surface **widens leftward** while a menu is open —
+it is anchored `Right`, so growing the width extends it left and the strip does
+not move — and the **exclusive zone stays at `WIDTH`**, which is what stops
+windows being shoved aside every time someone right-clicks. The zone is the
+reservation and is deliberately not the surface size.
+
+The resize happens in one place: `update` compares whether a menu was open
+before and after handling the message. Every arm that opens or closes one would
+otherwise have to remember to resize, and the one that forgot would leave a
+260px invisible surface swallowing clicks over the desktop.
+
+The transparent area beside the menu is a dismissal target rather than dead
+space, since it is part of the surface and would swallow those clicks anyway.
+
+`mouse_area` replaces `button` on tray tiles, because a button cannot tell the
+three mouse buttons apart. Middle-click is wired to `SecondaryActivate` — for a
+volume applet that is mute and for a player it is play/pause, so aliasing it to
+`Activate` would silently do the wrong thing rather than nothing.
+
+`ItemIsMenu` is honoured: items whose icon has no primary action open their menu
+on a *left* click. Calling `Activate` on those does nothing at all, which reads
+as a dead icon.
+
+Menu clicks resolve through the **remembered service**, not the index. The tray
+refreshes on a two-second timer, and an item can vanish while its menu is open —
+without the check, the next click goes to whichever item slid into that slot.
+
+### A test that failed for the right reason
+
+`ownership_is_confirmed_against_the_bus` first failed on `the owner must
+recognise itself`. Not a bug in the check: the other end-to-end test calls
+`start()`, which claims the watcher name, cargo runs tests in threads sharing one
+bus, and whichever lost the race genuinely did not own the name. The check was
+right about a connection that did not own it. It now uses a name of its own.
+
+### Not done
+
+- **The tray still polls.** Two seconds, and `NewIcon`/`NewTitle`/`NewStatus`
+  signals are not subscribed to. An icon changes up to two seconds late.
+- **No overflow.** Enough tray icons will run off the strip.
+- **`ToolTip` is not read**, so the hover text is the title rather than the
+  richer tooltip the specification defines.
+- **The dock still cannot be driven from the keyboard**, and now has a menu that
+  cannot be either.
+- **`fetch_menu` blocks the UI thread**, with a 700ms timeout as the safeguard.
+  A wedged tray icon must not take the dock with it; the honest fix is a channel
+  from the tray thread, which is the same plumbing a signal-driven tray needs.

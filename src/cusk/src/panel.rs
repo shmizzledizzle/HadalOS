@@ -7,15 +7,33 @@
 //! choice was a compositor-drawn bar or a fake panel pretending to be an
 //! ordinary window, and a fake would have to be undone later.
 //!
-//! # No text, on purpose
+//! # No text — and that reason expired
 //!
-//! A window title and a clock are the obvious contents and neither is here,
-//! because cusk cannot draw a glyph: there is no font rasteriser in the
-//! compositor and adding one is its own piece of work. What *is* here needs no
-//! text — one pill per workspace, filled when occupied, accented when active —
-//! and that is exactly the thing `Super+1..9` was missing, because switching to
-//! an empty workspace is otherwise indistinguishable from the compositor
-//! having hung.
+//! This module used to say a window title and a clock were absent "because
+//! cusk cannot draw a glyph: there is no font rasteriser in the compositor".
+//! **That stopped being true when `text.rs` landed**, which says so in its own
+//! first paragraph — "cusk could not draw a glyph until now, which is why
+//! milestone 15's indicator is rectangles" — and `main.rs` already loads a
+//! `text::Face` at startup.
+//!
+//! So the panel is bare for no current reason. Two modules disagreed about
+//! what the compositor could do, and the one describing a limitation was the
+//! one nobody revisited after removing it. This is the same shape as the
+//! greeter row in ARCHITECTURE.md §0 and `/etc/os-release` reverting under
+//! host-conversion.md §1: a state recorded once and then outlived.
+//!
+//! What is here — one pill per workspace, filled when occupied, accented when
+//! active — remains right, and is exactly what `Super+1..9` was missing:
+//! switching to an empty workspace is otherwise indistinguishable from the
+//! compositor having hung. What is *missing* is a clock and a focused-window
+//! title, both of which are now ordinary work rather than blocked work.
+//!
+//! Note what `text.rs` will and will not give the panel, since it is fontdue
+//! rather than a shaping engine: Latin, Greek and Cyrillic render correctly;
+//! Arabic and Devanagari come out visibly wrong rather than absent. A window
+//! title is exactly the string most likely to be in a script that needs
+//! shaping, so the title is the piece of this that wants `cosmic-text` and the
+//! clock is the piece that does not.
 //!
 //! Everything in this module is pure geometry, so where the pills are and what
 //! a click lands on can be tested without a display.

@@ -1,0 +1,17 @@
+[package]
+name = "cusk-keys"
+version = "0.1.0"
+edition = "2021"
+description = "Keyboard shortcut list for the cusk window manager"
+license = "GPL-2.0-only"
+
+[[bin]]
+name = "cusk-keys"
+path = "src/main.rs"
+
+[dependencies]
+# For the binding table and the palette. The whole point of this program is to
+# render `cusk::bindings`, so a copy of the list here would defeat it.
+cusk = { path = "../cusk" }
+iced = { version = "0.14.0", features = ["tokio"] }
+iced_layershell = "0.19.1"

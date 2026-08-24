@@ -62,21 +62,12 @@ use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 
 /// A compositor-level binding, returned from the keyboard filter so the event
 /// loop can act on it after the borrow of the seat ends.
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum Binding {
-    ToggleMaximize,
-    ToggleTiling,
-    ToggleFloating,
-    CycleLayout,
-    Widen(i32),
-    Spawn,
-    Launcher,
-    FocusStep(isize),
-    MoveInOrder(isize),
-    Promote,
-    Workspace(usize),
-    SendToWorkspace(usize),
-}
+///
+/// Defined in the library, not here. `cusk-keys` renders the same list this
+/// executes, and the three hand-maintained copies that preceded it — this
+/// match, the startup banner, and a test enumerating the banner — could
+/// disagree in any direction without anything saying so.
+use cusk::bindings::{self, Binding};
 use smithay::input::pointer::{AxisFrame,ButtonEvent, GrabStartData, MotionEvent};
 use smithay::input::{Seat, SeatHandler, SeatState};
 use smithay::reexports::wayland_server::protocol::wl_buffer;
@@ -96,7 +87,8 @@ use smithay::wayland::selection::data_device::{
 use smithay::wayland::selection::SelectionHandler;
 use smithay::desktop::{layer_map_for_output, LayerSurface};
 use smithay::wayland::shell::wlr_layer::{
-    Layer, LayerSurface as WlrLayerSurface, WlrLayerShellHandler, WlrLayerShellState,
+    KeyboardInteractivity, Layer, LayerSurface as WlrLayerSurface, LayerSurfaceCachedState,
+    WlrLayerShellHandler, WlrLayerShellState,
 };
 use smithay::wayland::shell::xdg::decoration::{XdgDecorationHandler, XdgDecorationState};
 use smithay::wayland::shell::xdg::{
@@ -123,60 +115,24 @@ use ::winit::platform::pump_events::PumpStatus;
 /// resize — the same gestures — so KWin consumes them before the nested window
 /// sees anything. `CUSK_MOD=alt` exists so the bindings can be exercised under
 /// a host that has already claimed Super.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ModKey {
-    Super,
-    Alt,
-    Ctrl,
-    CtrlAlt,
-}
-
-impl ModKey {
-    /// Resolve from the config, with `CUSK_MOD` overriding it.
-    ///
-    /// The env var stays because it is a testing affordance for nested runs
-    /// under a host that claims the same modifier, and editing a config file
-    /// to try the other one is friction in exactly the wrong place.
-    fn resolve(configured: &str) -> Self {
-        let chosen = std::env::var("CUSK_MOD").unwrap_or_else(|_| configured.to_string());
-        Self::parse(&chosen)
-    }
-
-    fn parse(name: &str) -> Self {
-        match name.to_ascii_lowercase().as_str() {
-            "alt" => ModKey::Alt,
-            "ctrl" => ModKey::Ctrl,
-            "ctrl-alt" | "ctrlalt" => ModKey::CtrlAlt,
-            "" | "super" | "logo" | "meta" => ModKey::Super,
-            other => {
-                tracing::warn!("mod key {other:?} not recognised, using super");
-                ModKey::Super
-            }
-        }
-    }
-
-    fn held(self, m: &ModifiersState) -> bool {
-        match self {
-            ModKey::Super => m.logo,
-            ModKey::Alt => m.alt,
-            ModKey::Ctrl => m.ctrl,
-            ModKey::CtrlAlt => m.ctrl && m.alt,
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            ModKey::Super => "super",
-            ModKey::Alt => "alt",
-            ModKey::Ctrl => "ctrl",
-            ModKey::CtrlAlt => "ctrl + alt",
-        }
-    }
-}
+/// Defined in the library, beside the bindings it arms: `cusk-keys` renders
+/// every chord as "<label> + key", so the label it prints has to be the one
+/// this session resolved — including a `CUSK_MOD` override, which a client
+/// cannot see any other way.
+pub use cusk::bindings::ModKey;
 
 /// The app id cusk treats as an overlay: exempt from tiling and centred.
-/// Must match `cusk-launcher`'s own constant; changing one without the other
-/// turns the launcher back into an ordinary tiled window.
+///
+/// **The shipped launcher no longer takes this path.** `cusk-launcher` became a
+/// layer-shell panel — anchored beside the dock, arranged by the `LayerMap` —
+/// so it is never an xdg toplevel and never reaches `classify`. This is now a
+/// fallback for an xdg-shell launcher, and nothing in the tree is one.
+///
+/// Left in place, and said out loud here, because the comment it replaced
+/// described the live behaviour of code that had stopped running: anyone
+/// debugging where the launcher appears would read "centred", find this, and be
+/// looking at the wrong file. That is the failure `panel.rs` opens by
+/// describing — a state recorded once and then outlived.
 const OVERLAY_APP_ID: &str = "cusk-launcher";
 
 /// What `classify` has worked out about a window so far.
@@ -210,6 +166,16 @@ struct Cusk {
     #[allow(dead_code)]
     xdg_decoration_state: XdgDecorationState,
     layer_shell_state: WlrLayerShellState,
+    /// What windows exist, as other clients see them. This is what makes a
+    /// taskbar possible — see cusk::toplevel and docs/cusk.md milestone 34.
+    foreign_toplevel_state: cusk::foreign_toplevel::ForeignToplevelState,
+    /// Ids handed to `foreign_toplevel`. Monotonic and never reused: a client
+    /// that outlives a window must not have a stale handle silently start
+    /// referring to a different one.
+    next_toplevel_id: u64,
+    /// Needed to create handle resources when a window appears. Cloned from
+    /// the constructor rather than threaded through every call site.
+    display: smithay::reexports::wayland_server::DisplayHandle,
     /// Held for the `wp_viewporter` global's lifetime.
     ///
     /// Lets a client say "scale this buffer to that size", which is how a
@@ -265,6 +231,27 @@ struct Cusk {
     /// Current output size in logical coordinates, kept so relayout does not
     /// need the render loop to hand it over.
     output_size: (i32, i32),
+    /// The layer surface currently holding the keyboard, if any.
+    ///
+    /// Layer surfaces ask for keyboard focus through
+    /// `set_keyboard_interactivity`, and cusk honoured none of it: `focus()`
+    /// takes a `Window` and reads `window.toplevel()`, so no layer surface could
+    /// ever hold the keyboard. The launcher asks for `Exclusive` and got
+    /// nothing, which made its search field inert, made Escape unreachable, and
+    /// meant it never received a `leave` — so it could not dismiss itself
+    /// either. One unhandled request, three symptoms.
+    ///
+    /// Remembered rather than re-derived, because giving focus back needs to
+    /// know it was taken: the seat only reports what has focus now, not what had
+    /// it before a panel appeared.
+    keyboard_layer: Option<LayerSurface>,
+    /// The window that had the keyboard before a layer surface took it.
+    ///
+    /// Restored when the layer goes away. Without it, dismissing the launcher
+    /// leaves the keyboard focused on nothing, and the terminal the user was
+    /// working in stays inert until they click it — which reads as the
+    /// compositor having hung.
+    focus_before_layer: Option<Window>,
 }
 
 // ── protocol handlers ────────────────────────────────────────────────────
@@ -311,6 +298,14 @@ impl CompositorHandler for Cusk {
             window.on_commit();
             self.classify(&window);
 
+            // Publish to foreign-toplevel clients here rather than at
+            // new_toplevel, for the reason classify documents: `set_title` and
+            // `set_app_id` are separate requests that have not arrived when the
+            // toplevel is created, so a dock registered there would show an
+            // untitled entry and never learn better. On commit both are known,
+            // and `toplevel::diff` makes the repeated call free when nothing
+            // has changed.
+            self.publish_toplevel(&window);
 
             if let Some(toplevel) = window.toplevel() {
                 toplevel.send_configure();
@@ -357,6 +352,17 @@ impl CompositorHandler for Cusk {
             if changed {
                 // The zone moved, so anything placed against it is now wrong.
                 self.relayout();
+            }
+
+            // On commit, not on creation, for the same reason the arrangement
+            // is: `set_keyboard_interactivity` is a separate request, so at
+            // creation every surface still looks like it wants `None`.
+            let layer = {
+                let map = layer_map_for_output(&self.output);
+                map.layer_for_surface(surface, WindowSurfaceType::ALL).cloned()
+            };
+            if let Some(layer) = layer {
+                self.grant_layer_keyboard(&layer);
             }
         }
 
@@ -509,6 +515,17 @@ impl XdgShellHandler for Cusk {
             .find(|w| w.toplevel().map(|t| t.wl_surface()) == Some(surface.wl_surface()))
             .cloned();
         if let Some(window) = gone {
+            // Tell the docks before the window leaves the space, while its id
+            // is still reachable. After unmap_elem there is nothing to look it
+            // up from, and a handle that never receives `closed` leaves a dead
+            // entry in every taskbar until the client is restarted.
+            if let Some(id) = window
+                .user_data()
+                .get::<cusk::foreign_toplevel::ToplevelId>()
+                .copied()
+            {
+                self.foreign_toplevel_state.remove(id);
+            }
             self.space.unmap_elem(&window);
             // Drop it from the tile order too, or the layout keeps reserving a
             // column for a window that no longer exists — a gap that looks
@@ -621,11 +638,17 @@ impl WlrLayerShellHandler for Cusk {
             .layers()
             .find(|l| l.layer_surface() == &surface)
             .cloned();
+        let held_keyboard = found.as_ref() == self.keyboard_layer.as_ref();
         if let Some(layer) = found {
             map.unmap_layer(&layer);
             map.arrange();
         }
         drop(map);
+        // The keyboard cannot be left pointing at a destroyed surface: every
+        // subsequent keystroke goes nowhere, and the session looks hung.
+        if held_keyboard {
+            self.restore_focus_after_layer();
+        }
         tracing::info!("layer surface destroyed");
         // The space it reserved is usable again, and a layout computed while
         // it existed is now wrong.
@@ -633,6 +656,42 @@ impl WlrLayerShellHandler for Cusk {
     }
 }
 smithay::delegate_layer_shell!(Cusk);
+
+impl cusk::foreign_toplevel::ForeignToplevelHandler for Cusk {
+    fn foreign_toplevel_state(&mut self) -> &mut cusk::foreign_toplevel::ForeignToplevelState {
+        &mut self.foreign_toplevel_state
+    }
+
+    fn request(
+        &mut self,
+        id: cusk::foreign_toplevel::ToplevelId,
+        request: cusk::foreign_toplevel::Request,
+    ) {
+        use cusk::foreign_toplevel::Request as R;
+        let Some(window) = self.window_for_toplevel_id(id) else {
+            // The window went away between the client sending and us reading.
+            // Ordinary, not an error: the client is told by `closed`.
+            return;
+        };
+        match request {
+            R::Activate => self.focus(&window),
+            R::Close => {
+                if let Some(toplevel) = window.toplevel() {
+                    toplevel.send_close();
+                }
+            }
+            // Deliberately unimplemented, and silently so — the protocol has
+            // no failure reply and a compositor that cannot minimise simply
+            // does not. cusk has no minimised state at all: a window is on a
+            // workspace or it is not. Wiring these to something approximate
+            // would be worse than ignoring them, because a dock would show a
+            // window as minimised while it sat visible on another workspace.
+            R::SetMinimized(_) | R::SetMaximized(_) | R::SetFullscreen(_) => {}
+        }
+    }
+}
+
+cusk::delegate_foreign_toplevel!(Cusk);
 smithay::delegate_viewporter!(Cusk);
 
 impl SeatHandler for Cusk {
@@ -711,6 +770,30 @@ impl Cusk {
     /// its clicks would be worse than one that did not render at all. Layers
     /// *below* are not tested at all — a wallpaper client stealing clicks from
     /// the windows in front of it is the same bug facing the other way.
+    /// Which layer surface the pointer is over, if any.
+    ///
+    /// The same layers, in the same order, as `pointer_focus` — above the
+    /// windows only, and topmost first. Kept separate because the caller wants
+    /// *which panel*, not which of its subsurfaces: focus decisions are per
+    /// surface-tree, and a click on a tooltip inside the launcher is still a
+    /// click on the launcher.
+    fn layer_under_pointer(&self) -> Option<LayerSurface> {
+        let map = layer_map_for_output(&self.output);
+        // Bound before the guard is dropped rather than returned directly: the
+        // map is behind a mutex, and the iterator borrows it.
+        let found = map
+            .layers()
+            .rev()
+            .filter(|layer| matches!(layer.layer(), Layer::Top | Layer::Overlay))
+            .find(|layer| {
+                map.layer_geometry(layer)
+                    .is_some_and(|geo| geo.to_f64().contains(self.pointer_location))
+            })
+            .cloned();
+        drop(map);
+        found
+    }
+
     fn pointer_focus(
         &self,
         point: Point<f64, Logical>,
@@ -922,6 +1005,91 @@ impl Cusk {
 
     pub fn focused(&self) -> Option<Window> {
         self.workspaces.active().focused.clone()
+    }
+
+    /// The stable id this window is known by on the foreign-toplevel protocol.
+    ///
+    /// Stored in the window's own user data, the same way `classify` stores
+    /// its `Classification`, so nothing has to keep a second map in step with
+    /// the space. Allocated once and never reused — a client holding a handle
+    /// for a window that has closed must not find the id pointing at a
+    /// different window later.
+    fn toplevel_id(&mut self, window: &Window) -> cusk::foreign_toplevel::ToplevelId {
+        if let Some(id) = window.user_data().get::<cusk::foreign_toplevel::ToplevelId>() {
+            return *id;
+        }
+        let id = cusk::foreign_toplevel::ToplevelId(self.next_toplevel_id);
+        self.next_toplevel_id += 1;
+        window.user_data().insert_if_missing(|| id);
+        id
+    }
+
+    fn window_for_toplevel_id(
+        &self,
+        id: cusk::foreign_toplevel::ToplevelId,
+    ) -> Option<Window> {
+        self.space
+            .elements()
+            .find(|w| {
+                w.user_data().get::<cusk::foreign_toplevel::ToplevelId>() == Some(&id)
+            })
+            .cloned()
+    }
+
+    /// What the protocol should currently say about this window.
+    ///
+    /// The states come from the toplevel's *committed* xdg state rather than
+    /// from cusk's own bookkeeping, so a dock is told what the client was told.
+    /// Two sources for "is this window activated" would eventually disagree,
+    /// and the visible symptom is a taskbar highlighting the wrong entry.
+    ///
+    /// No `Minimized`: cusk has no minimised state — a window is on a
+    /// workspace or it is not — and inventing one here would make a dock claim
+    /// something untrue about a window sitting visible on workspace 3.
+    fn toplevel_snapshot(&self, window: &Window) -> cusk::toplevel::Snapshot {
+        use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
+
+        let mut snapshot = cusk::toplevel::Snapshot::default();
+        let Some(toplevel) = window.toplevel() else {
+            return snapshot;
+        };
+
+        smithay::wayland::compositor::with_states(toplevel.wl_surface(), |states| {
+            if let Some(data) = states
+                .data_map
+                .get::<smithay::wayland::shell::xdg::XdgToplevelSurfaceData>()
+                .and_then(|d| d.lock().ok())
+            {
+                snapshot.title = data.title.clone().unwrap_or_default();
+                snapshot.app_id = data.app_id.clone().unwrap_or_default();
+            }
+        });
+
+        let current = toplevel.current_state();
+        if current.states.contains(xdg_toplevel::State::Activated) {
+            snapshot.states.insert(cusk::toplevel::State::Activated);
+        }
+        if current.states.contains(xdg_toplevel::State::Maximized) {
+            snapshot.states.insert(cusk::toplevel::State::Maximized);
+        }
+        if current.states.contains(xdg_toplevel::State::Fullscreen) {
+            snapshot.states.insert(cusk::toplevel::State::Fullscreen);
+        }
+        snapshot
+    }
+
+    /// Register the window if new, then publish whatever changed.
+    ///
+    /// Cheap enough to call on every commit: `toplevel::diff` returns nothing
+    /// when nothing changed, and this then touches no sockets.
+    fn publish_toplevel(&mut self, window: &Window) {
+        let id = self.toplevel_id(window);
+        if !self.foreign_toplevel_state.contains(id) {
+            let display = self.display.clone();
+            self.foreign_toplevel_state.add::<Cusk>(&display, id);
+        }
+        let snapshot = self.toplevel_snapshot(window);
+        self.foreign_toplevel_state.publish(id, &snapshot);
     }
 
     /// Decide what a window *is*, once, on its first commit.
@@ -1379,12 +1547,109 @@ impl Cusk {
     /// raised but not focused, is the classic window-manager bug where typing
     /// goes to something you cannot see.
     fn focus(&mut self, window: &Window) {
+        // A window taking the keyboard is what dismisses a panel that was
+        // holding it: the layer surface receives `leave`, and a launcher that
+        // wants to disappear when it stops being used now has an event that
+        // says so. Released before the new focus is set, so the client sees
+        // leave-then-enter rather than two enters.
+        self.release_layer_keyboard();
         self.workspaces.active_mut().focused = Some(window.clone());
         let location = self.space.element_location(window).unwrap_or_default();
         self.space.map_element(window.clone(), location, true);
         if let Some(kb) = self.seat.get_keyboard() {
             let surface = window.toplevel().map(|t| t.wl_surface().clone());
             kb.set_focus(self, surface, Serial::from(0));
+        }
+    }
+
+    /// What a layer surface asked for through `set_keyboard_interactivity`.
+    ///
+    /// Read from the *current* cached state rather than pending: interactivity
+    /// is double-buffered like everything else in the protocol, so the pending
+    /// value is what the client will want after its next commit, not what it
+    /// wants now.
+    fn layer_interactivity(layer: &LayerSurface) -> KeyboardInteractivity {
+        smithay::wayland::compositor::with_states(layer.wl_surface(), |states| {
+            states.cached_state.get::<LayerSurfaceCachedState>().current().keyboard_interactivity
+        })
+    }
+
+    /// Give the keyboard to a layer surface that has asked for it.
+    ///
+    /// Only `Exclusive` is honoured here. `OnDemand` means "focus me when the
+    /// user interacts with me", which is a click, not a map — handling it here
+    /// would let a status bar steal the keyboard the moment it appeared.
+    fn grant_layer_keyboard(&mut self, layer: &LayerSurface) {
+        if Self::layer_interactivity(layer) != KeyboardInteractivity::Exclusive {
+            return;
+        }
+        // Already ours. Re-setting focus on every commit would send a
+        // leave/enter pair per frame, and a client that resets its input state
+        // on enter would drop the keystroke that arrived in between.
+        if self.keyboard_layer.as_ref() == Some(layer) {
+            return;
+        }
+
+        // Remembered only on the way in, and only once: a second panel taking
+        // the keyboard from the first must not overwrite this with the first
+        // panel, or dismissing both returns focus to a launcher instead of to
+        // the window the user was actually working in.
+        if self.keyboard_layer.is_none() {
+            self.focus_before_layer = self.focused();
+        }
+        self.keyboard_layer = Some(layer.clone());
+        if let Some(kb) = self.seat.get_keyboard() {
+            let surface = layer.wl_surface().clone();
+            kb.set_focus(self, Some(surface), SERIAL_COUNTER.next_serial());
+        }
+        tracing::debug!("layer surface took the keyboard");
+    }
+
+    /// Take the keyboard back from whichever layer surface holds it.
+    ///
+    /// Does not restore the previous window — callers that are handing focus to
+    /// something else would immediately overwrite it, and calling `focus` from
+    /// here would recurse.
+    fn release_layer_keyboard(&mut self) -> bool {
+        if self.keyboard_layer.take().is_none() {
+            return false;
+        }
+        if let Some(kb) = self.seat.get_keyboard() {
+            kb.set_focus(self, None, SERIAL_COUNTER.next_serial());
+        }
+        true
+    }
+
+    /// Hand the keyboard back to the window that had it before a panel took it.
+    ///
+    /// Falls back to the workspace's focused window, then to nothing. The
+    /// remembered window may have closed while the launcher was open, and a
+    /// stale `Window` would be focused, raised, and invisible.
+    fn restore_focus_after_layer(&mut self) {
+        self.keyboard_layer = None;
+        let previous = self
+            .focus_before_layer
+            .take()
+            .filter(|w| self.space.elements().any(|e| e == w))
+            .or_else(|| self.focused());
+        // Logged either way. "The keyboard stopped working after I closed the
+        // launcher" is the failure this method exists to prevent, and it is
+        // indistinguishable from a hung compositor unless the handover says
+        // which branch it took.
+        match previous {
+            Some(window) => {
+                tracing::debug!(
+                    "keyboard restored to {:?} after layer",
+                    window.toplevel().and_then(|_| self.focused_title())
+                );
+                self.focus(&window);
+            }
+            None => {
+                tracing::debug!("keyboard released after layer: no window to restore to");
+                if let Some(kb) = self.seat.get_keyboard() {
+                    kb.set_focus(self, None, SERIAL_COUNTER.next_serial());
+                }
+            }
         }
     }
 }
@@ -1880,51 +2145,15 @@ fn run_on_tty(
 
 /// Which compositor binding a keysym asks for, if any.
 ///
-/// A pure function so both drivers agree by construction. The tty driver
-/// shipped without any of these — a session with a wallpaper, a panel and no
-/// way to open a terminal — because the whole table lived inside the winit
-/// event handler.
+/// Delegates to `cusk::bindings::resolve`, which is also what `cusk-keys`
+/// documents. Kept as a named function here rather than calling `resolve`
+/// inline at the two call sites, because the comment about *who checks the
+/// modifier* belongs next to the lookup and both drivers need to read it.
 ///
 /// The caller checks the modifier: whether the chord is armed depends on
 /// `ModKey` and the seat's state, and neither belongs in a lookup table.
 fn binding_for(sym: Keysym, shift: bool) -> Option<Binding> {
-    match sym {
-        Keysym::m => Some(Binding::ToggleMaximize),
-        Keysym::t => Some(Binding::ToggleTiling),
-        Keysym::space => Some(Binding::ToggleFloating),
-        Keysym::e => Some(Binding::CycleLayout),
-        Keysym::l => Some(Binding::Widen(1)),
-        Keysym::h => Some(Binding::Widen(-1)),
-        Keysym::Return | Keysym::KP_Enter => Some(Binding::Spawn),
-        Keysym::d => Some(Binding::Launcher),
-        Keysym::j => Some(Binding::FocusStep(1)),
-        Keysym::k => Some(Binding::FocusStep(-1)),
-        // Shift gives the capitalised keysym, so the
-        // shifted bindings are distinguished here
-        // rather than by re-reading modifier state.
-        Keysym::J => Some(Binding::MoveInOrder(1)),
-        Keysym::K => Some(Binding::MoveInOrder(-1)),
-        Keysym::P => Some(Binding::Promote),
-        // Digits pick a workspace; shifted digits send
-        // the focused window to one. Shift produces a
-        // different keysym per layout (! " # on some,
-        // symbols on others), so the unshifted keysym
-        // is read and the modifier checked separately —
-        // matching on the shifted symbol works on one
-        // keyboard layout and silently fails on the
-        // rest.
-        sym => match sym.raw() {
-            0x0031..=0x0039 => {
-                let index = (sym.raw() - 0x0031) as usize;
-                Some(if shift {
-                    Binding::SendToWorkspace(index)
-                } else {
-                    Binding::Workspace(index)
-                })
-            }
-            _ => None,
-        },
-    }
+    bindings::resolve(sym, shift)
 }
 
 /// Carry out a binding.
@@ -1966,22 +2195,11 @@ impl Cusk {
             Binding::Promote => self.promote(),
             Binding::Workspace(i) => self.switch_workspace(i),
             Binding::SendToWorkspace(i) => self.send_to_workspace(i),
-            Binding::Launcher => {
-                let program = resolve_launcher(&cfg.launcher);
-                match std::process::Command::new(&program)
-                    .env("WAYLAND_DISPLAY", socket_name)
-                    .spawn()
-                {
-                    Ok(child) => {
-                        tracing::info!("launcher {program} (pid {})", child.id());
-                        std::thread::spawn(move || {
-                let mut child = child;
-                let _ = child.wait();
-                        });
-                    }
-                    Err(e) => tracing::warn!("could not run {program}: {e}"),
-                }
-            }
+            Binding::Launcher => self.spawn_helper(&cfg.launcher, socket_name),
+            // Same path as the launcher: both are layer-shell panels that take
+            // the keyboard and dismiss themselves on losing it, so the
+            // compositor's whole job is starting them.
+            Binding::Keys => self.spawn_helper(&cfg.keys, socket_name),
             Binding::Spawn => match terminal {
                 Some(term) => spawn_terminal(term, socket_name),
                 None => tracing::warn!("no terminal to spawn"),
@@ -1993,57 +2211,38 @@ impl Cusk {
             }
         }
     }
-}
 
-#[cfg(test)]
-mod binding_tests {
-    use super::*;
-
-    /// Every binding the banner advertises must actually resolve. A table this
-    /// long is exactly where an entry goes missing, and the symptom is one
-    /// dead key among a dozen working ones.
-    #[test]
-    fn the_advertised_bindings_all_resolve() {
-        for (sym, expected) in [
-            (Keysym::Return, Binding::Spawn),
-            (Keysym::d, Binding::Launcher),
-            (Keysym::t, Binding::ToggleTiling),
-            (Keysym::e, Binding::CycleLayout),
-            (Keysym::m, Binding::ToggleMaximize),
-            (Keysym::space, Binding::ToggleFloating),
-            (Keysym::j, Binding::FocusStep(1)),
-            (Keysym::k, Binding::FocusStep(-1)),
-            (Keysym::l, Binding::Widen(1)),
-            (Keysym::h, Binding::Widen(-1)),
-            (Keysym::J, Binding::MoveInOrder(1)),
-            (Keysym::K, Binding::MoveInOrder(-1)),
-            (Keysym::P, Binding::Promote),
-        ] {
-            assert_eq!(
-                binding_for(sym, false),
-                Some(expected),
-                "{sym:?} resolves to nothing"
-            );
+    /// Start one of the session's own panels.
+    ///
+    /// Reaped on a thread. A compositor that spawns and never waits accumulates
+    /// a zombie per press, and over a session that fills the process table —
+    /// which looks like anything except a window-manager bug.
+    ///
+    /// An empty setting means "do not run one", so a user can turn a panel off
+    /// without it looking like a failure to start.
+    fn spawn_helper(&mut self, configured: &str, socket_name: &str) {
+        if configured.trim().is_empty() {
+            tracing::debug!("no program configured for this binding");
+            return;
         }
-    }
-
-    /// Digits pick a workspace; shifted digits send a window to one. Shift is
-    /// read as modifier state rather than as a shifted keysym, because that
-    /// symbol differs per keyboard layout.
-    #[test]
-    fn digits_pick_a_workspace_and_shift_sends_to_it() {
-        assert_eq!(binding_for(Keysym::_1, false), Some(Binding::Workspace(0)));
-        assert_eq!(binding_for(Keysym::_9, false), Some(Binding::Workspace(8)));
-        assert_eq!(binding_for(Keysym::_1, true), Some(Binding::SendToWorkspace(0)));
-        assert_eq!(binding_for(Keysym::_3, true), Some(Binding::SendToWorkspace(2)));
-    }
-
-    /// An unbound key must forward, or ordinary typing disappears whenever the
-    /// modifier happens to be down.
-    #[test]
-    fn unbound_keys_are_not_claimed() {
-        for sym in [Keysym::a, Keysym::z, Keysym::F5, Keysym::Escape, Keysym::_0] {
-            assert_eq!(binding_for(sym, false), None, "{sym:?} was claimed");
+        let program = resolve_launcher(configured);
+        // `CUSK_MOD` is inherited rather than set: the compositor read it from
+        // its own environment, so a child gets the same value for free. Said
+        // out loud because `cusk-keys` renders every chord with the resolved
+        // modifier, and a panel that read only the config file would print
+        // "super" for a session actually running on alt.
+        match std::process::Command::new(&program)
+            .env("WAYLAND_DISPLAY", socket_name)
+            .spawn()
+        {
+            Ok(child) => {
+                tracing::info!("spawned {program} (pid {})", child.id());
+                std::thread::spawn(move || {
+                    let mut child = child;
+                    let _ = child.wait();
+                });
+            }
+            Err(e) => tracing::warn!("could not run {program}: {e}"),
         }
     }
 }
@@ -2067,9 +2266,23 @@ impl Cusk {
             return false;
         }
 
+        // Tested before anything touches focus. `surface_under` asks *which
+        // window*, and a layer surface is not one — so a click on the launcher
+        // used to fall through to the background branch below, clear the
+        // keyboard, and dismiss the panel the click was aimed at. The row was
+        // never activated: the launcher vanished on press.
+        if self.layer_under_pointer().is_some() {
+            return true;
+        }
+
         let Some((window, _, _)) = self.surface_under(self.pointer_location) else {
             // Clicking the background clears focus. Otherwise the last window
             // keeps the keyboard while looking inert.
+            //
+            // A panel holding the keyboard is released the same way, which is
+            // what makes clicking the desktop dismiss the launcher.
+            self.keyboard_layer = None;
+            self.focus_before_layer = None;
             if let Some(keyboard) = self.seat.get_keyboard() {
                 keyboard.set_focus(self, None, serial);
             }
@@ -2850,6 +3063,10 @@ fn build_compositor(cfg: &config::Config) -> Result<Compositor, Box<dyn std::err
         xdg_shell_state: XdgShellState::new::<Cusk>(&dh),
         xdg_decoration_state: XdgDecorationState::new::<Cusk>(&dh),
         layer_shell_state: WlrLayerShellState::new::<Cusk>(&dh),
+        foreign_toplevel_state:
+            cusk::foreign_toplevel::ForeignToplevelState::new::<Cusk>(&dh),
+        next_toplevel_id: 0,
+        display: dh.clone(),
         viewporter_state: smithay::wayland::viewporter::ViewporterState::new::<Cusk>(&dh),
         output_manager_state: OutputManagerState::new_with_xdg_output::<Cusk>(&dh),
         shm_state,
@@ -2883,6 +3100,8 @@ fn build_compositor(cfg: &config::Config) -> Result<Compositor, Box<dyn std::err
         //
         // A wrong value that looks right is worse than an obviously empty one.
         output_size: (0, 0),
+        keyboard_layer: None,
+        focus_before_layer: None,
     };
 
     // Let the socket be allocated rather than hardcoded. A fixed name collides
@@ -3259,7 +3478,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // "listening on cusk-1" buried in a log line is easy to miss — connecting
     // to a compositor that has since exited fails as NoCompositor, which reads
     // like a client bug rather than a stale socket.
-    for line in [
+    let mut banner = vec![
         String::new(),
         "  cusk is running. From another terminal, while this one stays open:".into(),
         String::new(),
@@ -3272,27 +3491,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // help, and reads as the hint being boilerplate.
             if matches!(mod_key, ModKey::Alt) { "ctrl-alt" } else { "alt" },
         ),
-        String::new(),
-        "      click           focus and raise".into(),
-        format!("      {} + drag     move", mod_key.label()),
-        format!("      {} + right    resize from the nearest corner", mod_key.label()),
-        format!("      {} + m        maximise / restore", mod_key.label()),
-        format!("      {} + t        tiling on / off", mod_key.label()),
-        format!("      {} + e        cycle layout (master-stack, columns)", mod_key.label()),
-        format!("      {} + h / l    narrow / widen the master column", mod_key.label()),
-        format!("      {} + space    float this window out of the layout", mod_key.label()),
-        format!("      {} + enter    open another terminal", mod_key.label()),
-        format!("      {} + d        application launcher", mod_key.label()),
-        format!("      {} + j / k    focus next / previous window", mod_key.label()),
-        format!("      {} + shift + j / k", mod_key.label()),
-        "                      move it earlier / later in the layout".into(),
-        format!("      {} + shift + p    promote it to master", mod_key.label()),
-        format!("      {} + 1..9      switch workspace", mod_key.label()),
-        format!("      {} + shift + 1..9", mod_key.label()),
-        "                      send this window to that workspace".into(),
-        "      close window    quit".into(),
-        String::new(),
-    ] {
+    ];
+    // Walked from the shared table rather than typed out again. This banner was
+    // one of the three copies: it advertised bindings by hand, so a key could be
+    // implemented and unlisted, or listed and unbound, with nothing to catch
+    // either. `cusk-keys` draws the same rows this prints.
+    //
+    // Column width is computed rather than hardcoded, because the chords are
+    // rendered with whatever `input.mod-key` is set to and "ctrl + alt" is nine
+    // characters wider than "alt" — a fixed indent lined up under one setting
+    // and went ragged under the others.
+    let groups = bindings::rendered(mod_key.label());
+    let widest = groups
+        .iter()
+        .flat_map(|(_, rows)| rows.iter().map(|(chord, _)| chord.len()))
+        .max()
+        .unwrap_or(0);
+    for (group, rows) in groups {
+        banner.push(String::new());
+        banner.push(format!("  {}", group.title()));
+        for (chord, description) in rows {
+            banner.push(format!("      {chord:<widest$}   {description}"));
+        }
+    }
+    banner.push(String::new());
+
+    for line in banner {
         println!("{line}");
     }
 

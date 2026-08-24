@@ -4,7 +4,7 @@
 //! the settings editor and the compositor's focus ring cannot disagree.
 
 use cusk::theme as tokens;
-use iced::widget::{container, scrollable, text_input};
+use iced::widget::{button, container, scrollable, text_input};
 use iced::{border, Background, Border, Color, Theme};
 
 const fn token(c: tokens::Rgba) -> Color {
@@ -59,23 +59,6 @@ pub fn field(_theme: &Theme, status: text_input::Status) -> text_input::Style {
     }
 }
 
-pub fn row(selected: bool) -> impl Fn(&Theme) -> container::Style {
-    move |_theme| container::Style {
-        background: Some(Background::Color(if selected {
-            SURFACE
-        } else {
-            Color::TRANSPARENT
-        })),
-        text_color: Some(TEXT),
-        border: Border {
-            color: Color::TRANSPARENT,
-            width: 0.0,
-            radius: border::Radius::new(RADIUS_CONTROL),
-        },
-        ..Default::default()
-    }
-}
-
 /// The selection bar. One accent shape rather than a box around the row, which
 /// is how both reference shells mark a choice.
 pub fn marker(selected: bool) -> impl Fn(&Theme) -> container::Style {
@@ -89,6 +72,71 @@ pub fn marker(selected: bool) -> impl Fn(&Theme) -> container::Style {
             radius: border::Radius::new(999.0),
             ..Default::default()
         },
+        ..Default::default()
+    }
+}
+
+/// A menu row: an application in the right pane, or a category in the sidebar.
+///
+/// A button rather than the plain container the flat list used, because a
+/// container has no `on_press` — the old list could only be driven by Enter, so
+/// clicking an application did nothing at all. Transparent until hovered or
+/// selected, so the menu reads as text with one marked line rather than as a
+/// grid of tiles.
+pub fn menu_row(selected: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |_theme, status| {
+        let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
+        button::Style {
+            background: Some(Background::Color(match (selected, hovered) {
+                (true, _) => SURFACE,
+                // Distinctly weaker than the selection. Matching them would
+                // make the keyboard's idea of "current" and the pointer's
+                // indistinguishable, and Enter launches only one of them.
+                (false, true) => alpha(SURFACE, 0.5),
+                (false, false) => Color::TRANSPARENT,
+            })),
+            text_color: TEXT,
+            border: Border {
+                color: Color::TRANSPARENT,
+                width: 0.0,
+                radius: border::Radius::new(RADIUS_CONTROL),
+            },
+            ..Default::default()
+        }
+    }
+}
+
+/// A sidebar category.
+///
+/// The accent is carried by the text rather than by a filled pill: the sidebar
+/// is a list of nine or ten words, and ten filled shapes stacked vertically
+/// compete with the applications beside them for the eye.
+pub fn category(selected: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |_theme, status| {
+        let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
+        button::Style {
+            background: Some(Background::Color(if selected {
+                alpha(ACCENT, 0.16)
+            } else if hovered {
+                alpha(SURFACE, 0.5)
+            } else {
+                Color::TRANSPARENT
+            })),
+            text_color: if selected { ACCENT } else { TEXT_DIM },
+            border: Border {
+                color: Color::TRANSPARENT,
+                width: 0.0,
+                radius: border::Radius::new(RADIUS_CONTROL),
+            },
+            ..Default::default()
+        }
+    }
+}
+
+/// The hairline between the sidebar and the application pane.
+pub fn divider(_theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(alpha(SURFACE_HI, 0.55))),
         ..Default::default()
     }
 }

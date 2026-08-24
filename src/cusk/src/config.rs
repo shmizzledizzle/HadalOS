@@ -433,6 +433,12 @@ settings! {
         apply: Live,
         default: "cusk-launcher"
     },
+    keys: Text {
+        key: "commands.keys",
+        doc: "Program the shortcut-list binding runs. A bare name is looked for beside cusk, then on PATH.",
+        apply: Live,
+        default: "cusk-keys"
+    },
     terminal: Choice {
         key: "commands.terminal",
         doc: "Terminal opened by the spawn binding.",

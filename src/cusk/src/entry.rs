@@ -31,6 +31,12 @@ pub struct Entry {
     /// to be looked up. Kept unresolved because resolving it needs the
     /// filesystem, and parsing should not.
     pub icon: Option<String>,
+    /// The raw `Categories=` list, as written. Kept unmapped for the same
+    /// reason `icon` is kept unresolved: which menu section a category belongs
+    /// to is a presentation decision, and a parser that folded
+    /// `WebBrowser;Network` into "Internet" here would leave no way to ask what
+    /// the file actually said.
+    pub categories: Vec<String>,
 }
 
 /// Parse the `[Desktop Entry]` group of a `.desktop` file.
@@ -91,7 +97,22 @@ pub fn parse(text: &str, id: &str) -> Option<Entry> {
         exec,
         terminal: is_true(fields.get("Terminal")),
         icon: fields.get("Icon").map(|i| i.to_string()).filter(|i| !i.is_empty()),
+        categories: fields.get("Categories").map(|c| split_list(c)).unwrap_or_default(),
     })
+}
+
+/// Split a `;`-separated spec list.
+///
+/// The spec says these end with a trailing `;`, so a naive split yields a final
+/// empty element — which would become a category named "" and a menu section
+/// with no title.
+fn split_list(value: &str) -> Vec<String> {
+    value
+        .split(';')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 fn is_true(value: Option<&&str>) -> bool {
@@ -323,6 +344,133 @@ pub fn rank<'a>(entries: &'a [Entry], query: &str) -> Vec<&'a Entry> {
     scored.into_iter().map(|(_, e)| e).collect()
 }
 
+/// One heading in the launcher's menu.
+///
+/// Not the freedesktop category list. That list has thirteen main categories
+/// and hundreds of additional ones, and a menu with a `Video` section beside an
+/// `AudioVideo` section beside an `Audio` section is a directory listing of the
+/// spec rather than somewhere to find a music player. These are the groupings
+/// every shipped menu converges on, which is why `Network` reads as "Internet"
+/// and `Utility` as "Utilities" — the spec's words are for the file, and these
+/// are for the person reading the screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Section {
+    Development,
+    Education,
+    Games,
+    Graphics,
+    Internet,
+    Multimedia,
+    Office,
+    Settings,
+    System,
+    Utilities,
+    /// Anything with no `Categories=` line, or only categories none of the
+    /// above claim. A real section rather than a silent drop: an application
+    /// that is installed and runnable must be reachable from the menu, and a
+    /// mis-categorised entry hidden entirely is indistinguishable from one that
+    /// failed to parse.
+    Other,
+}
+
+impl Section {
+    /// Every section, in the order the sidebar lists them.
+    ///
+    /// `Other` sits last because it is a fallback, and `Settings`/`System` sit
+    /// low because they are visited deliberately rather than browsed.
+    pub const ALL: [Section; 11] = [
+        Section::Development,
+        Section::Education,
+        Section::Games,
+        Section::Graphics,
+        Section::Internet,
+        Section::Multimedia,
+        Section::Office,
+        Section::Settings,
+        Section::System,
+        Section::Utilities,
+        Section::Other,
+    ];
+
+    pub fn title(self) -> &'static str {
+        match self {
+            Section::Development => "Development",
+            Section::Education => "Education",
+            Section::Games => "Games",
+            Section::Graphics => "Graphics",
+            Section::Internet => "Internet",
+            Section::Multimedia => "Multimedia",
+            Section::Office => "Office",
+            Section::Settings => "Settings",
+            Section::System => "System",
+            Section::Utilities => "Utilities",
+            Section::Other => "Other",
+        }
+    }
+}
+
+/// Which spec category maps to which section, most specific first.
+///
+/// Order is the whole point. An entry may declare several main categories —
+/// `Utility;Network;` and `Settings;System;` are both common — so "the first
+/// match wins" only gives a stable answer if *this table* decides what first
+/// means, rather than the order the categories happened to appear in the file.
+/// Two machines would otherwise sort the same application differently.
+///
+/// `Settings` before `System`, because a control panel declaring both belongs
+/// under Settings; `Development` early, because an IDE declaring
+/// `Development;Utility;` is not a utility.
+const CATEGORY_SECTIONS: &[(&str, Section)] = &[
+    ("Settings", Section::Settings),
+    ("Development", Section::Development),
+    ("Game", Section::Games),
+    ("Graphics", Section::Graphics),
+    ("Office", Section::Office),
+    ("Network", Section::Internet),
+    ("AudioVideo", Section::Multimedia),
+    ("Audio", Section::Multimedia),
+    ("Video", Section::Multimedia),
+    ("Education", Section::Education),
+    ("Science", Section::Education),
+    ("System", Section::System),
+    ("Utility", Section::Utilities),
+];
+
+/// Which section an entry belongs in.
+pub fn section(entry: &Entry) -> Section {
+    CATEGORY_SECTIONS
+        .iter()
+        .find(|(name, _)| entry.categories.iter().any(|c| c == name))
+        .map(|(_, section)| *section)
+        .unwrap_or(Section::Other)
+}
+
+/// Group entries into the sections that actually have something in them.
+///
+/// Empty sections are dropped rather than shown greyed out: on a given machine
+/// half of them are empty, and a sidebar of mostly-dead rows makes the menu look
+/// broken.
+///
+/// Each section is sorted by name even though `load_all` already returns its
+/// entries sorted. This takes an arbitrary slice, not necessarily that one, and
+/// the order it is handed is the caller's business — a section whose order
+/// depended on how the caller happened to build its vector would be sorted in
+/// the launcher and arbitrary in the next thing to call this.
+pub fn sections(entries: &[Entry]) -> Vec<(Section, Vec<&Entry>)> {
+    Section::ALL
+        .iter()
+        .filter_map(|&wanted| {
+            let mut found: Vec<&Entry> =
+                entries.iter().filter(|e| section(e) == wanted).collect();
+            if found.is_empty() {
+                return None;
+            }
+            found.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+            Some((wanted, found))
+        })
+        .collect()
+}
+
 /// Resolve a pinned list — desktop ids, comma separated — into entries.
 ///
 /// Order is the user's, not the filesystem's: a dock is muscle memory, and a
@@ -368,6 +516,15 @@ mod tests {
             exec: strip_field_codes(exec),
             terminal: false,
             icon: None,
+            categories: Vec::new(),
+        }
+    }
+
+    /// The same, with categories, for the grouping tests.
+    fn categorised(name: &str, categories: &[&str]) -> Entry {
+        Entry {
+            categories: categories.iter().map(|c| c.to_string()).collect(),
+            ..entry(name, name)
         }
     }
 
@@ -476,6 +633,106 @@ Exec=firefox --private-window
         assert!(parse(&messy, "x.desktop").is_some());
     }
 
+    /// The spec's lists end with a trailing `;`. Splitting naively leaves an
+    /// empty final element, which becomes a category named "" and a menu
+    /// section with no title.
+    #[test]
+    fn a_trailing_semicolon_does_not_become_an_empty_category() {
+        let e = parse(FIREFOX, "firefox.desktop").unwrap();
+        assert_eq!(e.categories, vec!["Network", "WebBrowser"]);
+    }
+
+    #[test]
+    fn an_entry_with_no_categories_line_parses_with_none() {
+        let bare = FIREFOX.replace("Categories=Network;WebBrowser;\n", "");
+        assert!(parse(&bare, "x.desktop").unwrap().categories.is_empty());
+    }
+
+    /// `Network` is what the file says; "Internet" is what the menu says.
+    #[test]
+    fn spec_categories_map_onto_menu_sections() {
+        assert_eq!(section(&categorised("Firefox", &["Network"])), Section::Internet);
+        assert_eq!(section(&categorised("Kate", &["Development"])), Section::Development);
+        assert_eq!(section(&categorised("Files", &["Utility"])), Section::Utilities);
+        assert_eq!(section(&categorised("VLC", &["AudioVideo"])), Section::Multimedia);
+    }
+
+    /// An installed, runnable application must be reachable from the menu.
+    /// Hiding one because its categories were unrecognised is indistinguishable
+    /// from one that failed to parse.
+    #[test]
+    fn unrecognised_and_absent_categories_both_land_in_other() {
+        assert_eq!(section(&categorised("Odd", &["ConferenceCall"])), Section::Other);
+        assert_eq!(section(&categorised("Bare", &[])), Section::Other);
+    }
+
+    /// The precedence table decides, not the order the file happened to list
+    /// them in — otherwise the same application sorts differently on two
+    /// machines, depending only on how its `.desktop` file was written.
+    #[test]
+    fn the_table_breaks_ties_not_the_files_ordering() {
+        let one = categorised("Panel", &["Settings", "System"]);
+        let other = categorised("Panel", &["System", "Settings"]);
+        assert_eq!(section(&one), Section::Settings);
+        assert_eq!(section(&other), Section::Settings, "file order must not decide");
+
+        // An IDE declaring Development;Utility; is not a utility.
+        assert_eq!(
+            section(&categorised("IDE", &["Utility", "Development"])),
+            Section::Development
+        );
+    }
+
+    /// A sidebar of mostly-dead rows makes the menu look broken, and on any
+    /// real machine half the sections are empty.
+    #[test]
+    fn grouping_drops_empty_sections_and_keeps_sidebar_order() {
+        let entries = vec![
+            categorised("Kate", &["Development"]),
+            categorised("Firefox", &["Network"]),
+        ];
+        let grouped = sections(&entries);
+        assert_eq!(
+            grouped.iter().map(|(s, _)| *s).collect::<Vec<_>>(),
+            vec![Section::Development, Section::Internet]
+        );
+        assert!(grouped.iter().all(|(_, found)| !found.is_empty()));
+    }
+
+    /// `load_all` returns filesystem order, which is arbitrary and differs per
+    /// machine, so the section has to sort.
+    #[test]
+    fn entries_within_a_section_are_sorted_by_name() {
+        let entries = vec![
+            categorised("zathura", &["Office"]),
+            categorised("Abiword", &["Office"]),
+            categorised("libreoffice", &["Office"]),
+        ];
+        let (_, found) = sections(&entries).into_iter().next().unwrap();
+        assert_eq!(
+            found.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(),
+            vec!["Abiword", "libreoffice", "zathura"],
+            "case must not split the alphabet into two runs"
+        );
+    }
+
+    /// Every entry handed in must come back out exactly once. A menu that
+    /// silently loses or duplicates an application is the failure this whole
+    /// grouping step could plausibly introduce.
+    #[test]
+    fn grouping_partitions_the_catalogue() {
+        let entries = vec![
+            categorised("Kate", &["Development"]),
+            categorised("Firefox", &["Network"]),
+            categorised("Odd", &["ConferenceCall"]),
+            categorised("Bare", &[]),
+            categorised("VLC", &["AudioVideo"]),
+        ];
+        let grouped = sections(&entries);
+        let total: usize = grouped.iter().map(|(_, found)| found.len()).sum();
+        assert_eq!(total, entries.len());
+    }
+
     #[test]
     fn an_empty_query_matches_everything() {
         let entries = vec![entry("Firefox", "firefox"), entry("Files", "nautilus")];
@@ -501,6 +758,7 @@ Exec=firefox --private-window
             exec: vec![exec.into()],
             terminal: false,
             icon: Some(id.into()),
+            categories: Vec::new(),
         }
     }
 
@@ -605,6 +863,38 @@ Exec=firefox --private-window
             resolved * 2 > with_icon.len(),
             "only {resolved} of {} icons resolved — the directory layouts are probably wrong",
             with_icon.len()
+        );
+    }
+
+    /// The same shape of floor as the icon test above, for the menu: a
+    /// categoriser that files everything installed under "Other" has produced a
+    /// sidebar with one row, which is the flat list the menu replaced. It
+    /// reports the distribution rather than asserting counts, because those
+    /// depend on what is installed.
+    #[test]
+    fn most_installed_applications_land_somewhere_better_than_other() {
+        let all = load_all();
+        if all.is_empty() {
+            eprintln!("no desktop entries; skipping");
+            return;
+        }
+        let grouped = sections(&all);
+        for (section, found) in &grouped {
+            eprintln!("{:>12}: {}", section.title(), found.len());
+        }
+
+        let total: usize = grouped.iter().map(|(_, found)| found.len()).sum();
+        assert_eq!(total, all.len(), "every installed entry must appear exactly once");
+
+        let other = grouped
+            .iter()
+            .find(|(section, _)| *section == Section::Other)
+            .map_or(0, |(_, found)| found.len());
+        assert!(
+            other * 2 < all.len(),
+            "{other} of {} entries fell through to Other — the category table is \
+             probably missing something common",
+            all.len()
         );
     }
 

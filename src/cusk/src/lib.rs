@@ -16,7 +16,30 @@ pub mod config;
 /// A second copy would drift, and the drift would be a program that appears in
 /// one and not the other.
 pub mod entry;
+
+/// The keyboard bindings, and what each one is for.
+///
+/// In the library because `cusk-keys` draws this list and the compositor
+/// executes it. There were three hand-maintained copies before it moved here —
+/// the match, the startup banner, and a test — and nothing could tell you when
+/// they disagreed.
+pub mod bindings;
 pub mod theme;
+
+/// What windows exist, and what may be done to them.
+///
+/// In the library for the same reason `entry` is: the compositor produces this
+/// and the dock consumes it, and two descriptions of "what is a window" would
+/// drift into a taskbar that disagrees with the compositor about which window
+/// is focused. The Wayland plumbing stays in the binary; only the state model
+/// and its diff live here.
+pub mod toplevel;
+
+/// The Wayland server side of `toplevel` — objects, globals and dispatch.
+///
+/// In the library only because `toplevel` is; the compositor is its only user.
+/// Kept beside the model so the two cannot drift about what an event means.
+pub mod foreign_toplevel;
 
 /// Re-exported so the settings editor edits documents with *this* version of
 /// `toml_edit`. Two crates each depending on it separately can drift onto

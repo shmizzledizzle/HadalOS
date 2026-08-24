@@ -60,3 +60,71 @@ pub const RING_IDLE: Rgba = [
 pub const fn premultiplied(c: Rgba) -> Rgba {
     [c[0] * c[3], c[1] * c[3], c[2] * c[3], c[3]]
 }
+
+// ── Elevation ──────────────────────────────────────────────────────────
+//
+// Added 2026-08-24, because the dock was flat against the wallpaper and read
+// as rough next to XFCE. A translucent panel with no shadow does not look like
+// it is *above* anything; it looks like a discoloured rectangle.
+//
+// Structure taken from Plasma's Breeze, which uses a short fixed set of
+// elevation steps rather than a per-widget shadow — a set small enough that
+// two surfaces at the same height always match. Hyprland's shadow parameters
+// (large blur, small offset, very low alpha) informed the values.
+//
+// **Approaches only, no code.** cusk is `GPL-2.0-only`. Plasma is GPL-2+ and
+// Hyprland is BSD-3-Clause, so code from either *could* be incorporated with
+// attribution — but nothing here is copied, because these are numbers chosen
+// against this palette. niri is GPL-3.0 and code from it could **not** be used
+// here at all, which is worth writing down since niri is the closest reference
+// in stack terms and the temptation is real.
+//
+// The shadow is near-black rather than a darkened accent: on a background this
+// dark, a tinted shadow reads as a coloured halo instead of depth.
+
+/// What a surface at a given height casts. Renderer-agnostic on purpose — the
+/// compositor's GL path and iced both consume these.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Elevation {
+    pub shadow: Rgba,
+    /// x, y in logical pixels. Positive y is downward in both renderers.
+    pub offset: (f32, f32),
+    pub blur: f32,
+}
+
+/// Surfaces resting on the desktop: the dock, the panel.
+///
+/// Deliberately shallow. A heavy shadow on a full-width bar reads as a drop
+/// shadow on the whole screen rather than as depth.
+pub const RAISED: Elevation = Elevation {
+    shadow: [0.0, 0.0, 0.0, 0.34],
+    offset: (0.0, 2.0),
+    blur: 12.0,
+};
+
+/// Surfaces floating above everything: tooltips, menus, the launcher.
+///
+/// Deeper than RAISED, because an overlay that shares the dock's elevation
+/// looks like part of the dock.
+pub const OVERLAY: Elevation = Elevation {
+    shadow: [0.0, 0.0, 0.0, 0.45],
+    offset: (0.0, 6.0),
+    blur: 24.0,
+};
+
+// ── Interaction states ─────────────────────────────────────────────────
+//
+// The dock previously drew Hovered and Pressed identically, so a click gave no
+// feedback distinct from the pointer merely being there. Every reference
+// distinguishes them, and the distinction is what makes a control feel
+// responsive rather than laggy.
+
+/// Accent alpha for a hovered control.
+pub const STATE_HOVER: f32 = 0.22;
+/// Accent alpha for a pressed one. Stronger *and* the caller should drop the
+/// elevation — a button that is being pushed should not also be rising.
+pub const STATE_PRESS: f32 = 0.38;
+/// The keyboard focus ring. Distinct from hover because focus can be somewhere
+/// the pointer is not, and a control that shows only hover is unusable from
+/// the keyboard.
+pub const STATE_FOCUS: f32 = 0.55;
