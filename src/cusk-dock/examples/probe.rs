@@ -4,7 +4,7 @@
 //! cannot be run headless — it needs a compositor to draw into — so a bug in
 //! the window list would otherwise only be visible as an empty strip.
 fn main() {
-    let (windows, _outbox) = cusk_dock::windows::start();
+    let (windows, _outbox, _thumbs) = cusk_dock::windows::start();
     std::thread::sleep(std::time::Duration::from_secs(2));
     let held = windows.lock().unwrap();
     println!("{} window(s)", held.len());

@@ -41,6 +41,18 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 toml_edit = "0.25.13"
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
 fontdue = "0.9.4"
+# Generates the bindings for `hadal_stage_v1`, which is HadalOS's own protocol
+# and so has no crate to pull them from. Already in the dependency graph — every
+# wayland-protocols crate builds through it — and it is a macro crate, so this
+# adds code generation rather than a library.
+wayland-scanner = "0.31"
+# The runtime half of the above: the generated code names `wayland_backend`
+# types directly. Not reached through smithay's re-exports because the scanner
+# emits an unqualified crate path and cannot be told otherwise — which is also
+# why wayland-protocols-wlr depends on it by name. Semver-unified with the copy
+# smithay already pulls in, so this is a path to an existing crate rather than
+# another crate.
+wayland-backend = "0.3"
 
 [profile.release]
 lto = true

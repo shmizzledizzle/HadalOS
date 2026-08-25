@@ -267,6 +267,12 @@ struct Cusk {
     keyboard_layer: Option<LayerSurface>,
     /// Thumbnails of minimised windows, for the dock's stage strip.
     stage: cusk::stage::Stage,
+    /// Who is being told about them.
+    ///
+    /// Separate from `stage` on purpose: one is the pictures, the other is the
+    /// audience, and keeping the audience out of the store is what lets
+    /// `stage` be tested without a Wayland connection.
+    stage_state: cusk::stage_server::StageState,
     /// Windows minimised but not yet captured.
     ///
     /// Capture needs the renderer, which only the render loop has, so
@@ -576,6 +582,11 @@ impl XdgShellHandler for Cusk {
                 .copied()
             {
                 self.foreign_toplevel_state.remove(id);
+                // The stage entry goes with it. A thumbnail of a window that
+                // has closed is the one picture a taskbar must never offer a
+                // way back to, because there is nothing to go back to.
+                self.stage.forget(id);
+                self.stage_state.clear(id);
             }
             self.space.unmap_elem(&window);
             // Drop it from the tile order too, or the layout keeps reserving a
@@ -835,6 +846,18 @@ impl cusk::foreign_toplevel::ForeignToplevelHandler for Cusk {
 }
 
 cusk::delegate_foreign_toplevel!(Cusk);
+
+impl cusk::stage_server::StageHandler for Cusk {
+    fn stage_state(&mut self) -> &mut cusk::stage_server::StageState {
+        &mut self.stage_state
+    }
+
+    fn thumbnail(&self, id: cusk::foreign_toplevel::ToplevelId) -> Option<&cusk::stage::Snapshot> {
+        self.stage.get(id)
+    }
+}
+
+cusk::delegate_stage!(Cusk);
 smithay::delegate_viewporter!(Cusk);
 
 impl SeatHandler for Cusk {
@@ -1567,6 +1590,7 @@ impl Cusk {
         // thumbnail of how it looked before is worse than none.
         let id = self.toplevel_id(window);
         self.stage.forget(id);
+        self.stage_state.clear(id);
         // A restore that beats the render loop to it leaves an entry that would
         // capture a window nobody minimised any more.
         self.pending_capture.retain(|(_, pending)| *pending != id);
@@ -3592,6 +3616,10 @@ fn capture_pending(renderer: &mut GlesRenderer, state: &mut Cusk) {
                         snapshot.height
                     );
                 }
+                // Published before it is stored, so the borrow of `stage` and
+                // the borrow of `stage_state` never overlap — and so a watcher
+                // is never told about a picture the compositor has not got.
+                state.stage_state.publish(id, &snapshot);
                 state.stage.insert(id, snapshot);
             }
             None => tracing::debug!("no thumbnail for minimised window; it stays hidden"),
@@ -3740,6 +3768,7 @@ fn build_compositor(cfg: &config::Config) -> Result<Compositor, Box<dyn std::err
         lock: None,
         minimized: Vec::new(),
         stage: cusk::stage::Stage::default(),
+        stage_state: cusk::stage_server::StageState::new::<Cusk>(&dh),
         pending_capture: Vec::new(),
         focus_before_layer: None,
     };

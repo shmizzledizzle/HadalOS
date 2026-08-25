@@ -37,4 +37,10 @@ wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 # For polling the Wayland socket and a wake-up pipe together. Without a second
 # fd to wait on, a queued request sits unsent until the compositor happens to
 # say something — see windows.rs for the bug this fixes.
-rustix = { version = "1", features = ["event", "pipe"] }
+rustix = { version = "1", features = ["event", "pipe", "mm", "fs"] }
+# `hadal_stage_v1` is HadalOS's own protocol and has no crate to pull bindings
+# from, so they are generated here from the same XML the compositor generates
+# from. wayland-backend is what the generated code names directly; both are
+# already in the graph via wayland-client.
+wayland-scanner = "0.31"
+wayland-backend = "0.3"

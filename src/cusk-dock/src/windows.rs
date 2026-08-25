@@ -39,6 +39,12 @@ use wayland_protocols_wlr::foreign_toplevel::v1::client::{
     zwlr_foreign_toplevel_manager_v1::{self, ZwlrForeignToplevelManagerV1},
 };
 
+use crate::stage::{Thumbnail, Thumbs};
+use crate::stage_protocol::{
+    hadal_stage_manager_v1::HadalStageManagerV1,
+    hadal_stage_thumbnail_v1::{self, HadalStageThumbnailV1},
+};
+
 /// One open window, as far as drawing is concerned.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Window {
@@ -178,9 +184,53 @@ struct State {
     seat: Option<wayland_client::protocol::wl_seat::WlSeat>,
     /// Held for its lifetime: dropping the manager withdraws every handle.
     manager: Option<ZwlrForeignToplevelManagerV1>,
+    /// Thumbnails of minimised windows, shared with the UI.
+    thumbs: Thumbs,
+    /// `hadal_stage_v1`, absent on any compositor that is not cusk.
+    ///
+    /// Absent is not an error and is not reported. The dock is expected to run
+    /// on other compositors — it speaks nothing but standard protocols
+    /// otherwise — and a taskbar that logs a complaint per session because a
+    /// HadalOS extension is missing would be noise on every machine it is
+    /// not on. Without it the stage strip shows labels and no pictures.
+    stage: Option<HadalStageManagerV1>,
+    /// Watch objects, one per window, held so they stay alive.
+    ///
+    /// Dropping one stops the thumbnails for that window arriving, which is
+    /// the whole reason this is a map and not a series of discarded returns.
+    watches: HashMap<u32, HadalStageThumbnailV1>,
 }
 
 impl State {
+    /// Record or drop a thumbnail.
+    ///
+    /// Compared before assigning, for the same reason `publish` is: iced
+    /// rebuilds its view whenever shared state changes, and writing an
+    /// identical picture would redraw the dock forever for nothing. Here it
+    /// matters more than in `publish` — the comparison is over a quarter
+    /// megabyte, but the redraw it prevents is an image upload.
+    fn set_thumb(&mut self, id: u32, thumbnail: Option<Thumbnail>) {
+        let Ok(mut held) = self.thumbs.lock() else { return };
+        match thumbnail {
+            Some(mut fresh) => {
+                match held.get(&id) {
+                    // Identical pixels, so nothing is written and the
+                    // revision does not move — which is what tells the UI its
+                    // cached image handle is still good. A compositor that
+                    // recaptures an unchanged window must not cost a texture
+                    // upload.
+                    Some(old) if old.pixels == fresh.pixels => return,
+                    Some(old) => fresh.revision = old.revision.wrapping_add(1),
+                    None => fresh.revision = 0,
+                }
+                held.insert(id, fresh);
+            }
+            None => {
+                held.remove(&id);
+            }
+        }
+    }
+
     /// Republish the snapshot in `order`.
     fn publish(&mut self) {
         let fresh: Vec<Window> = self
@@ -230,8 +280,9 @@ impl State {
 /// the compositor reports what exists. A compositor that does not implement the
 /// protocol leaves it permanently empty and says so once — the dock still runs,
 /// because a missing taskbar is better than no dock.
-pub fn start() -> (Shared, Arc<Outbox>) {
+pub fn start() -> (Shared, Arc<Outbox>, Thumbs) {
     let published: Shared = Arc::new(Mutex::new(Vec::new()));
+    let thumbs: Thumbs = Arc::new(Mutex::new(HashMap::new()));
 
     // Non-blocking on both ends: the writer must never stall the UI thread on a
     // full pipe, and the reader is drained opportunistically after a poll that
@@ -241,7 +292,7 @@ pub fn start() -> (Shared, Arc<Outbox>) {
         Err(e) => {
             eprintln!("windows: no wake-up pipe, window list disabled: {e}");
             // A disabled list is better than a panic in a dock.
-            return (published, Outbox::inert());
+            return (published, Outbox::inert(), thumbs);
         }
     };
     let outbox = Arc::new(Outbox {
@@ -249,6 +300,7 @@ pub fn start() -> (Shared, Arc<Outbox>) {
         waker: Some(write_end),
     });
     let (thread_published, thread_outbox) = (published.clone(), outbox.clone());
+    let thread_thumbs = thumbs.clone();
 
     std::thread::spawn(move || {
         let connection = match Connection::connect_to_env() {
@@ -275,6 +327,9 @@ pub fn start() -> (Shared, Arc<Outbox>) {
             by_object: HashMap::new(),
             seat: None,
             manager: None,
+            thumbs: thread_thumbs,
+            stage: None,
+            watches: HashMap::new(),
         };
 
         // One round trip to learn what globals exist, and a second so the
@@ -358,7 +413,7 @@ pub fn start() -> (Shared, Arc<Outbox>) {
         }
     });
 
-    (published, outbox)
+    (published, outbox, thumbs)
 }
 
 impl Dispatch<wl_registry::WlRegistry, ()> for State {
@@ -383,6 +438,14 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                 state.manager = Some(
                     registry.bind::<ZwlrForeignToplevelManagerV1, _, _>(name, wanted, handle, ()),
                 );
+            }
+            "hadal_stage_manager_v1" => {
+                state.stage = Some(registry.bind::<HadalStageManagerV1, _, _>(
+                    name,
+                    version.min(1),
+                    handle,
+                    (),
+                ));
             }
             // Needed for `activate`, which takes a seat. Without it the list is
             // readable and every tile is inert.
@@ -420,7 +483,7 @@ impl Dispatch<ZwlrForeignToplevelManagerV1, ()> for State {
         event: zwlr_foreign_toplevel_manager_v1::Event,
         _: &(),
         _: &Connection,
-        _: &QueueHandle<Self>,
+        handle: &QueueHandle<Self>,
     ) {
         match event {
             zwlr_foreign_toplevel_manager_v1::Event::Toplevel { toplevel } => {
@@ -448,6 +511,16 @@ impl Dispatch<ZwlrForeignToplevelManagerV1, ()> for State {
                 // The id is stored on the handle's user data so its own events
                 // can find their way back to the right record.
                 state.by_object.insert(toplevel.id(), id);
+                // Asked for at once, not when the window is first minimised.
+                // A `watch` sent on minimise would race the compositor's
+                // capture and lose the first picture roughly half the time,
+                // and "the thumbnail appears the second time you minimise it"
+                // is a bug nobody would report clearly.
+                if let Some(stage) = &state.stage {
+                    state
+                        .watches
+                        .insert(id, stage.watch(&toplevel, handle, id));
+                }
             }
             zwlr_foreign_toplevel_manager_v1::Event::Finished => {
                 // The compositor has withdrawn the protocol. Nothing more will
@@ -648,5 +721,62 @@ mod tests {
 
         window.title = "   ".into();
         assert_eq!(window.label(), "org.kde.konsole", "blank is not a title");
+    }
+}
+
+/// The stage manager says nothing; it exists to create watch objects.
+impl Dispatch<HadalStageManagerV1, ()> for State {
+    fn event(
+        _: &mut Self,
+        _: &HadalStageManagerV1,
+        _: <HadalStageManagerV1 as Proxy>::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<HadalStageThumbnailV1, u32> for State {
+    fn event(
+        state: &mut Self,
+        _: &HadalStageThumbnailV1,
+        event: hadal_stage_thumbnail_v1::Event,
+        id: &u32,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            hadal_stage_thumbnail_v1::Event::Image {
+                fd,
+                width,
+                height,
+                stride,
+                format,
+            } => {
+                // Only the one format exists at version 1, and an unknown one
+                // is skipped rather than guessed at. `WEnum::Unknown` is what
+                // a future compositor sending a format this build has never
+                // heard of looks like, and drawing those bytes as RGBA would
+                // put colour noise on the strip.
+                if !matches!(
+                    format.into_result(),
+                    Ok(hadal_stage_thumbnail_v1::Format::Abgr8888)
+                ) {
+                    return;
+                }
+                // The descriptor is ours from here. `OwnedFd` closes it when
+                // this scope ends, which is the part a taskbar gets wrong:
+                // one leaked per minimise exhausts the process in an
+                // afternoon of ordinary use.
+                let Some(thumbnail) =
+                    crate::stage::read(std::os::fd::AsFd::as_fd(&fd), width, height, stride)
+                else {
+                    return;
+                };
+                state.set_thumb(*id, Some(thumbnail));
+            }
+            hadal_stage_thumbnail_v1::Event::Cleared => state.set_thumb(*id, None),
+        }
     }
 }

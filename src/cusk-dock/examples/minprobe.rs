@@ -19,7 +19,7 @@ use cusk_dock::windows::{self, Request, Window};
 const SETTLE: Duration = Duration::from_millis(600);
 
 fn main() {
-    let (shared, outbox) = windows::start();
+    let (shared, outbox, _thumbs) = windows::start();
     std::thread::sleep(Duration::from_secs(1));
 
     let Some(target) = pick(&shared) else {

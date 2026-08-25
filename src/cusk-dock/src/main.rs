@@ -16,6 +16,12 @@
 
 mod menu;
 mod session;
+// The stage: thumbnails of minimised windows, and the protocol that carries
+// them. Declared here as well as in `lib.rs` because this crate builds twice —
+// the binary is the dock, the library is what `examples/stageprobe.rs` drives —
+// and each build needs its own module tree.
+mod stage;
+mod stage_protocol;
 mod style;
 mod tray;
 mod windows;
@@ -37,6 +43,16 @@ use iced_layershell::to_layer_message;
 /// application list belongs in the launcher that opens beside it.
 const WIDTH: u32 = 48;
 const ICON: u16 = 26;
+
+/// How wide a thumbnail is drawn in a tooltip.
+///
+/// Wider than the compositor captures at, on purpose. The capture is bounded
+/// at 256 pixels on the long edge and a landscape window comes back close to
+/// that wide, so drawing at 200 leaves it very slightly downscaled rather than
+/// stretched — and a portrait window, which is captured narrow, is fitted
+/// rather than blown up. `ContentFit::Contain` is what enforces the second
+/// half of that.
+const THUMB: f32 = 200.0;
 /// The mark is a little larger than the pins: it is the one fixed landmark on
 /// the strip, and everything else is found relative to it.
 const MARK_SIZE: u16 = 30;
@@ -193,6 +209,24 @@ struct App {
     /// Requests queued for the window-list thread. The protocol objects are not
     /// reachable from here, so a click becomes an entry in this.
     outbox: std::sync::Arc<windows::Outbox>,
+    /// Written by the window-list thread, read here: a picture of each
+    /// minimised window.
+    ///
+    /// Kept apart from `open_windows` on purpose. The window list is
+    /// republished on every title change — which for a terminal is every
+    /// command — and a quarter megabyte of pixels riding along on each of
+    /// those would be copied thousands of times a session for nothing.
+    thumbs: stage::Thumbs,
+    /// The same thumbnails as iced image handles, rebuilt only when the pixels
+    /// change.
+    ///
+    /// The cache is the point. `image::Handle::from_rgba` stamps a fresh id on
+    /// every call and iced uploads a texture per id it has not seen, so
+    /// building these in `view` would re-upload every thumbnail at every
+    /// frame — the same mistake `mark` above carries a comment about, and the
+    /// one that costs most here because these are the largest images the dock
+    /// draws.
+    thumb_handles: std::collections::HashMap<u32, (u64, image::Handle)>,
     /// Written by the D-Bus thread, read here. Cloned into the view each tick
     /// rather than held borrowed, because the tray thread must never be
     /// blocked by a slow frame.
@@ -297,11 +331,12 @@ impl App {
         // tray and the right one no window list, and starting both everywhere
         // would mean two D-Bus watchers fighting for one name and two Wayland
         // connections nothing reads.
-        let (windows_shared, outbox) = match side {
+        let (windows_shared, outbox, thumbs) = match side {
             Side::Left => windows::start(),
             Side::Right => (
                 std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
                 windows::Outbox::inert(),
+                std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             ),
         };
         let tray_shared = match side {
@@ -320,6 +355,12 @@ impl App {
             windows: windows_shared,
             open_windows: Vec::new(),
             outbox,
+            thumbs,
+            // Image handles for what is in `thumbs`, rebuilt only when the
+            // pixels change. `Handle::from_rgba` stamps a fresh id per call
+            // and iced re-uploads a texture per fresh id, so building these in
+            // `view` would upload every thumbnail on every frame.
+            thumb_handles: std::collections::HashMap::new(),
             tray: tray_shared,
             items: Vec::new(),
             panel: None,
@@ -366,6 +407,7 @@ impl App {
                 if open != self.open_windows {
                     self.open_windows = open;
                 }
+                self.refresh_thumbnails();
                 let fresh = self.tray.lock().map(|i| i.clone()).unwrap_or_default();
                 if fresh != self.items {
                     self.items = fresh;
@@ -636,6 +678,42 @@ impl App {
         })
     }
 
+    /// Rebuild the image handles for thumbnails whose pixels changed.
+    ///
+    /// Called on the poll tick rather than from `view`, because `view` takes
+    /// `&self` and because building a handle is an upload rather than a read:
+    /// `Handle::from_rgba` stamps a fresh id every call, and iced uploads a
+    /// texture for every id it has not seen. Doing this per frame would
+    /// re-upload every minimised window sixty times a second.
+    ///
+    /// The revision is what makes it cheap. Comparing pixels would mean
+    /// reading every byte of every thumbnail each tick to establish that
+    /// nothing had changed, which is the answer almost every time.
+    fn refresh_thumbnails(&mut self) {
+        let Ok(held) = self.thumbs.lock() else { return };
+        for (id, thumbnail) in held.iter() {
+            let cached = self.thumb_handles.get(id).map(|(rev, _)| *rev);
+            if cached == Some(thumbnail.revision) {
+                continue;
+            }
+            self.thumb_handles.insert(
+                *id,
+                (
+                    thumbnail.revision,
+                    image::Handle::from_rgba(
+                        thumbnail.width,
+                        thumbnail.height,
+                        thumbnail.pixels.clone(),
+                    ),
+                ),
+            );
+        }
+        // Handles for windows that no longer have a picture go too. Without
+        // this the dock holds a texture per window ever minimised for as long
+        // as the session lasts — invisible, because nothing draws them.
+        self.thumb_handles.retain(|id, _| held.contains_key(id));
+    }
+
     /// The running-window strip.
     ///
     /// One tile per window, in the order they appeared. A taskbar that reorders
@@ -684,9 +762,28 @@ impl App {
             .spacing(2)
             .align_y(iced::Center);
 
+            // The picture goes in the tooltip, not on the tile. A tile is 24
+            // pixels; a thumbnail at that size is a smudge, and the icon
+            // already says which application it is. What a stage is *for* is
+            // telling four terminals apart, and that question is only asked
+            // while reaching for one — which is exactly when the tooltip is up.
+            let label = text(window.label().to_string()).size(12);
+            let tip: Element<Message> = match self.thumb_handles.get(&window.id) {
+                Some((_, handle)) => column![
+                    image(handle.clone())
+                        .width(Length::Fixed(THUMB))
+                        .content_fit(iced::ContentFit::Contain),
+                    label,
+                ]
+                .spacing(6)
+                .align_x(iced::Center)
+                .into(),
+                None => label.into(),
+            };
+
             tooltip(
                 tile,
-                container(text(window.label().to_string()).size(12))
+                container(tip)
                     .padding(6)
                     .style(style::tip),
                 // Opens away from the strip, or the tooltip covers the tiles it

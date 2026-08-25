@@ -1,0 +1,157 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<protocol name="hadal_stage_v1">
+
+  <copyright>
+    Copyright 2026 HadalOS
+
+    Permission is hereby granted, free of charge, to any person obtaining a
+    copy of this software and associated documentation files (the "Software"),
+    to deal in the Software without restriction, including without limitation
+    the rights to use, copy, modify, merge, publish, distribute, sublicense,
+    and/or sell copies of the Software, and to permit persons to whom the
+    Software is furnished to do so, subject to the following conditions:
+
+    The above copyright notice and this permission notice (including the next
+    paragraph) shall be included in all copies or substantial portions of the
+    Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+    THE COPYRIGHT HOLDERS OR AUTHORS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+    FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+    DEALINGS IN THE SOFTWARE.
+  </copyright>
+
+  <description summary="pictures of windows that are not on screen">
+    A minimised window is, to a taskbar, a name in a list. This protocol lets
+    the compositor hand out a small picture of one instead, so that a stage
+    strip can show what a window looked like when it was hidden rather than
+    asking the user to remember which of four terminals they wanted back.
+
+    It is deliberately not a screen-capture protocol. There is no region, no
+    cursor, no damage, no stream, and no way to ask for the current contents of
+    anything. A client can obtain exactly one thing: a downscaled still of a
+    window that the compositor has already decided to hide, at a size the
+    compositor chose. That is enough to draw a stage and not enough to build a
+    screen recorder on, which is the whole point of it being a separate
+    interface from wlr-screencopy rather than a mode of it.
+
+    The pictures travel as file descriptors because they do not fit in a
+    Wayland message: a 256x144 image is about 147 kB and libwayland's
+    connection buffer is 4 kB. The compositor seals the memory before sending
+    it, so a client cannot alter a picture another client is also reading.
+
+    Warning! This protocol is HadalOS-specific and carries no stability
+    promise. It is versioned so that it can change, not so that it will not.
+  </description>
+
+  <interface name="hadal_stage_manager_v1" version="1">
+    <description summary="request thumbnails for windows">
+      The entry point. A client binds this, and then asks for a thumbnail
+      object per window it wants pictures of.
+    </description>
+
+    <request name="destroy" type="destructor">
+      <description summary="stop using the manager">
+        Thumbnail objects created by this manager are unaffected and must be
+        destroyed separately. Tearing down a taskbar therefore does not have to
+        get the order right.
+      </description>
+    </request>
+
+    <request name="watch">
+      <description summary="ask for pictures of one window">
+        Creates an object that reports thumbnails of the given window for as
+        long as it lives.
+
+        Windows are named by their zwlr_foreign_toplevel_handle_v1, and not by
+        a number of this protocol's own, because a client that already draws a
+        taskbar already has that object and any second identifier would be one
+        more thing that can disagree with the window list.
+
+        If a thumbnail already exists when this is called, it is sent
+        immediately; there is no request to poll for one. If the window is not
+        currently hidden, nothing is sent until it is.
+
+        Calling this twice for the same toplevel is allowed and yields two
+        independent objects, each of which gets its own copy of the events.
+      </description>
+      <arg name="thumbnail" type="new_id" interface="hadal_stage_thumbnail_v1"/>
+      <arg name="toplevel" type="object"
+           interface="zwlr_foreign_toplevel_handle_v1"
+           summary="the window to report on"/>
+    </request>
+  </interface>
+
+  <interface name="hadal_stage_thumbnail_v1" version="1">
+    <description summary="pictures of one window">
+      Sends an image event whenever the compositor has a new picture of the
+      window, and a cleared event when it no longer has one — which is what
+      happens when the window is restored, since a picture of how it used to
+      look is worse than no picture at all.
+
+      The object outlives the window. When the window closes, the compositor
+      sends cleared and then says nothing further; the client destroys the
+      object at its convenience. Nothing here becomes invalid on its own,
+      because an object that dies when a window does would make every use of it
+      a race against a close the client has not been told about yet.
+    </description>
+
+    <request name="destroy" type="destructor">
+      <description summary="stop receiving pictures">
+        Any file descriptor already received stays valid and stays the client's
+        to close.
+      </description>
+    </request>
+
+    <event name="image">
+      <description summary="here is a picture">
+        A read-only, size-sealed file descriptor holding height * stride bytes
+        of pixel data. The client should mmap it PROT_READ, MAP_PRIVATE.
+
+        The descriptor is the client's from the moment it arrives: the client
+        closes it, and must do so, since a taskbar that leaks one per minimise
+        runs out of descriptors in an afternoon.
+
+        Each image event supersedes the last. A client holding a mapping from a
+        previous event should drop it, since the compositor has stopped
+        maintaining any relationship between that picture and the window.
+
+        Dimensions are chosen by the compositor and are not negotiable. They
+        preserve the window's aspect ratio and are bounded on the long edge, so
+        a client must scale to whatever box it draws in and must not assume a
+        constant size across events — a window that is resized while hidden
+        produces a differently shaped picture next time.
+      </description>
+      <arg name="fd" type="fd" summary="sealed, read-only pixel data"/>
+      <arg name="width" type="uint" summary="in pixels"/>
+      <arg name="height" type="uint" summary="in pixels"/>
+      <arg name="stride" type="uint" summary="bytes per row"/>
+      <arg name="format" type="uint" enum="format" summary="pixel layout"/>
+    </event>
+
+    <event name="cleared">
+      <description summary="there is no longer a picture">
+        The compositor has discarded its thumbnail of this window. Sent when
+        the window is restored or closed.
+
+        A client that keeps drawing the last image it received after this will
+        show a picture of a window that is on screen and looks different, which
+        is worse than showing nothing.
+      </description>
+    </event>
+
+    <enum name="format">
+      <description summary="pixel layout of an image">
+        One entry, and a named enum rather than a bare uint, because the
+        alternative is a protocol whose format is implicit and therefore
+        undocumented. Adding a second entry is a version bump.
+      </description>
+      <entry name="abgr8888" value="0"
+             summary="8-bit RGBA, little-endian, alpha last in memory; premultiplied"/>
+    </enum>
+  </interface>
+
+</protocol>

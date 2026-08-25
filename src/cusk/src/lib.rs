@@ -41,6 +41,18 @@ pub mod identity;
 /// it can be tested without a compositor; the capture and the protocol stay in
 /// the binary.
 pub mod stage;
+
+/// The wire format for `stage`.
+///
+/// Generated, and separate from `stage` so that the hand-written model is not
+/// buried under six hundred lines of macro output.
+pub mod stage_protocol;
+
+/// The Wayland server side of `stage`.
+///
+/// In the library only because `stage` is; the compositor is its only user.
+/// Kept beside the model so the two cannot drift about what a thumbnail means.
+pub mod stage_server;
 pub mod theme;
 
 /// What windows exist, and what may be done to them.

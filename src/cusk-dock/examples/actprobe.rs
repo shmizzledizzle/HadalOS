@@ -5,7 +5,7 @@
 //! whether the compositor's reply changes the snapshot. Without this the whole
 //! request half of the protocol is untested against a real compositor.
 fn main() {
-    let (windows, outbox) = cusk_dock::windows::start();
+    let (windows, outbox, _thumbs) = cusk_dock::windows::start();
     std::thread::sleep(std::time::Duration::from_secs(2));
 
     // The *unfocused* window, so a successful Activate is visible as a change.
