@@ -164,6 +164,17 @@ impl<T: Clone + PartialEq> Workspaces<T> {
         }
     }
 
+    /// Every window this compositor knows about, on any workspace.
+    ///
+    /// Distinct from what is in the `Space`, and the distinction is the point.
+    /// The `Space` holds only what is *mapped* — one workspace's windows, minus
+    /// anything minimised — so a lookup that goes through it can only find
+    /// windows the user can already see. That is wrong for anything driven by a
+    /// taskbar, whose entire job is acting on windows that are not visible.
+    pub fn all(&self) -> impl Iterator<Item = &T> + '_ {
+        self.spaces.iter().flat_map(|space| space.order.iter())
+    }
+
     /// Which workspace a window is on.
     ///
     /// No caller in the compositor yet — a panel showing "this window is on
@@ -348,6 +359,28 @@ mod tests {
         w.active_mut().focused = Some(2);
         w.remove(&2);
         assert_eq!(w.active().focused, Some(1));
+    }
+
+    #[test]
+    fn all_sees_every_workspace_not_just_the_active_one() {
+        // The bug this exists for: a taskbar acts on windows that are not
+        // mapped — minimised, or on another workspace — and a lookup through
+        // the Space cannot find them. `all` is what such a lookup must use.
+        let mut spaces = spaces(3);
+        spaces.insert(1);
+        spaces.switch_to(1);
+        spaces.insert(2);
+        spaces.switch_to(2);
+        spaces.insert(3);
+
+        let seen: Vec<u32> = spaces.all().copied().collect();
+        assert_eq!(seen.len(), 3, "all() missed a workspace");
+        assert!(seen.contains(&1));
+        assert!(seen.contains(&2));
+        assert!(seen.contains(&3));
+        // The active workspace holds exactly one of them, so a lookup through
+        // the active workspace alone would have found only the last.
+        assert_eq!(spaces.active().order, vec![3]);
     }
 
     #[test]

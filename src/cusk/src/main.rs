@@ -265,6 +265,18 @@ struct Cusk {
     /// know it was taken: the seat only reports what has focus now, not what had
     /// it before a panel appeared.
     keyboard_layer: Option<LayerSurface>,
+    /// Windows hidden by minimising, in the order they were hidden.
+    ///
+    /// Unmapped from the `Space` rather than moved off-screen, for the reason
+    /// workspace switching unmaps: a window parked at a huge coordinate is
+    /// still hit-tested, still counted by the layout, and still answers
+    /// "topmost window". Being absent from the space is what makes a minimised
+    /// window inert everywhere without a check in every caller.
+    ///
+    /// The `Space` is therefore the source of truth for "is it visible" and
+    /// this list is the source of truth for "why not" — a window is in exactly
+    /// one of them.
+    minimized: Vec<Window>,
     /// The window that had the keyboard before a layer surface took it.
     ///
     /// Restored when the layer goes away. Without it, dismissing the launcher
@@ -508,12 +520,20 @@ impl XdgShellHandler for Cusk {
     /// switching unmaps: a window parked at a huge coordinate is still in the
     /// `Space`, still hit-tested, still counted by the layout.
     ///
-    /// **There is no way to bring it back yet.** A minimise that hides a
-    /// window with no route to restoring it is worse than a button that does
-    /// nothing, so this refuses and says why until there is a task list to
-    /// restore from.
-    fn minimize_request(&mut self, _surface: ToplevelSurface) {
-        tracing::info!("minimise ignored: nothing can restore a hidden window yet");
+    /// The route back is the dock's window list, which is where a minimised
+    /// window now appears and from which a click restores it. This used to
+    /// refuse, on the grounds that hiding a window with no way to bring it back
+    /// is worse than a button that does nothing — true then, and untrue since
+    /// the dock grew a taskbar.
+    fn minimize_request(&mut self, surface: ToplevelSurface) {
+        let window = self
+            .space
+            .elements()
+            .find(|w| w.toplevel().is_some_and(|t| t == &surface))
+            .cloned();
+        if let Some(window) = window {
+            self.minimize(&window);
+        }
     }
 
     fn new_popup(&mut self, _surface: PopupSurface, _positioner: PositionerState) {}
@@ -771,19 +791,34 @@ impl cusk::foreign_toplevel::ForeignToplevelHandler for Cusk {
             return;
         };
         match request {
-            R::Activate => self.focus(&window),
+            // Activating a minimised window restores it. A taskbar sends
+            // `activate` for a plain click and does not send `set_minimized
+            // false` first, so without this the click would reach `focus`,
+            // which maps the window at `element_location` — `None` for an
+            // unmapped window, so the origin — while leaving it in the
+            // minimised list. Visible and recorded as hidden, at (0, 0).
+            R::Activate => {
+                if self.is_minimized(&window) {
+                    self.unminimize(&window);
+                } else {
+                    self.focus(&window);
+                }
+            }
             R::Close => {
                 if let Some(toplevel) = window.toplevel() {
                     toplevel.send_close();
                 }
             }
-            // Deliberately unimplemented, and silently so — the protocol has
-            // no failure reply and a compositor that cannot minimise simply
-            // does not. cusk has no minimised state at all: a window is on a
-            // workspace or it is not. Wiring these to something approximate
-            // would be worse than ignoring them, because a dock would show a
-            // window as minimised while it sat visible on another workspace.
-            R::SetMinimized(_) | R::SetMaximized(_) | R::SetFullscreen(_) => {}
+            R::SetMinimized(true) => self.minimize(&window),
+            R::SetMinimized(false) => self.unminimize(&window),
+            // Still unimplemented, and still silently — the protocol has no
+            // failure reply, and a compositor that cannot do these simply does
+            // not. Unlike minimising, these have no state of their own here: a
+            // window is tiled or floating, and "maximised" is a shape the
+            // layout produces rather than a flag it stores. Wiring them to
+            // something approximate would make a dock show a state the
+            // compositor does not have.
+            R::SetMaximized(_) | R::SetFullscreen(_) => {}
         }
     }
 }
@@ -1170,8 +1205,20 @@ impl Cusk {
         &self,
         id: cusk::foreign_toplevel::ToplevelId,
     ) -> Option<Window> {
-        self.space
-            .elements()
+        // Every window, not the mapped ones.
+        //
+        // This searched `space.elements()`, which holds only what is currently
+        // *visible* — one workspace's windows, minus anything minimised. So a
+        // request could never reach a window that was not on screen, which is
+        // exactly the set a taskbar exists to act on. Minimising worked and
+        // restoring did not: the unminimise request arrived, found no window,
+        // and returned as though the client had raced a close.
+        //
+        // Caught by `cusk-dock/examples/minprobe.rs` on the first run, which is
+        // the argument for having written it — the same round trip by hand is a
+        // right-click, a glance, and a conclusion that minimising is broken.
+        self.workspaces
+            .all()
             .find(|w| {
                 w.user_data().get::<cusk::foreign_toplevel::ToplevelId>() == Some(&id)
             })
@@ -1216,6 +1263,13 @@ impl Cusk {
         }
         if current.states.contains(xdg_toplevel::State::Fullscreen) {
             snapshot.states.insert(cusk::toplevel::State::Fullscreen);
+        }
+        // Not from `current_state`: xdg-shell has no Minimized toplevel state.
+        // A client can *request* minimisation and the compositor can decline,
+        // but there is no state bit for the result — so the only place this can
+        // come from is cusk's own list.
+        if self.minimized.contains(window) {
+            snapshot.states.insert(cusk::toplevel::State::Minimized);
         }
         snapshot
     }
@@ -1438,6 +1492,78 @@ impl Cusk {
             self.workspaces.len(),
             if occupied.is_empty() { "none".into() } else { occupied.join(", ") }
         );
+    }
+
+
+    /// Hide a window, keeping it restorable.
+    ///
+    /// The comment this replaces said minimising "refuses and says why until
+    /// there is a task list to restore from". That was right when it was
+    /// written and stopped being right when the dock grew a window list: the
+    /// precondition it named has been met, and the refusal outlived it. Until
+    /// now the dock's minimise button sent `set_minimized` into a handler that
+    /// ignored it — a control that did nothing, silently, which is the failure
+    /// the original refusal was trying to avoid in the first place.
+    fn minimize(&mut self, window: &Window) {
+        if self.minimized.contains(window) {
+            return;
+        }
+        // Recorded before unmapping. `element_location` answers from the space,
+        // so afterwards there is nothing to ask, and a restore would put the
+        // window at the fallback position instead of where the user left it.
+        geometry::remember(&self.space, window);
+        self.space.unmap_elem(window);
+        self.minimized.push(window.clone());
+
+        // A minimised window must not keep the keyboard. Focus moves to the
+        // topmost thing still visible, or to nothing.
+        if self.workspaces.active().focused.as_ref() == Some(window) {
+            self.workspaces.active_mut().focused = None;
+            // Bound before the match: the iterator borrows the space, and
+            // `focus` needs `self` mutably.
+            let next = self.space.elements().next_back().cloned();
+            match next {
+                Some(next) => self.focus(&next),
+                None => {
+                    if let Some(kb) = self.seat.get_keyboard() {
+                        kb.set_focus(self, None, SERIAL_COUNTER.next_serial());
+                    }
+                }
+            }
+        }
+
+        self.relayout();
+        self.publish_toplevel(window);
+        tracing::info!("minimised {:?}", window.toplevel().and_then(|_| self.focused_title()));
+    }
+
+    /// Bring a minimised window back, focused.
+    ///
+    /// Focused deliberately: restoring is always the result of someone asking
+    /// for this specific window, and returning it un-focused would mean a
+    /// second click to type into the thing they just chose.
+    fn unminimize(&mut self, window: &Window) {
+        let Some(at) = self.minimized.iter().position(|held| held == window) else {
+            return;
+        };
+        self.minimized.remove(at);
+
+        // Where it was, not the origin. `recall` is the same source workspace
+        // switching restores from, so a window that was minimised and a window
+        // that was on another workspace come back to the same place.
+        let location = geometry::recall(window)
+            .map(|rect| rect.loc)
+            .unwrap_or_else(|| Point::from((40, 40)));
+        self.space.map_element(window.clone(), location, true);
+
+        self.relayout();
+        self.focus(window);
+        self.publish_toplevel(window);
+    }
+
+    /// Whether a window is hidden by minimising rather than by workspace.
+    fn is_minimized(&self, window: &Window) -> bool {
+        self.minimized.contains(window)
     }
 
     /// Send the focused window to another workspace.
@@ -1710,6 +1836,15 @@ impl Cusk {
     /// raised but not focused, is the classic window-manager bug where typing
     /// goes to something you cannot see.
     fn focus(&mut self, window: &Window) {
+        // A minimised window is not focusable. `focus` maps as well as
+        // focuses, so calling it on one would un-hide the window without
+        // clearing the minimised flag — visible, and recorded as hidden.
+        // `unminimize` is the only supported way back.
+        if self.is_minimized(window) {
+            tracing::debug!("refusing to focus a minimised window");
+            return;
+        }
+
         // Belt and braces. Every caller is already guarded, and this is the one
         // function that could hand a keyboard to a window while the screen says
         // locked — so it refuses on its own account rather than trusting that
@@ -3479,6 +3614,7 @@ fn build_compositor(cfg: &config::Config) -> Result<Compositor, Box<dyn std::err
         output_size: (0, 0),
         keyboard_layer: None,
         lock: None,
+        minimized: Vec::new(),
         focus_before_layer: None,
     };
 
