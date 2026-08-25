@@ -1967,6 +1967,10 @@ fn run_on_tty(
     }
     println!();
 
+    // Before anything is spawned, because a service started without this has
+    // already made its decision about which platform plugin to load.
+    publish_session_environment(&socket_name);
+
     // Watching before the display is taken, so a switch during startup is not
     // missed and cusk does not draw over a VT it no longer owns.
     let (mut session_events, mut active) = tty::watch_session(notifier)?;
@@ -3272,6 +3276,93 @@ fn send_frames(surface: &WlSurface, time: u32) {
 /// and never waits accumulates zombies for every window ever closed; the
 /// symptom is a process table filling up over a long session, which looks like
 /// anything but a window manager bug.
+/// Tell the systemd user manager and the D-Bus session bus what session this is.
+///
+/// Everything cusk spawns gets `WAYLAND_DISPLAY` through `Command::env`, which
+/// covers the dock, the launcher and terminals — and covers nothing else. A
+/// systemd **user service** is not a child of cusk. It is a child of the user
+/// manager, which was started at login, long before this compositor existed,
+/// and which therefore knows nothing about the session running inside it.
+///
+/// The cost of that gap was not subtle. KDE's `drkonqi-coredump-launcher` runs
+/// as a user service; with no `WAYLAND_DISPLAY` and no `QT_QPA_PLATFORM`, Qt
+/// fell back to xcb, found no X display — cusk runs no XWayland — and aborted.
+/// The abort produced a core dump. systemd-coredump handed that dump to
+/// drkonqi, which launched the launcher, which aborted. On 2026-08-24 that loop
+/// ran **40,820 times in two hours**, wrote 4.1 GB of core dumps, consumed
+/// 140,000 PIDs and made every application on the machine slow. Diagnosing it
+/// started from "my browser and my network are slow", which is how far the
+/// symptom had travelled from the cause.
+///
+/// So this is not a convenience for well-behaved services. A GUI service that
+/// cannot determine its platform does not degrade — it aborts, and an aborting
+/// service that is itself the crash handler does not stop.
+///
+/// Both mechanisms, because they feed different things: `systemctl --user
+/// set-environment` reaches units the manager starts, and
+/// `dbus-update-activation-environment` reaches services the session bus
+/// activates. A desktop needs both, and neither implies the other.
+///
+/// `set-environment` rather than `import-environment`: cusk never puts
+/// `WAYLAND_DISPLAY` in its own environment — see `spawn_terminal` for why the
+/// per-child approach is deliberate — so there would be nothing to import.
+///
+/// Every failure is a warning. A session started without a systemd user manager
+/// or without a session bus is unusual but legitimate, and a compositor that
+/// refused to start because it could not tell systemd about itself would be
+/// worse than one whose crash dialogs do not appear.
+fn publish_session_environment(socket_name: &str) {
+    // Passed through rather than invented. cusk-session sets these before exec,
+    // so they are in this process's environment; forwarding what is actually
+    // there keeps one definition of the session rather than a second copy here
+    // that can disagree with the first.
+    let mut vars = vec![format!("WAYLAND_DISPLAY={socket_name}")];
+    for name in [
+        "XDG_CURRENT_DESKTOP",
+        "XDG_SESSION_DESKTOP",
+        "XDG_SESSION_TYPE",
+        "QT_QPA_PLATFORM",
+        "GDK_BACKEND",
+        "MOZ_ENABLE_WAYLAND",
+    ] {
+        if let Ok(value) = std::env::var(name) {
+            vars.push(format!("{name}={value}"));
+        }
+    }
+
+    let run = |program: &str, args: &[String]| match std::process::Command::new(program)
+        .args(args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+    {
+        Ok(status) if status.success() => true,
+        Ok(status) => {
+            tracing::warn!("{program} exited {status}; user services will not see the session");
+            false
+        }
+        Err(e) => {
+            tracing::warn!("could not run {program} ({e}); user services will not see the session");
+            false
+        }
+    };
+
+    let mut args = vec!["--user".to_string(), "set-environment".to_string()];
+    args.extend(vars.iter().cloned());
+    let systemd = run("systemctl", &args);
+
+    // `--systemd` also pushes them into the user manager, which is belt and
+    // braces with the call above and harmless. Kept because this one is what
+    // reaches bus-activated services, and the two paths fail independently.
+    let mut args = vec!["--systemd".to_string()];
+    args.extend(vars.iter().cloned());
+    let dbus = run("dbus-update-activation-environment", &args);
+
+    if systemd || dbus {
+        tracing::info!("published WAYLAND_DISPLAY={socket_name} to the session");
+    }
+}
+
 fn spawn_terminal(term: &str, socket_name: &str) {
     // Only the child's environment is changed. Setting WAYLAND_DISPLAY on the
     // compositor's own process would make it a client of itself the next time
