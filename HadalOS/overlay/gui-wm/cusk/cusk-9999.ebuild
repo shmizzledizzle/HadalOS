@@ -14,13 +14,24 @@ inherit cargo git-r3
 DESCRIPTION="The HadalOS Wayland compositor — floating and dynamic tiling in one"
 HOMEPAGE="https://github.com/shmizzledizzle/HadalOS"
 
-# There is no published remote for this tree. The "repository" is therefore the
-# working checkout on this machine, which is enough to install HadalOS *here*
-# and not enough to install it anywhere else. Overriding HADALOS_GIT_REPO is
-# what makes this ebuild portable, and until the tree is pushed somewhere
-# fetchable there is nothing to point it at. Say so rather than letting someone
-# discover it when the fetch fails on a second machine.
-EGIT_REPO_URI="${HADALOS_GIT_REPO:-/home/shmizzy/Hadalpoint/Projects/HadalOS-Mobile}"
+# Upstream, which every other ebuild in this overlay points at.
+#
+# This defaulted to a path inside one developer's home directory until
+# 2026-08-25, with a comment explaining that there was no published remote and
+# that the working checkout on that machine was therefore the repository. That
+# was true when it was written and stopped being true when the tree was pushed
+# — the same "recorded once and then outlived" shape this tree keeps finding,
+# except that here the stale value also published one developer's home
+# directory to anyone who read the overlay.
+#
+# HADALOS_GIT_REPO still overrides it, and that is now the *development* path
+# rather than the only path. Building your own commits means pointing it at a
+# local checkout, because git-r3 fetches from this URI and will not see
+# anything you have not pushed:
+#
+#     # /etc/portage/make.conf
+#     HADALOS_GIT_REPO="/path/to/your/HadalOS-Mobile"
+EGIT_REPO_URI="${HADALOS_GIT_REPO:-https://github.com/shmizzledizzle/HadalOS.git}"
 
 # git-r3 checks out to ${WORKDIR}/${P}; the crate is one member of that tree.
 S="${WORKDIR}/${P}/src/cusk"

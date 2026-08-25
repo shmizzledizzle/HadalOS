@@ -14,8 +14,8 @@ inherit cargo git-r3
 DESCRIPTION="The HadalOS settings editor — a round-tripping editor over cusk.toml"
 HOMEPAGE="https://github.com/shmizzledizzle/HadalOS"
 
-# See gui-wm/cusk for why this is a local path.
-EGIT_REPO_URI="${HADALOS_GIT_REPO:-/home/shmizzy/Hadalpoint/Projects/HadalOS-Mobile}"
+# See gui-wm/cusk for this, and for how to point it at a local checkout.
+EGIT_REPO_URI="${HADALOS_GIT_REPO:-https://github.com/shmizzledizzle/HadalOS.git}"
 S="${WORKDIR}/${P}/src/cusk-settings"
 
 LICENSE="GPL-2"

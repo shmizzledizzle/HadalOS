@@ -687,7 +687,7 @@ reports *"there are no ebuilds to satisfy"*.
 sudo mkdir -p /etc/portage/repos.conf
 sudo tee /etc/portage/repos.conf/hadalos.conf >/dev/null <<'EOF'
 [hadalos]
-location = /home/shmizzy/Documents/HadalOS-Mobile/HadalOS/overlay
+location = /path/to/HadalOS-Mobile/HadalOS/overlay
 auto-sync = no
 EOF
 

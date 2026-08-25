@@ -14,8 +14,8 @@ inherit cargo git-r3 systemd
 DESCRIPTION="HadalOS capability broker (org.hadal.Broker1) and its client"
 HOMEPAGE="https://github.com/shmizzledizzle/HadalOS"
 
-# See gui-wm/cusk for why this is a local path.
-EGIT_REPO_URI="${HADALOS_GIT_REPO:-/home/shmizzy/Hadalpoint/Projects/HadalOS-Mobile}"
+# See gui-wm/cusk for this, and for how to point it at a local checkout.
+EGIT_REPO_URI="${HADALOS_GIT_REPO:-https://github.com/shmizzledizzle/HadalOS.git}"
 
 # The desktop cargo workspace. Note this is HadalOS/src, not src/ — the tracked
 # src/hadal-brokerd at the repo root is hadal-brokerd-android, a different crate

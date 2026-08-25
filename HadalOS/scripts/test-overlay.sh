@@ -129,6 +129,23 @@ for f in ${ebuilds}; do
 	fi
 done
 
+section "ebuilds do not fetch from somebody's home directory"
+# Every live ebuild here defaulted to /home/<someone>/... until 2026-08-25,
+# because the tree had no published remote and the working checkout was the
+# repository. Publishing made that both wrong and a disclosure: an overlay that
+# names a developer's home directory is unusable on any other machine *and*
+# tells everyone who reads it what that directory is.
+#
+# HADALOS_GIT_REPO is still the override for local development. The point is
+# that it is the override and not the default.
+for f in ${ebuilds}; do
+	if grep -qE '^[^#]*/home/' "${f}"; then
+		bad "${f#"${overlay}"/} references a home directory — it will not fetch anywhere else"
+	else
+		ok "${f#"${overlay}"/}"
+	fi
+done
+
 section "unit directives are in the section systemd reads them from"
 # Three times now, in three different units. systemd does not fail on a
 # directive in the wrong section — it logs "Unknown key ... ignoring" once at

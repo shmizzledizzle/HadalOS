@@ -61,7 +61,7 @@ every single `emerge` invocation and it was survivable, so it survived:
 
 ```
 !!! Section 'hadalos' in repos.conf has location attribute set to
-    nonexistent directory: '/home/shmizzy/Documents/HadalOS-Mobile/HadalOS/overlay'
+    nonexistent directory: '/home/you/Documents/HadalOS-Mobile/HadalOS/overlay'
 ```
 
 The consequence was not cosmetic. The two HadalOS packages already installed on
@@ -70,7 +70,7 @@ could not read the ebuilds they came from.
 
 ```ini
 [hadalos]
-location = /home/shmizzy/Hadalpoint/Projects/HadalOS-Mobile/HadalOS/overlay
+location = /path/to/HadalOS-Mobile/HadalOS/overlay
 auto-sync = no
 ```
 
@@ -318,16 +318,31 @@ work, and it is deliberate:
 records build failures whether or not anything is around to read them, so a
 build host can capture material without hosting an assistant.
 
-### The gap that stops this being reproducible today
+### The gap that stopped this being reproducible, and is now closed
 
-**There is no published remote.** The live ebuilds fetch from
-`EGIT_REPO_URI="${HADALOS_GIT_REPO:-/home/shmizzy/Hadalpoint/Projects/HadalOS-Mobile}"`
-— a path on this laptop. That is enough to install HadalOS *here* and not
-enough to install it anywhere else, and no amount of package layering fixes it.
+**There is a published remote**, as of 2026-08-25:
+<https://github.com/shmizzledizzle/HadalOS>. The live ebuilds default to it:
 
-Publishing the tree is therefore not housekeeping, it is the remaining
-requirement for the word "distribution" to apply. Until then `HADALOS_GIT_REPO`
-can point at a clone, which moves the problem rather than solving it.
+```sh
+EGIT_REPO_URI="${HADALOS_GIT_REPO:-https://github.com/shmizzledizzle/HadalOS.git}"
+```
+
+Until then they fetched from a path inside one developer's home directory,
+which was enough to install HadalOS *there* and nowhere else — and no amount of
+package layering fixed it, because the layering was never the missing piece.
+Publishing was not housekeeping; it was the remaining requirement for the word
+"distribution" to apply.
+
+`HADALOS_GIT_REPO` still overrides the default, and that is now the
+**development** path rather than the only one. `git-r3` fetches from whatever
+this resolves to, so building your own commits means pointing it at a local
+checkout — otherwise you get upstream's tree and quietly wonder why your change
+is not in the installed binary:
+
+```sh
+# /etc/portage/make.conf
+HADALOS_GIT_REPO="/path/to/your/HadalOS-Mobile"
+```
 
 ### And the pinning question behind it
 

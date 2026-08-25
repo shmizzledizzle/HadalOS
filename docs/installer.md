@@ -212,15 +212,21 @@ Both are clients of §2's socket, so this is sequencing, not scope reduction.
 
 Stated here rather than discovered later, because it is absolute.
 
-`host-conversion.md` §4 records that the live ebuilds fetch from
+This was the blocking one, and it is no longer blocking. The live ebuilds used
+to fetch from a path inside one developer's home directory, which an ISO booted
+on another machine cannot resolve — publishing the tree was a prerequisite for
+the installer to install anything, and no amount of installer design
+substituted for it.
+
+Closed 2026-08-25. `host-conversion.md` §4 records the default the ebuilds now
+carry:
 
 ```
-EGIT_REPO_URI="${HADALOS_GIT_REPO:-/home/shmizzy/Hadalpoint/Projects/HadalOS-Mobile}"
+EGIT_REPO_URI="${HADALOS_GIT_REPO:-https://github.com/shmizzledizzle/HadalOS.git}"
 ```
 
-a path on this laptop. An ISO booted on another machine cannot resolve it.
-**Publishing the tree is a prerequisite for the installer to install
-anything**, and no amount of installer design substitutes for it.
+An ISO can resolve that, which means the installer's remaining problems are its
+own.
 
 Two consequences worth being honest about:
 

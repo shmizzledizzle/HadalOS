@@ -14,8 +14,8 @@ inherit cargo git-r3 systemd
 DESCRIPTION="The Hadal model host — Ollama-shaped inward, OpenAI-shaped outward"
 HOMEPAGE="https://github.com/shmizzledizzle/HadalOS"
 
-# See gui-wm/cusk for why this is a local path.
-EGIT_REPO_URI="${HADALOS_GIT_REPO:-/home/shmizzy/Hadalpoint/Projects/HadalOS-Mobile}"
+# See gui-wm/cusk for this, and for how to point it at a local checkout.
+EGIT_REPO_URI="${HADALOS_GIT_REPO:-https://github.com/shmizzledizzle/HadalOS.git}"
 S="${WORKDIR}/${P}/src/hadald"
 
 LICENSE="GPL-2"
