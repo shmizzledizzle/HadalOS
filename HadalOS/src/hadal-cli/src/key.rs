@@ -1,0 +1,389 @@
+//! `hadal key` — acquire and install the upstream API key.
+//!
+//! hadald will not start without a model id and, for a remote upstream, a
+//! credential. Both live in `/etc/hadal`, which is `0700` and owned by `hadal`,
+//! so writing them needs privilege the CLI deliberately does not have. This
+//! command is the bridge: it explains where to get a key, opens the page, takes
+//! the paste, and hands the write to `pkexec` — one prompt, at the end, for the
+//! one operation that needs it.
+//!
+//! # Why this does not go through the broker
+//!
+//! The broker is the component that holds privilege, so a `SetUpstreamKey`
+//! capability would be the consistent-looking choice. It is the wrong one. The
+//! broker's whole design argument is that its action enum is closed and that no
+//! model generation can reach anything outside it; "write these bytes to a
+//! privileged file" is precisely the shape that argument exists to keep off the
+//! list. This command is interactive, user-initiated, and reachable only from a
+//! terminal — there is no path to it from a generation because it is not a
+//! capability at all.
+//!
+//! # Why it runs before the bus connection
+//!
+//! `main` connects to the system bus before dispatching most subcommands. This
+//! one cannot wait for that: hadal-brokerd `Requires=hadald.service`, hadald
+//! will not start without the key, so the broker is guaranteed to be down at
+//! the exact moment someone runs this. A `key` command that needed the broker
+//! running would be unreachable in the only situation it is for.
+
+use std::fs;
+use std::io::{self, BufRead, IsTerminal, Write};
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+type Res<T> = Result<T, Box<dyn std::error::Error>>;
+
+const CONFIG_DIR: &str = "/etc/hadal";
+const KEY_FILE: &str = "/etc/hadal/upstream.key";
+const ENV_FILE: &str = "/etc/hadal/hadald.env";
+
+/// Where NVIDIA hands out keys for the endpoint `config.rs` defaults to.
+///
+/// Named as a constant beside the default upstream it belongs to, because the
+/// two have to change together: pointing hadald at a different provider makes
+/// these directions wrong, and wrong directions are worse than none.
+const SIGNUP_URL: &str = "https://build.nvidia.com/";
+const DEFAULT_UPSTREAM: &str = "https://integrate.api.nvidia.com/v1";
+
+/// What NVIDIA's keys have looked like. Advisory only.
+///
+/// Checked to catch the common paste mistakes — a URL, an empty clipboard, the
+/// page title — not to enforce a format. A provider that changes its prefix
+/// must not make this command refuse a valid key, so a mismatch warns and
+/// continues.
+const EXPECTED_PREFIX: &str = "nvapi-";
+
+pub fn run() -> Res<()> {
+    if !io::stdin().is_terminal() {
+        return Err("hadal key is interactive; run it from a terminal".into());
+    }
+
+    println!();
+    println!("  Setting up hadald's upstream credential.");
+    println!();
+    println!("  hadald routes to a model endpoint. The default is NVIDIA's,");
+    println!("  which needs an API key. Nothing is sent anywhere until hadald");
+    println!("  runs, and the key is written to {KEY_FILE}");
+    println!("  as mode 0600 owned by hadal — never to your shell history and");
+    println!("  never into the service's environment, where /proc would expose");
+    println!("  it.");
+    println!();
+
+    match open_browser(SIGNUP_URL) {
+        Ok(()) => println!("  Opened {SIGNUP_URL} in your browser."),
+        // Not fatal. A headless box, no xdg-open, or no browser installed are
+        // all ordinary; the URL is printed either way and that is the part
+        // that matters.
+        Err(e) => println!("  Could not open a browser ({e}). Go to {SIGNUP_URL}"),
+    }
+
+    println!();
+    println!("  On that page:");
+    println!("    1. Sign in, or create an account.");
+    println!("    2. Pick any model — the key is account-wide, not per model.");
+    println!("    3. Click 'Get API Key', then 'Generate Key'.");
+    println!("    4. Copy it. It is shown once.");
+    println!();
+
+    let key = prompt_secret("  Paste the key here (it will not echo): ")?;
+    let key = key.trim().to_string();
+    if key.is_empty() {
+        return Err("no key entered; nothing was written".into());
+    }
+    if key.contains(char::is_whitespace) {
+        return Err("that contains whitespace — it looks like prose, not a key".into());
+    }
+    if !key.starts_with(EXPECTED_PREFIX) {
+        // A warning, not a refusal: see EXPECTED_PREFIX.
+        println!();
+        println!("  Note: that does not start with {EXPECTED_PREFIX:?}, which is what");
+        println!("  NVIDIA keys have looked like. Continuing anyway — if hadald");
+        println!("  reports 401 afterwards, this is the first thing to re-check.");
+    }
+    // Masked confirmation. A pasted key that silently lost a character to a
+    // terminal is the failure this catches, and echoing the whole thing to
+    // catch it would defeat the point of not echoing it.
+    println!();
+    println!("  Got {} characters, {}.", key.len(), mask(&key));
+
+    let model = prompt_line("  Model id [nvidia/llama-3.3-nemotron-super-49b-v1.5]: ")?;
+    let model = match model.trim() {
+        "" => "nvidia/llama-3.3-nemotron-super-49b-v1.5".to_string(),
+        chosen => chosen.to_string(),
+    };
+
+    install(&key, &model)?;
+
+    println!();
+    println!("  Written:");
+    println!("    {KEY_FILE}   (0600 hadal:hadal)");
+    println!("    {ENV_FILE}    (0600 hadal:hadal)");
+    println!();
+    println!("  Start it with:");
+    println!("    sudo systemctl start hadald hadal-brokerd");
+    println!();
+    println!("  Then `hadal status` should answer.");
+    println!();
+    Ok(())
+}
+
+/// First four and last four, with the middle elided.
+///
+/// Short keys are elided entirely rather than shown — a key short enough that
+/// eight characters would reveal most of it is a key worth not printing.
+fn mask(key: &str) -> String {
+    let chars: Vec<char> = key.chars().collect();
+    if chars.len() < 16 {
+        return "too short to show safely".to_string();
+    }
+    let head: String = chars[..4].iter().collect();
+    let tail: String = chars[chars.len() - 4..].iter().collect();
+    format!("starting {head}… and ending …{tail}")
+}
+
+fn open_browser(url: &str) -> Res<()> {
+    let status = Command::new("xdg-open")
+        .arg(url)
+        // Silenced: xdg-open is a shell script and several backends chatter on
+        // stderr even when they succeed, which would land in the middle of the
+        // directions below.
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()?;
+    if !status.success() {
+        return Err(format!("xdg-open exited {status}").into());
+    }
+    Ok(())
+}
+
+fn prompt_line(prompt: &str) -> Res<String> {
+    print!("{prompt}");
+    io::stdout().flush()?;
+    let mut line = String::new();
+    io::stdin().lock().read_line(&mut line)?;
+    Ok(line)
+}
+
+/// Read a line with terminal echo disabled.
+///
+/// `stty` rather than a crate. The alternative is `libc` or `rpassword` for one
+/// ioctl on one line of input, and this binary's dependency list is otherwise
+/// four things it genuinely needs.
+///
+/// Echo is restored by `EchoGuard` on the way out, including on the error paths
+/// above — leaving a terminal with echo off is a far worse outcome than
+/// failing to read a key, because the shell it returns to appears broken.
+fn prompt_secret(prompt: &str) -> Res<String> {
+    print!("{prompt}");
+    io::stdout().flush()?;
+
+    let guard = EchoGuard::off();
+    let mut line = String::new();
+    let read = io::stdin().lock().read_line(&mut line);
+    drop(guard);
+    // The newline the user typed was swallowed with the echo.
+    println!();
+    read?;
+    Ok(line)
+}
+
+/// Restores terminal echo when dropped.
+struct EchoGuard {
+    /// False when `stty -echo` failed, in which case there is nothing to undo
+    /// and the key was echoed. Not an error: the key still gets installed, and
+    /// refusing to proceed because a terminal would not turn echo off helps
+    /// nobody.
+    disabled: bool,
+}
+
+impl EchoGuard {
+    fn off() -> Self {
+        EchoGuard { disabled: stty(&["-echo"]).is_ok() }
+    }
+}
+
+impl Drop for EchoGuard {
+    fn drop(&mut self) {
+        if self.disabled {
+            let _ = stty(&["echo"]);
+        }
+    }
+}
+
+fn stty(args: &[&str]) -> Res<()> {
+    // `-F /dev/tty` rather than inheriting stdin: it works when stdin has been
+    // redirected but a controlling terminal still exists.
+    let status = Command::new("stty")
+        .arg("-F")
+        .arg("/dev/tty")
+        .args(args)
+        .stderr(std::process::Stdio::null())
+        .status()?;
+    if !status.success() {
+        return Err("stty failed".into());
+    }
+    Ok(())
+}
+
+/// Stage both files as the user, then move them into place with one pkexec.
+///
+/// Staged rather than piped because `pkexec` does not reliably forward stdin,
+/// and passed as file paths rather than arguments because an API key in argv is
+/// readable from `/proc/<pid>/cmdline` by anyone on the machine for as long as
+/// the call runs. The staging files are created 0600 in the user's own runtime
+/// directory and removed on every path out, including failure.
+fn install(key: &str, model: &str) -> Res<()> {
+    let staging = Staging::new()?;
+    // Trailing newline: `read_key` in hadald trims, but a file without one is
+    // a nuisance to every other tool that reads it.
+    staging.write("upstream.key", &format!("{key}\n"))?;
+    staging.write(
+        "hadald.env",
+        &format!(
+            "# Written by `hadal key`.\n\
+             # HADAL_MODEL is the one setting that varies per machine.\n\
+             # HADAL_UPSTREAM overrides the unit's default; remove it to use that.\n\
+             HADAL_MODEL={model}\n\
+             HADAL_UPSTREAM={DEFAULT_UPSTREAM}\n"
+        ),
+    )?;
+
+    println!();
+    println!("  Installing into {CONFIG_DIR} — this needs authentication.");
+
+    // One invocation, so there is one prompt rather than three. `sh -c` with
+    // the paths as positional arguments rather than interpolated into the
+    // script: a staging path containing a quote would otherwise be a shell
+    // injection into a root command.
+    let status = Command::new("pkexec")
+        .arg("/bin/sh")
+        .arg("-c")
+        .arg(
+            "install -d -m 0700 -o hadal -g hadal /etc/hadal && \
+             install -m 0600 -o hadal -g hadal \"$1\" /etc/hadal/upstream.key && \
+             install -m 0600 -o hadal -g hadal \"$2\" /etc/hadal/hadald.env",
+        )
+        .arg("sh")
+        .arg(staging.path("upstream.key"))
+        .arg(staging.path("hadald.env"))
+        .status()
+        .map_err(|e| format!("could not run pkexec: {e}"))?;
+
+    if !status.success() {
+        // 126 is pkexec's "not authorized"; 127 is "dismissed". Both are the
+        // user declining, which is not a fault to report as one.
+        return Err(match status.code() {
+            Some(126) | Some(127) => "not authorized; nothing was written".into(),
+            _ => format!("pkexec exited {status}; nothing was written"),
+        }
+        .into());
+    }
+    Ok(())
+}
+
+/// A private directory for the two files between writing and installing them.
+///
+/// Under `XDG_RUNTIME_DIR` when there is one — that is `0700`, user-owned, and
+/// on tmpfs, so a key staged there never reaches a disk. `/tmp` is the fallback
+/// and is world-readable, which is why the files are `0600` regardless.
+struct Staging {
+    dir: PathBuf,
+}
+
+impl Staging {
+    fn new() -> Res<Self> {
+        let base = std::env::var("XDG_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("/tmp"));
+        let dir = base.join(format!("hadal-key.{}", std::process::id()));
+        fs::create_dir_all(&dir)?;
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
+        Ok(Staging { dir })
+    }
+
+    fn path(&self, name: &str) -> PathBuf {
+        self.dir.join(name)
+    }
+
+    fn write(&self, name: &str, contents: &str) -> Res<()> {
+        let path = self.path(name);
+        fs::write(&path, contents)?;
+        // After writing, not before: `fs::write` creates with 0644 and the
+        // window between the two is the only moment the key is readable.
+        // Narrow, and closed here rather than left open.
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+        Ok(())
+    }
+}
+
+impl Drop for Staging {
+    fn drop(&mut self) {
+        // Best effort, but it does run on the failure paths too — a declined
+        // polkit prompt must not leave the key sitting in a temp file.
+        let _ = shred(&self.dir);
+    }
+}
+
+/// Overwrite before unlinking.
+///
+/// tmpfs makes this close to theatre and it costs nothing; on the `/tmp`
+/// fallback, where `/tmp` may be a real filesystem, it is the difference
+/// between a deleted file and a recoverable one.
+fn shred(dir: &Path) -> io::Result<()> {
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if let Ok(meta) = fs::metadata(&path) {
+                let _ = fs::write(&path, vec![0u8; meta.len() as usize]);
+            }
+            let _ = fs::remove_file(&path);
+        }
+    }
+    fs::remove_dir(dir)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_key_is_masked_to_its_ends() {
+        let masked = mask("nvapi-abcdefghijklmnop");
+        assert!(masked.contains("nvap"), "{masked}");
+        assert!(masked.contains("mnop"), "{masked}");
+        // The point of masking is that the middle is absent.
+        assert!(!masked.contains("efghij"), "{masked}");
+    }
+
+    #[test]
+    fn a_short_key_is_not_shown_at_all() {
+        // Eight characters of a twelve-character key is most of it.
+        assert_eq!(mask("nvapi-abcdef"), "too short to show safely");
+        assert_eq!(mask(""), "too short to show safely");
+    }
+
+    #[test]
+    fn staging_files_are_not_readable_by_anyone_else() {
+        let staging = Staging::new().expect("staging dir");
+        staging.write("upstream.key", "nvapi-secret\n").expect("write");
+        let mode = fs::metadata(staging.path("upstream.key")).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "staged key is {:o}", mode & 0o777);
+        let dir_mode = fs::metadata(&staging.dir).unwrap().permissions().mode();
+        assert_eq!(dir_mode & 0o777, 0o700, "staging dir is {:o}", dir_mode & 0o777);
+    }
+
+    #[test]
+    fn staging_is_removed_when_dropped_even_though_the_key_was_never_installed() {
+        let path = {
+            let staging = Staging::new().expect("staging dir");
+            staging.write("upstream.key", "nvapi-secret\n").expect("write");
+            let path = staging.dir.clone();
+            assert!(path.exists());
+            path
+        };
+        // This is the declined-polkit path: nothing was installed, and the key
+        // must not be left behind.
+        assert!(!path.exists(), "staging survived the drop");
+    }
+}

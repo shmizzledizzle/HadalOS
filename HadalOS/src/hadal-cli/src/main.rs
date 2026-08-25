@@ -8,6 +8,8 @@
 //! Nothing in this binary can bypass that. It holds no capability and knows no
 //! token it was not handed.
 
+mod key;
+
 use std::collections::HashMap;
 use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
@@ -43,6 +45,7 @@ hadal — the assistant built into this system
   hadal explain            analyse the most recent Portage build failure
   hadal why                explain services that failed on this boot
   hadal status             broker readiness and what it is permitted to do
+  hadal key                get an upstream API key and install it
   hadal -h, --help         this text, plus what Hadal is currently allowed to do
 
 Proposed changes are always shown and confirmed before anything happens, and
@@ -101,6 +104,15 @@ async fn main() -> Res<()> {
     // exactly when someone reaches for --help.
     if matches!(first, "-h" | "--help" | "help") {
         return help().await;
+    }
+
+    // Answered before the bus, like help, and for a sharper reason.
+    // hadal-brokerd `Requires=hadald.service`, and hadald will not start
+    // without the key this command installs — so the broker is guaranteed to be
+    // down at the exact moment someone needs this. Dispatching it after
+    // `Connection::system()` would make it unreachable in its only situation.
+    if args.len() == 1 && first == "key" {
+        return key::run();
     }
 
     // An unrecognised flag is a mistake, not a question. Without this,
