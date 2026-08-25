@@ -1,0 +1,22 @@
+[package]
+name = "cusk-lock"
+version = "0.1.0"
+edition = "2021"
+description = "Session locker for the cusk window manager"
+license = "GPL-2.0-only"
+
+[[bin]]
+name = "cusk-lock"
+path = "src/main.rs"
+
+[dependencies]
+# The palette and the font rasteriser, shared with the compositor rather than
+# reimplemented. A lock screen that does not look like the desktop it is
+# covering reads as something that has gone wrong.
+cusk = { path = "../cusk" }
+pam = "0.8.0"
+# ext-session-lock-v1 client side, plus the seat/xkb and shm handling that
+# would otherwise be several hundred lines of this crate. Not iced: iced speaks
+# xdg-shell and layer-shell, and a lock surface is neither.
+smithay-client-toolkit = "0.20"
+wayland-client = "0.31"

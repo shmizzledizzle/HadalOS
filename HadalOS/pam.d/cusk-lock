@@ -1,0 +1,24 @@
+#%PAM-1.0
+#
+# PAM policy for cusk-lock, the session locker.
+#
+# Its own service rather than borrowing `login` or `system-auth` directly, for
+# two reasons.
+#
+# First, so this file exists at all. cusk-lock resolves its service against
+# files on disk and falls back to system-auth, because naming a service with no
+# file does not fail open — PAM falls through to `other`, which is pam_deny, and
+# the result is a lock screen that rejects every correct password. Shipping the
+# file removes that path.
+#
+# Second, so a site can change the policy for *unlocking a screen* without
+# changing the policy for logging in. Adding a fingerprint module here is a
+# reasonable thing to want; adding it to system-auth is a much larger decision.
+#
+# auth and account only. A screen unlock resumes a session that is already
+# running: there is no session to open, and `session` stacks have side effects —
+# pam_lastlog writes a login record, pam_motd prints — that are wrong for
+# something that never logged in. `password` is for changing credentials, which
+# this cannot do.
+auth        include     system-auth
+account     include     system-auth
