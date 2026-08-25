@@ -71,6 +71,7 @@ use cusk::bindings::{self, Binding};
 use smithay::input::pointer::{AxisFrame,ButtonEvent, GrabStartData, MotionEvent};
 use smithay::input::{Seat, SeatHandler, SeatState};
 use smithay::reexports::wayland_server::protocol::wl_buffer;
+use smithay::reexports::wayland_server::protocol::wl_output::WlOutput;
 use smithay::reexports::wayland_server::protocol::wl_seat;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::backend::{ClientData, ClientId, DisconnectReason};
@@ -89,6 +90,9 @@ use smithay::wayland::selection::data_device::{
 };
 use smithay::wayland::selection::SelectionHandler;
 use smithay::desktop::{layer_map_for_output, LayerSurface};
+use smithay::wayland::session_lock::{
+    LockSurface, SessionLockHandler, SessionLockManagerState, SessionLocker,
+};
 use smithay::wayland::shell::wlr_layer::{
     KeyboardInteractivity, Layer, LayerSurface as WlrLayerSurface, LayerSurfaceCachedState,
     WlrLayerShellHandler, WlrLayerShellState,
@@ -169,6 +173,19 @@ struct Cusk {
     #[allow(dead_code)]
     xdg_decoration_state: XdgDecorationState,
     layer_shell_state: WlrLayerShellState,
+    session_lock_state: SessionLockManagerState,
+    /// The session lock, when the session is locked.
+    ///
+    /// `Some` is the *only* thing that means locked, and it is cleared in
+    /// exactly one place: `SessionLockHandler::unlock`, which fires on the
+    /// client's `unlock_and_destroy` request and nothing else.
+    ///
+    /// That single-assignment discipline is the security property.
+    /// ext-session-lock-v1 requires that a lock client which dies without
+    /// unlocking leaves the session locked — a crashed locker must not be a way
+    /// in. So nothing here keys off whether a lock *surface* exists: the
+    /// surfaces vanish with the client, and this does not.
+    lock: Option<SessionLock>,
     /// What windows exist, as other clients see them. This is what makes a
     /// taskbar possible — see cusk::toplevel and docs/cusk.md milestone 34.
     foreign_toplevel_state: cusk::foreign_toplevel::ForeignToplevelState,
@@ -660,6 +677,83 @@ impl WlrLayerShellHandler for Cusk {
 }
 smithay::delegate_layer_shell!(Cusk);
 
+
+/// A locked session.
+///
+/// The existence of this value is what "locked" means. See `Cusk::lock` for why
+/// nothing here keys off the surfaces.
+#[derive(Default)]
+struct SessionLock {
+    /// One per output, created by the client after it locks. Empty in two very
+    /// different situations that must look identical on screen: before the
+    /// client has drawn anything, and after the client has died. Both render
+    /// black.
+    surfaces: Vec<LockSurface>,
+    /// Held until a frame has actually been presented with client content gone.
+    ///
+    /// The protocol says to confirm *after* a cleared frame, and the difference
+    /// is not pedantic: confirming here, at request time, tells the client the
+    /// screen is safe while the previous frame — the user's actual desktop — is
+    /// still in the scanout buffer. `draw_frame` takes this and confirms once
+    /// it has drawn the locked frame.
+    confirmation: Option<SessionLocker>,
+}
+
+impl SessionLockHandler for Cusk {
+    fn lock_state(&mut self) -> &mut SessionLockManagerState {
+        &mut self.session_lock_state
+    }
+
+    fn lock(&mut self, confirmation: SessionLocker) {
+        // Focus is dropped from every client *now*, not when the lock surface
+        // arrives. Between the lock request and the first lock surface there is
+        // a window of some milliseconds, and a keyboard still pointed at a
+        // terminal during it is a keylogger with the screen turned off.
+        self.release_layer_keyboard();
+        if let Some(kb) = self.seat.get_keyboard() {
+            kb.set_focus(self, None, SERIAL_COUNTER.next_serial());
+        }
+        self.lock = Some(SessionLock { confirmation: Some(confirmation), ..Default::default() });
+        tracing::info!("session locked");
+    }
+
+    fn unlock(&mut self) {
+        // The only place this is cleared. Reached only from the client's
+        // `unlock_and_destroy`.
+        self.lock = None;
+        tracing::info!("session unlocked");
+        // Give the keyboard back to whatever had it, the same way dismissing a
+        // panel does. Without this the desktop returns and ignores typing,
+        // which reads as the unlock not having worked.
+        self.restore_focus_after_layer();
+        self.relayout();
+    }
+
+    fn new_surface(&mut self, surface: LockSurface, _output: WlOutput) {
+        // Sized to the output before the first configure: a lock surface that
+        // is told nothing draws at whatever size it guesses, and anything
+        // smaller than the output leaves the desktop visible around it.
+        let size = (self.output_size.0 as u32, self.output_size.1 as u32);
+        surface.with_pending_state(|state| state.size = Some(size.into()));
+        surface.send_configure();
+
+        // Focus follows the lock surface, because it is the only thing on
+        // screen that may receive input.
+        if let Some(kb) = self.seat.get_keyboard() {
+            kb.set_focus(self, Some(surface.wl_surface().clone()), SERIAL_COUNTER.next_serial());
+        }
+
+        match &mut self.lock {
+            Some(lock) => lock.surfaces.push(surface),
+            // A lock surface with no lock is a protocol error on the client's
+            // part; dropping it is the safe reading, since accepting it would
+            // put an unauthenticated surface over an unlocked session.
+            None => tracing::warn!("lock surface arrived while unlocked; ignored"),
+        }
+    }
+}
+smithay::delegate_session_lock!(Cusk);
+
 impl cusk::foreign_toplevel::ForeignToplevelHandler for Cusk {
     fn foreign_toplevel_state(&mut self) -> &mut cusk::foreign_toplevel::ForeignToplevelState {
         &mut self.foreign_toplevel_state
@@ -827,6 +921,25 @@ impl Cusk {
         &self,
         point: Point<f64, Logical>,
     ) -> Option<(WlSurface, Point<f64, Logical>)> {
+        // While locked, the lock surface is the only thing the pointer can
+        // reach. Not "the topmost thing" — the *only* thing: a lock screen that
+        // let a click through to a window behind it would be a lock screen in
+        // name only, and the window need not be visible for the click to work.
+        if let Some(lock) = &self.lock {
+            return lock
+                .surfaces
+                .first()
+                .and_then(|s| {
+                    smithay::desktop::utils::under_from_surface_tree(
+                        s.wl_surface(),
+                        point,
+                        (0, 0),
+                        WindowSurfaceType::ALL,
+                    )
+                })
+                .map(|(surface, loc)| (surface, loc.to_f64()));
+        }
+
         let map = layer_map_for_output(&self.output);
         for layer in map.layers().rev() {
             if !matches!(layer.layer(), Layer::Top | Layer::Overlay) {
@@ -1563,6 +1676,11 @@ impl Cusk {
     /// - **Already-focused windows are skipped.** `focus` raises, and raising
     ///   on every motion event re-stacks the space hundreds of times a second.
     fn focus_under_pointer(&mut self, location: Point<f64, smithay::utils::Logical>) {
+        // Focus-follows-mouse does not follow into a locked session.
+        if self.lock.is_some() {
+            return;
+        }
+
         // The same test `press` makes, for the same reason. `surface_under`
         // asks *which window*, and a layer surface is not one — so it looks
         // straight through the launcher to whichever tile is behind it, and
@@ -1592,6 +1710,15 @@ impl Cusk {
     /// raised but not focused, is the classic window-manager bug where typing
     /// goes to something you cannot see.
     fn focus(&mut self, window: &Window) {
+        // Belt and braces. Every caller is already guarded, and this is the one
+        // function that could hand a keyboard to a window while the screen says
+        // locked — so it refuses on its own account rather than trusting that
+        // the list of callers is still complete.
+        if self.lock.is_some() {
+            tracing::debug!("refusing to focus a window: session is locked");
+            return;
+        }
+
         // A window taking the keyboard is what dismisses a panel that was
         // holding it: the layer surface receives `leave`, and a launcher that
         // wants to disappear when it stops being used now has an event that
@@ -2262,6 +2389,19 @@ impl Cusk {
         terminal: Option<&str>,
         socket_name: &str,
     ) {
+        // Nothing the compositor binds does anything while locked.
+        //
+        // One guard here rather than one per arm, because the arms are the
+        // problem: `Super+D` spawns the launcher, `Super+Return` spawns a
+        // terminal, `Super+1..9` switches workspace. Every one of those puts an
+        // unauthenticated window on top of the lock screen, and the terminal is
+        // a shell. A guard per arm is a guard someone forgets when adding the
+        // tenth binding; this is the only line that has to stay right.
+        if self.lock.is_some() {
+            tracing::debug!("binding ignored: session is locked");
+            return;
+        }
+
         // Topmost in stacking order is the focused window.
         let focused = self.focused();
         match binding {
@@ -2354,6 +2494,13 @@ impl Cusk {
     /// focuses. Consumed presses are not forwarded, or Super+drag selects text
     /// in the terminal it is dragging.
     fn press(&mut self, button: u32, serial: Serial) -> bool {
+        // Forwarded to the lock surface by the caller, but nothing here runs:
+        // no panel click, no window focus, no move or resize grab. The desktop
+        // does not exist while locked.
+        if self.lock.is_some() {
+            return true;
+        }
+
         if self.panel_click(self.pointer_location.to_i32_round()) {
             return false;
         }
@@ -2542,6 +2689,19 @@ fn draw_frame(
     start: std::time::Instant,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let damage = Rectangle::from_size(size);
+
+    // A locked session shares no rendering with an unlocked one.
+    //
+    // Branching here, into a function that cannot see the wallpaper, the
+    // windows, the layer surfaces, the panel or the cursor, rather than
+    // threading `if !locked` through the six hundred lines below. The property
+    // wanted is "no client content reaches the screen", and the only way to
+    // hold that under future edits is for the locked path to have no access to
+    // the code that draws any.
+    if state.lock.is_some() {
+        return draw_locked(renderer, framebuffer, state, size, transform, start);
+    }
+
         // Compiled on the first frame rather than at startup, because it
         // needs a current GL context and the renderer only has one here.
         let chrome = ctx.chrome.get_or_insert_with(|| chrome::Chrome::new(renderer));
@@ -3140,6 +3300,87 @@ fn draw_frame(
         }
     Ok(())
 }
+
+/// Draw a locked session: the lock surfaces, and otherwise nothing.
+///
+/// Deliberately separate from `draw_frame`. It has no `Config`, no
+/// `FrameContext`, and no access to the space or the layer map — not as a
+/// tidiness measure, but because the security property is negative ("no client
+/// content is visible") and negative properties are not maintainable as a
+/// condition sprinkled through a long function. Someone adding a new overlay to
+/// `draw_frame` a year from now cannot accidentally make it render here.
+///
+/// # Black when there is nothing to draw
+///
+/// The surface list is empty in two situations that must be indistinguishable
+/// on screen: before the lock client has drawn its first frame, and after the
+/// lock client has died. ext-session-lock-v1 requires the second to stay
+/// locked — a crashed locker is not a way in — so the fallback is a black
+/// screen rather than anything derived from session state.
+///
+/// Black rather than the desktop's background colour, which is a recognisable
+/// dark blue. The screen should not look like a desktop that failed to draw.
+fn draw_locked(
+    renderer: &mut GlesRenderer,
+    framebuffer: &mut <GlesRenderer as RendererSuper>::Framebuffer<'_>,
+    state: &mut Cusk,
+    size: Size<i32, Physical>,
+    transform: Transform,
+    start: std::time::Instant,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let damage = Rectangle::from_size(size);
+
+    // Collected before the frame is created, because building elements and
+    // creating the frame both borrow the renderer mutably.
+    let surfaces: Vec<WlSurface> = state
+        .lock
+        .as_ref()
+        .map(|lock| lock.surfaces.iter().map(|s| s.wl_surface().clone()).collect())
+        .unwrap_or_default();
+
+    let mut elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>> = Vec::new();
+    for surface in &surfaces {
+        // At the origin: a lock surface is configured to the output size in
+        // `new_surface`, so it covers the screen and has nowhere else to be.
+        elements.extend(render_elements_from_surface_tree(
+            renderer,
+            surface,
+            (0, 0),
+            1.0,
+            1.0,
+            Kind::Unspecified,
+        ));
+    }
+
+    let mut frame = renderer.render(framebuffer, size, transform)?;
+    frame.clear(Color32F::new(0.0, 0.0, 0.0, 1.0), &[damage])?;
+    draw_render_elements(&mut frame, 1.0, &elements, &[damage])?;
+    let _sync = frame.finish()?;
+
+    // Confirmed here and nowhere else.
+    //
+    // The protocol says to confirm after a cleared frame has been presented,
+    // and the distinction is the whole point: confirming when the lock request
+    // arrives would tell the client the screen is safe while the previous
+    // frame — the user's actual desktop — is still in the scanout buffer.
+    // `take()` so it happens once.
+    if let Some(lock) = &mut state.lock {
+        if let Some(confirmation) = lock.confirmation.take() {
+            confirmation.lock();
+            tracing::info!("lock confirmed after a cleared frame");
+        }
+    }
+
+    // Without these the lock client draws one frame and freezes — the same bug
+    // that made the launcher and the cheatsheet look dead, except here it would
+    // mean a password field that cannot show what you typed.
+    let now = start.elapsed().as_millis() as u32;
+    for surface in &surfaces {
+        send_frames(surface, now);
+    }
+    Ok(())
+}
+
 /// Everything a driver needs to run a session, built once.
 ///
 /// Extracted so the winit and DRM drivers construct it the same way. The
@@ -3193,6 +3434,12 @@ fn build_compositor(cfg: &config::Config) -> Result<Compositor, Box<dyn std::err
         xdg_shell_state: XdgShellState::new::<Cusk>(&dh),
         xdg_decoration_state: XdgDecorationState::new::<Cusk>(&dh),
         layer_shell_state: WlrLayerShellState::new::<Cusk>(&dh),
+        // `|_| true`: any client of this compositor may lock the session.
+        // There is one seat and one user, and the socket already lives mode
+        // 0700 in the user's runtime directory — a client that can connect at
+        // all is already the user. A stricter check would be theatre, and a
+        // wrong one would make an unlockable session possible.
+        session_lock_state: SessionLockManagerState::new::<Cusk, _>(&dh, |_| true),
         foreign_toplevel_state:
             cusk::foreign_toplevel::ForeignToplevelState::new::<Cusk>(&dh),
         next_toplevel_id: 0,
@@ -3231,6 +3478,7 @@ fn build_compositor(cfg: &config::Config) -> Result<Compositor, Box<dyn std::err
         // A wrong value that looks right is worse than an obviously empty one.
         output_size: (0, 0),
         keyboard_layer: None,
+        lock: None,
         focus_before_layer: None,
     };
 
