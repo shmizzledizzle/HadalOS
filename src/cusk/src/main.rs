@@ -265,6 +265,17 @@ struct Cusk {
     /// know it was taken: the seat only reports what has focus now, not what had
     /// it before a panel appeared.
     keyboard_layer: Option<LayerSurface>,
+    /// Thumbnails of minimised windows, for the dock's stage strip.
+    stage: cusk::stage::Stage,
+    /// Windows minimised but not yet captured.
+    ///
+    /// Capture needs the renderer, which only the render loop has, so
+    /// `minimize` cannot do it and the work is deferred one frame. The window
+    /// is unmapped immediately regardless — hiding must be instant — and the
+    /// thumbnail is rendered afterwards from the client's last committed
+    /// buffer, which stays valid until the client attaches another and a
+    /// minimised client is not drawing.
+    pending_capture: Vec<(Window, cusk::foreign_toplevel::ToplevelId)>,
     /// Windows hidden by minimising, in the order they were hidden.
     ///
     /// Unmapped from the `Space` rather than moved off-screen, for the reason
@@ -1513,6 +1524,11 @@ impl Cusk {
         // window at the fallback position instead of where the user left it.
         geometry::remember(&self.space, window);
         self.space.unmap_elem(window);
+        // Captured on the next frame, from the client's still-valid buffer
+        // rather than from the screen — so hiding is immediate and the window
+        // is in exactly one of `space` and `minimized` at every instant.
+        let id = self.toplevel_id(window);
+        self.pending_capture.push((window.clone(), id));
         self.minimized.push(window.clone());
 
         // A minimised window must not keep the keyboard. Focus moves to the
@@ -1547,6 +1563,13 @@ impl Cusk {
             return;
         };
         self.minimized.remove(at);
+        // Stale from here on: the window is about to be live again, and a
+        // thumbnail of how it looked before is worse than none.
+        let id = self.toplevel_id(window);
+        self.stage.forget(id);
+        // A restore that beats the render loop to it leaves an entry that would
+        // capture a window nobody minimised any more.
+        self.pending_capture.retain(|(_, pending)| *pending != id);
 
         // Where it was, not the origin. `recall` is the same source workspace
         // switching restores from, so a window that was minimised and a window
@@ -2837,6 +2860,11 @@ fn draw_frame(
         return draw_locked(renderer, framebuffer, state, size, transform, start);
     }
 
+    // Before the presented frame is touched, alongside the other offscreen
+    // work. See `capture_pending` for what happened when this ran against the
+    // backend's own framebuffer instead.
+    capture_pending(renderer, state);
+
         // Compiled on the first frame rather than at startup, because it
         // needs a current GL context and the renderer only has one here.
         let chrome = ctx.chrome.get_or_insert_with(|| chrome::Chrome::new(renderer));
@@ -3516,6 +3544,102 @@ fn draw_locked(
     Ok(())
 }
 
+/// Render thumbnails for windows minimised since the last frame.
+///
+/// Every failure is silent and costs only the thumbnail. The window is already
+/// hidden by the time this runs, so a capture that fails leaves a stage entry
+/// missing — not a minimise that did not happen.
+///
+/// # Why this renders the window again instead of reading the screen
+///
+/// The obvious implementation copies the window's rectangle out of the
+/// framebuffer that was just presented, and it does work: it produced a correct
+/// 256x140 thumbnail on the first try. It also killed the compositor one frame
+/// later with `ContextLost(EGLCreateSurface(BadAlloc))`.
+///
+/// `copy_framebuffer` may change or invalidate the current bind — smithay says
+/// so on the neighbouring `copy_texture` — and the winit backend owns the bind
+/// on the surface it is about to present. Reading from *its* framebuffer left
+/// it unable to create the next one.
+///
+/// So the window is rendered into an offscreen texture this function owns, and
+/// the readback happens from that. Nothing the backend is holding is touched,
+/// which is the same reason `gpublur` composites offscreen. It also removes the
+/// constraint that made the first version awkward: capturing no longer has to
+/// happen while the window is still on screen, because a client's last
+/// committed buffer stays valid until it attaches another — and a minimised
+/// client is not drawing.
+fn capture_pending(renderer: &mut GlesRenderer, state: &mut Cusk) {
+    if state.pending_capture.is_empty() {
+        return;
+    }
+
+    for (window, id) in std::mem::take(&mut state.pending_capture) {
+        match capture_window(renderer, &window) {
+            Some(snapshot) => {
+                if snapshot.is_blank() {
+                    // Right size, right length, nothing in it. Said here
+                    // because the symptom otherwise appears in the dock.
+                    tracing::warn!(
+                        "thumbnail for a minimised window rendered empty ({}x{})",
+                        snapshot.width,
+                        snapshot.height
+                    );
+                } else {
+                    tracing::debug!(
+                        "captured {}x{} thumbnail for minimised window",
+                        snapshot.width,
+                        snapshot.height
+                    );
+                }
+                state.stage.insert(id, snapshot);
+            }
+            None => tracing::debug!("no thumbnail for minimised window; it stays hidden"),
+        }
+    }
+}
+
+/// Render one window to an offscreen texture and download it as a thumbnail.
+fn capture_window(renderer: &mut GlesRenderer, window: &Window) -> Option<cusk::stage::Snapshot> {
+    use smithay::backend::allocator::Fourcc;
+    use smithay::backend::renderer::{Bind, ExportMem, Offscreen};
+
+    let size = window.geometry().size;
+    if size.w <= 0 || size.h <= 0 {
+        return None;
+    }
+    let physical = Size::<i32, Physical>::from((size.w, size.h));
+
+    let surface = window.toplevel()?.wl_surface().clone();
+    // At the origin: the offscreen is exactly this window and nothing else, so
+    // the surface tree starts at (0, 0) rather than wherever it sat on screen.
+    let elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>> =
+        render_elements_from_surface_tree(renderer, &surface, (0, 0), 1.0, 1.0, Kind::Unspecified);
+
+    let buffer_size = Size::<i32, smithay::utils::Buffer>::from((size.w, size.h));
+    let mut texture: GlesTexture =
+        Offscreen::<GlesTexture>::create_buffer(renderer, Fourcc::Abgr8888, buffer_size).ok()?;
+    {
+        let mut target = renderer.bind(&mut texture).ok()?;
+        let mut frame = renderer.render(&mut target, physical, Transform::Normal).ok()?;
+        let whole = Rectangle::from_size(physical);
+        // Transparent, not black. A window with rounded corners or its own
+        // shadow would otherwise get a black surround baked into the thumbnail.
+        frame.clear(Color32F::new(0.0, 0.0, 0.0, 0.0), &[whole]).ok()?;
+        draw_render_elements(&mut frame, 1.0, &elements, &[whole]).ok()?;
+        // Awaited, not dropped. The fence says when the GPU has actually
+        // finished drawing; reading the texture before it is reached returns a
+        // half-rendered thumbnail, and intermittently — whenever the download
+        // happens to lose the race.
+        frame.finish().ok()?.wait().ok()?;
+    }
+
+    let region = Rectangle::<i32, smithay::utils::Buffer>::from_size(Size::from((size.w, size.h)));
+    let mapping = renderer.copy_texture(&texture, region, Fourcc::Abgr8888).ok()?;
+    let bytes = renderer.map_texture(&mapping).ok()?;
+    cusk::stage::downscale(bytes, size.w as u32, size.h as u32)
+}
+
 /// Everything a driver needs to run a session, built once.
 ///
 /// Extracted so the winit and DRM drivers construct it the same way. The
@@ -3615,6 +3739,8 @@ fn build_compositor(cfg: &config::Config) -> Result<Compositor, Box<dyn std::err
         keyboard_layer: None,
         lock: None,
         minimized: Vec::new(),
+        stage: cusk::stage::Stage::default(),
+        pending_capture: Vec::new(),
         focus_before_layer: None,
     };
 

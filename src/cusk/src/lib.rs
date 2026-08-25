@@ -33,6 +33,14 @@ pub mod bindings;
 /// called itself Gentoo for five days — so "am I HadalOS" is a question with a
 /// live answer, and every component that asks must ask the same file.
 pub mod identity;
+
+/// Thumbnails of minimised windows.
+///
+/// In the library because the compositor produces these and the dock draws
+/// them. The scaling arithmetic is the part with bugs in it and lives here so
+/// it can be tested without a compositor; the capture and the protocol stay in
+/// the binary.
+pub mod stage;
 pub mod theme;
 
 /// What windows exist, and what may be done to them.
