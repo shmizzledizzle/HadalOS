@@ -129,6 +129,51 @@ for f in ${ebuilds}; do
 	fi
 done
 
+section "unit directives are in the section systemd reads them from"
+# Three times now, in three different units. systemd does not fail on a
+# directive in the wrong section — it logs "Unknown key ... ignoring" once at
+# load and carries on, so the unit works, starts, and silently lacks the
+# property the file says it has:
+#
+#   hadal-brokerd.service  JoinsNamespaceOf= in [Service]  — never shared
+#                          hadald's namespace, while PrivateNetwork=yes made
+#                          it look confined anyway
+#   hadal-model.service    JoinsNamespaceOf= in [Service]  — same bug, copied
+#   hadald.service         StartLimitBurst= / ConditionPathExists= in
+#                          [Service] — written there while fixing the first two
+#
+# These are the [Unit] keys this tree has actually got wrong or would plausibly
+# get wrong; it is not the complete list, which is `man systemd.unit`.
+unit_only_keys="JoinsNamespaceOf StartLimitBurst StartLimitIntervalSec \
+Requires Requisite Wants BindsTo PartOf Conflicts Before After OnFailure \
+OnSuccess RequiresMountsFor StopWhenUnneeded RefuseManualStart RefuseManualStop"
+for unit in systemd/*.service systemd/*.timer; do
+	[[ -e ${unit} ]] || continue
+	misplaced=""
+	sect=""
+	while IFS= read -r line; do
+		case ${line} in
+			"["*"]") sect=${line} ;;
+			"#"*|"") ;;
+			*=*)
+				key=${line%%=*}
+				# Continuation lines and indented values are not directives.
+				[[ ${key} == "${key#[[:space:]]}" ]] || continue
+				for k in ${unit_only_keys}; do
+					if [[ ${key} == "${k}" && ${sect} != "[Unit]" ]]; then
+						misplaced+=" ${key}${sect}"
+					fi
+				done
+				;;
+		esac
+	done < "${unit}"
+	if [[ -n ${misplaced} ]]; then
+		bad "${unit} has [Unit] directives in the wrong section:${misplaced} — systemd ignores them"
+	else
+		ok "${unit}"
+	fi
+done
+
 section "Type=dbus units have a D-Bus activation file"
 # A unit with Type=dbus and BusName= is started *by the bus*, not by
 # multi-user.target. Without a matching file in system-services/, the name is

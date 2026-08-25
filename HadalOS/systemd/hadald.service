@@ -4,6 +4,31 @@ Documentation=https://github.com/shmizzledizzle/HadalOS
 After=network.target
 Before=hadal-brokerd.service
 
+# A misconfiguration does not become correct by being retried. Without these the
+# unit burns its start limit on a bad model id or an unreadable key, and the
+# journal carries the real error once followed by hundreds of identical
+# restarts — which is where it goes to hide. Three attempts rides out a
+# genuinely transient failure and keeps the cause on screen.
+#
+# [Unit], not [Service]. These moved sections in systemd 229 and are silently
+# ignored in [Service] — the same failure hadal-brokerd's JoinsNamespaceOf= had,
+# which is reason enough to say so here rather than rediscover it a third time.
+StartLimitBurst=3
+StartLimitIntervalSec=60
+
+# Unconfigured is not the same as broken, and must not look like it.
+#
+# `EnvironmentFile=` without a `-` is a hard failure, and with `Restart=
+# on-failure` that becomes a restart loop: on this machine hadald reached
+# **264 restarts** against a missing /etc/hadal/hadald.env, hit the start limit,
+# and the only thing hadal-brokerd could then report was "Dependency failed".
+# `Failed to spawn 'start' task: No such file or directory` repeated 264 times
+# is not a message that says "you have not configured this yet".
+#
+# The condition makes the unconfigured state its own state: systemd skips the
+# unit and says so once, naming the thing that is actually missing.
+ConditionPathExists=/etc/hadal/hadald.env
+
 [Service]
 Type=exec
 # hadald has no --config flag. It never did: config.rs parses arguments with a
@@ -18,7 +43,25 @@ Type=exec
 # readable through /proc/<pid>/environ, is inherited by children, and appears in
 # `systemctl show`.
 EnvironmentFile=/etc/hadal/hadald.env
+
+# The default upstream, overridable by the environment file above.
+#
+# `Environment=` is applied before `EnvironmentFile=` regardless of the order
+# they appear in, so a HADAL_UPSTREAM in the file wins. It has to exist at all
+# because ${HADAL_UPSTREAM} is expanded unconditionally below, and an unset
+# variable would pass `--upstream ""` — which is neither local nor a usable URL.
+Environment=HADAL_UPSTREAM=https://integrate.api.nvidia.com/v1
+
+# --upstream was missing, and its absence was documented as though it worked.
+# hadald takes the upstream as a CLI flag; this unit never passed one, so it
+# always used config.rs's DEFAULT_UPSTREAM — the NVIDIA endpoint — and therefore
+# always classified Remote and always demanded a key. Meanwhile this package's
+# own pkg_postinst instructed the user to write
+# `HADAL_UPSTREAM=http://127.0.0.1:8080/v1` into the environment file to select
+# the local tier. That variable was set, exported, and read by nothing: the
+# local tier could not be reached by following its own instructions.
 ExecStart=/usr/bin/hadald --serve --model ${HADAL_MODEL} \
+    --upstream ${HADAL_UPSTREAM} \
     --key-file /etc/hadal/upstream.key \
     --egress-log /var/log/hadal/egress.log
 Restart=on-failure

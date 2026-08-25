@@ -26,6 +26,8 @@
 Description=Hadal inference runtime (llama.cpp, Vulkan)
 Documentation=file:///usr/share/doc/hadalos/compute.md
 After=hadald.service
+# Shares hadald's network namespace; see the block above PrivateNetwork=.
+JoinsNamespaceOf=hadald.service
 BindsTo=hadald.service
 
 [Service]
@@ -103,7 +105,8 @@ ExecStart=/usr/bin/llama-server \
 # hadald owns the namespace, so it starts first and will answer 502 until this
 # unit is listening. That is the honest failure mode and better than making the
 # API surface depend on the model being loaded.
-JoinsNamespaceOf=hadald.service
+# JoinsNamespaceOf= is in [Unit] — it is a unit property, and systemd
+# ignores it here. See hadal-brokerd.service, which had the same bug.
 PrivateNetwork=yes
 IPAddressDeny=any
 
