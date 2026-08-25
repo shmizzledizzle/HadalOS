@@ -180,6 +180,15 @@ pub fn strip_field_codes(exec: &str) -> Vec<String> {
 /// SVG is returned alongside PNG because breeze is *entirely* SVG. Treating
 /// icons as a raster problem would have left most applications blank.
 ///
+/// It also covers **more than one context**, which it did not until the dock
+/// grew battery and network readouts. `apps` was the only directory searched,
+/// and every one of the seventeen freedesktop status names the readouts ask
+/// for missed — `battery-full` lives in `status/32`, `network-wired` in
+/// `devices/22`, and nothing named in either is in `apps` at all. The tray had
+/// the same hole without anyone noticing, because an application that names a
+/// `status` icon for its tray entry got a lettered tile and a lettered tile
+/// looks like a deliberate fallback rather than a resolver that never looked.
+///
 /// Not covered, and worth naming rather than discovering: theme inheritance,
 /// `index.theme`, scaled `@2x` variants, and the user's configured theme. The
 /// search order below is a guess at preference, not a reading of their
@@ -194,6 +203,13 @@ pub fn find_icon(name: &str) -> Option<PathBuf> {
     // Largest first: scaling an icon down looks better than scaling it up.
     const SIZES: &[&str] = &["256", "128", "96", "64", "48", "32", "24", "22", "16"];
     const THEMES: &[&str] = &["breeze", "Adwaita", "hicolor"];
+    // `apps` first, because that is what an `Icon=` line in a desktop entry
+    // almost always names and a launcher must not pick up an unrelated status
+    // icon that happens to share a word. The rest are where the machine's own
+    // indicators live: `status` for charge and signal, `devices` for the
+    // network interface itself, `legacy` for Adwaita's full-colour set — which
+    // is the only place Adwaita keeps a non-symbolic `battery-full`.
+    const CONTEXTS: &[&str] = &["apps", "status", "devices", "legacy"];
 
     for root in ["/usr/share/icons", "/usr/local/share/icons"] {
         for theme in THEMES {
@@ -201,27 +217,35 @@ pub fn find_icon(name: &str) -> Option<PathBuf> {
             if !theme_dir.is_dir() {
                 continue;
             }
+            // Size outside context, so a 48px status icon beats a 22px one
+            // rather than `apps` winning at every size before `status` is
+            // tried at any. The wrong nesting would find the smallest
+            // available icon of the preferred context and scale it up.
             for size in SIZES {
-                for ext in ["svg", "png"] {
-                    // breeze: apps/48/name.svg
-                    let flat = theme_dir.join("apps").join(size).join(format!("{name}.{ext}"));
-                    if flat.is_file() {
-                        return Some(flat);
-                    }
-                    // hicolor and Adwaita: 48x48/apps/name.png
-                    let square = theme_dir
-                        .join(format!("{size}x{size}"))
-                        .join("apps")
-                        .join(format!("{name}.{ext}"));
-                    if square.is_file() {
-                        return Some(square);
+                for context in CONTEXTS {
+                    for ext in ["svg", "png"] {
+                        // breeze: apps/48/name.svg
+                        let flat = theme_dir.join(context).join(size).join(format!("{name}.{ext}"));
+                        if flat.is_file() {
+                            return Some(flat);
+                        }
+                        // hicolor and Adwaita: 48x48/apps/name.png
+                        let square = theme_dir
+                            .join(format!("{size}x{size}"))
+                            .join(context)
+                            .join(format!("{name}.{ext}"));
+                        if square.is_file() {
+                            return Some(square);
+                        }
                     }
                 }
             }
             // Adwaita keeps its vector icons outside the size hierarchy.
-            let scalable = theme_dir.join("scalable").join("apps").join(format!("{name}.svg"));
-            if scalable.is_file() {
-                return Some(scalable);
+            for context in CONTEXTS {
+                let scalable = theme_dir.join("scalable").join(context).join(format!("{name}.svg"));
+                if scalable.is_file() {
+                    return Some(scalable);
+                }
             }
         }
     }

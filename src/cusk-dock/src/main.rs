@@ -15,6 +15,8 @@
 //! `LayerMap::non_exclusive_zone`, which is the same path waybar exercises.
 
 mod menu;
+mod battery;
+mod network;
 mod session;
 // The stage: thumbnails of minimised windows, and the protocol that carries
 // them. Declared here as well as in `lib.rs` because this crate builds twice —
@@ -22,6 +24,7 @@ mod session;
 // and each build needs its own module tree.
 mod stage;
 mod stage_protocol;
+mod status;
 mod style;
 mod tray;
 mod windows;
@@ -227,6 +230,9 @@ struct App {
     /// one that costs most here because these are the largest images the dock
     /// draws.
     thumb_handles: std::collections::HashMap<u32, (u64, image::Handle)>,
+    /// Written by the status thread, read here: charge and network.
+    status: status::Shared,
+    readouts: status::Status,
     /// Written by the D-Bus thread, read here. Cloned into the view each tick
     /// rather than held borrowed, because the tray thread must never be
     /// blocked by a slow frame.
@@ -343,6 +349,14 @@ impl App {
             Side::Right => tray::start(),
             Side::Left => std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
         };
+        // Only the strip that draws them starts the polling. Two threads
+        // waking twice a second to answer the same question, one of whose
+        // answers nothing reads, is the same waste the tray and window-list
+        // split above avoids.
+        let status_shared = match side {
+            Side::Right => status::start(),
+            Side::Left => std::sync::Arc::new(std::sync::Mutex::new(status::Status::default())),
+        };
 
         App {
             pinned,
@@ -361,6 +375,8 @@ impl App {
             // and iced re-uploads a texture per fresh id, so building these in
             // `view` would upload every thumbnail on every frame.
             thumb_handles: std::collections::HashMap::new(),
+            status: status_shared,
+            readouts: status::Status::default(),
             tray: tray_shared,
             items: Vec::new(),
             panel: None,
@@ -408,6 +424,10 @@ impl App {
                     self.open_windows = open;
                 }
                 self.refresh_thumbnails();
+                let readouts = self.status.lock().map(|s| s.clone()).unwrap_or_default();
+                if readouts != self.readouts {
+                    self.readouts = readouts;
+                }
                 let fresh = self.tray.lock().map(|i| i.clone()).unwrap_or_default();
                 if fresh != self.items {
                     self.items = fresh;
@@ -570,6 +590,39 @@ impl App {
     /// so a tray icon matches the rest of the desktop instead of being
     /// whatever the application happened to ship. Only when there is no name
     /// are the raw pixels used.
+    /// Charge and network, between the tray and the power button.
+    ///
+    /// Not in the tray proper, which is a different thing wearing similar
+    /// clothes: tray items belong to applications, arrive and leave with them,
+    /// and answer clicks with menus the application defines. These two belong
+    /// to the machine, are always there, and have nothing to click. Putting
+    /// them in `items` would mean a StatusNotifierItem with no application
+    /// behind it and a menu that had to be invented.
+    ///
+    /// Below the tray so their position is fixed. Tray items come and go, and
+    /// an indicator that moved down the strip whenever a chat client started
+    /// would be one you had to look for rather than glance at.
+    fn readout_icons(&self) -> Element<'_, Message> {
+        let mut items: Vec<Element<Message>> = Vec::new();
+
+        // Network first, battery below it, so battery sits nearest the power
+        // button it is about.
+        items.push(readout(
+            self.readouts.network.icons(),
+            self.readouts.network.label(),
+            self.readouts.network.detail(),
+        ));
+
+        // Absent on a desktop rather than drawn as a zero or an empty slot.
+        // A machine with no battery has nothing to say about charge, and a
+        // placeholder would be furniture explaining itself.
+        if let Some(charge) = &self.readouts.battery {
+            items.push(readout(charge.icons(), Some(charge.label()), charge.detail()));
+        }
+
+        column(items).spacing(6).align_x(iced::Center).into()
+    }
+
     fn tray_icons(&self) -> Element<'_, Message> {
         column(self.items.iter().enumerate().map(|(index, item)| {
             let glyph: Element<Message> = match (&item.icon_name, &item.pixmap) {
@@ -971,6 +1024,7 @@ impl App {
                 launcher,
                 container(apps).height(Fill),
                 self.tray_icons(),
+                self.readout_icons(),
                 self.session_button(),
             ]
             .spacing(8)
@@ -1140,6 +1194,58 @@ fn letter_tile<'a>(name: &str, size: u16) -> Element<'a, Message> {
         .center_y(Length::Fixed(size as f32))
         .style(style::letter)
         .into()
+}
+
+/// One machine readout: an icon from the theme, a small number under it, and
+/// the whole sentence in a tooltip.
+///
+/// The number is drawn as well as the icon rather than instead of it. An icon
+/// alone answers "roughly how much" and the question actually being asked is
+/// "how much" — the whole reason for wanting this without a CLI tool. Six
+/// points smaller than the tray's labels so two lines fit in the width the
+/// strip already has.
+///
+/// No `mouse_area`, no `button`, no `on_press`. There is nothing to click:
+/// these report, and a control that looks pressable and does nothing is worse
+/// than one that plainly does not.
+fn readout<'a>(
+    icons: &'static [&'static str],
+    label: Option<String>,
+    detail: String,
+) -> Element<'a, Message> {
+    // First name the theme actually has. The chain exists because freedesktop
+    // icon naming is a convention themes follow unevenly — breeze has no
+    // `network-wireless-no-route` and spells the same idea `network-limited` —
+    // and a single hardcoded name is how this shipped with no glyph the first
+    // time it was run.
+    let glyph: Element<Message> = match icons.iter().find_map(|name| entry::find_icon(name)) {
+        Some(path) if path.extension().is_some_and(|e| e == "svg") => {
+            svg(svg::Handle::from_path(path))
+                .width(Length::Fixed(TRAY as f32))
+                .height(Length::Fixed(TRAY as f32))
+                .into()
+        }
+        Some(path) => image(image::Handle::from_path(path))
+            .width(Length::Fixed(TRAY as f32))
+            .height(Length::Fixed(TRAY as f32))
+            .into(),
+        // No such icon in this theme. The number carries the whole readout on
+        // its own, and a lettered tile beside it would be a "B" that means
+        // nothing — so the glyph is simply dropped rather than faked.
+        None => space().width(Length::Fixed(0.0)).into(),
+    };
+
+    let mut stack = column![glyph].spacing(1).align_x(iced::Center);
+    if let Some(label) = label {
+        stack = stack.push(text(label).size(9));
+    }
+
+    tooltip(
+        stack,
+        container(text(detail).size(12)).padding(6).style(style::tip),
+        tooltip::Position::Left,
+    )
+    .into()
 }
 
 /// Start a program, detached.

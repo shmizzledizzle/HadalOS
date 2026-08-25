@@ -6,6 +6,16 @@
 //! is the difference between "the strip is empty" and knowing why.
 pub mod windows;
 
+/// How much charge is left. Pure sysfs, no daemon.
+pub mod battery;
+
+/// Whether there is a network and what kind. NetworkManager, falling back to
+/// sysfs.
+pub mod network;
+
+/// The two readouts together, polled off the UI thread.
+pub mod status;
+
 /// Thumbnails of minimised windows: the store the UI reads, and the two
 /// conversions between a compositor's pixels and iced's.
 pub mod stage;
