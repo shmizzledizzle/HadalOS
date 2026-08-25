@@ -26,6 +26,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use cusk::config::{self, Complaint, Config, Kind, Setting, Value};
+use cusk::identity::Identity;
 use cusk::toml_edit::DocumentMut;
 use iced::widget::{
     button, column, container, pick_list, row, scrollable, slider, space, text, text_input,
@@ -42,6 +43,9 @@ fn main() -> iced::Result {
         .centered()
         .run()
 }
+
+/// The About tab's name. Not a schema section — see `App::tabs`.
+const ABOUT: &str = "about";
 
 struct App {
     path: PathBuf,
@@ -173,8 +177,20 @@ impl App {
         }
     }
 
+    /// The tab strip: every schema section, then About.
+    ///
+    /// Appended here rather than added to `SCHEMA`, because the schema means
+    /// "settings that can be changed" and About changes nothing. Putting it
+    /// there would make every consumer of `settings_in` filter it back out, and
+    /// the one that forgot would render an empty card with a reset button.
+    fn tabs() -> Vec<&'static str> {
+        let mut tabs = config::sections();
+        tabs.push(ABOUT);
+        tabs
+    }
+
     fn view(&self) -> Element<'_, Message> {
-        let sections = config::sections();
+        let sections = Self::tabs();
 
         // A top tab row with an accent underline, not a sidebar. Both
         // reference shells mark the active section with one thin line and
@@ -211,14 +227,19 @@ impl App {
         .spacing(style::GAP);
 
         let current = sections.get(self.section).copied().unwrap_or("layout");
-        let cards = column(
-            config::settings_in(current)
-                .into_iter()
-                .map(|setting| self.card(setting)),
-        )
-        .spacing(style::GAP);
+        let body: Element<Message> = if current == ABOUT {
+            self.about()
+        } else {
+            column(
+                config::settings_in(current)
+                    .into_iter()
+                    .map(|setting| self.card(setting)),
+            )
+            .spacing(style::GAP)
+            .into()
+        };
 
-        let body = scrollable(container(cards).padding([0, 6]))
+        let body = scrollable(container(body).padding([0, 6]))
             .height(Fill)
             .style(style::scroller);
 
@@ -230,6 +251,128 @@ impl App {
         .padding(style::PAD)
         .style(style::window)
         .into()
+    }
+
+
+    /// What system this is, according to the system.
+    ///
+    /// Every line here is read at display time rather than compiled in. A
+    /// HadalOS panel that hardcodes "HadalOS" keeps saying it on a machine that
+    /// has stopped being one, and that is not hypothetical: a baselayout
+    /// upgrade restored Gentoo's `/etc/os-release` on 2026-08-19 and this
+    /// machine identified as Gentoo for five days with nothing reporting it.
+    ///
+    /// So the panel reports what it finds, and says so when what it finds is
+    /// not HadalOS. That makes it a detector rather than a decoration.
+    fn about(&self) -> Element<'_, Message> {
+        let identity = Identity::load();
+
+        let mut rows: Vec<Element<Message>> = Vec::new();
+
+        // The mismatch warning goes first, because it changes how everything
+        // below it should be read.
+        match &identity {
+            Some(id) if !id.is_hadalos() => {
+                rows.push(
+                    container(
+                        column![
+                            text(format!("This system identifies as {}, not HadalOS.", id.pretty_name))
+                                .size(14),
+                            text(format!(
+                                "{} says ID={}. A sys-apps/baselayout upgrade restores its own \
+                                 os-release over the one sys-apps/hadalos-release installs; \
+                                 re-merging hadalos-release puts it back.",
+                                id.source.display(),
+                                id.id
+                            ))
+                            .size(12)
+                            .color(style::TEXT_DIM),
+                        ]
+                        .spacing(4),
+                    )
+                    .padding(12)
+                    .width(Fill)
+                    .style(style::notice(style::Notice::Problem))
+                    .into(),
+                );
+            }
+            None => {
+                rows.push(
+                    container(
+                        text("No os-release on this system, so it claims no identity at all.")
+                            .size(14),
+                    )
+                    .padding(12)
+                    .width(Fill)
+                    .style(style::notice(style::Notice::Problem))
+                    .into(),
+                );
+            }
+            Some(_) => {}
+        }
+
+        let mut facts: Vec<(String, String)> = Vec::new();
+        if let Some(id) = &identity {
+            facts.push(("System".into(), id.pretty_name.clone()));
+            if let Some(version) = &id.version {
+                facts.push(("Version".into(), version.clone()));
+            }
+            // Shown because its *absence* is meaningful: a derived
+            // distribution sets it and the thing it derives from does not, so
+            // an empty row here on a machine calling itself HadalOS would mean
+            // the os-release was written wrong.
+            facts.push((
+                "Based on".into(),
+                id.id_like.clone().unwrap_or_else(|| "nothing — this is not a derived system".into()),
+            ));
+        }
+        if let Some(kernel) = cusk::identity::kernel_release() {
+            facts.push(("Kernel".into(), kernel));
+        }
+        facts.push(("Architecture".into(), cusk::identity::architecture().to_string()));
+
+        // From the environment rather than assumed: this editor runs perfectly
+        // well under another compositor, and claiming to be a cusk session when
+        // it is not would be the same class of lie as hardcoding the identity.
+        let session = std::env::var("XDG_SESSION_DESKTOP")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "not a cusk session".into());
+        facts.push(("Session".into(), session));
+        facts.push(("Settings editor".into(), format!("cusk-settings {}", env!("CARGO_PKG_VERSION"))));
+
+        if let Some(id) = &identity {
+            facts.push(("Identity from".into(), id.source.display().to_string()));
+        }
+        facts.push(("Configuration".into(), self.path.display().to_string()));
+        if let Some(url) = identity.as_ref().and_then(|id| id.home_url.clone()) {
+            facts.push(("Home".into(), url));
+        }
+        if let Some(url) = identity.as_ref().and_then(|id| id.bug_url.clone()) {
+            facts.push(("Report a problem".into(), url));
+        }
+
+        let table = column(facts.into_iter().map(|(label, value)| {
+            row![
+                container(text(label).size(13).color(style::TEXT_DIM))
+                    .width(Length::Fixed(150.0)),
+                text(value).size(13),
+            ]
+            .spacing(style::GAP)
+            .align_y(iced::Center)
+            .into()
+        }))
+        .spacing(8);
+
+        rows.push(
+            container(column![text("System").size(16), table].spacing(12))
+                .padding(16)
+                .width(Fill)
+                .style(style::card)
+                .into(),
+        );
+
+        column(rows).spacing(style::GAP).into()
     }
 
     /// One setting, rendered from its schema entry alone.

@@ -24,6 +24,15 @@ pub mod entry;
 /// the match, the startup banner, and a test — and nothing could tell you when
 /// they disagreed.
 pub mod bindings;
+
+/// What system this is, read from `os-release(5)`.
+///
+/// In the library because the settings editor displays it and nothing should
+/// hardcode it. The identity has silently reverted once already — a baselayout
+/// upgrade put its own `/etc/os-release` back on 2026-08-19 and the machine
+/// called itself Gentoo for five days — so "am I HadalOS" is a question with a
+/// live answer, and every component that asks must ask the same file.
+pub mod identity;
 pub mod theme;
 
 /// What windows exist, and what may be done to them.
