@@ -3095,7 +3095,45 @@ fn draw_frame(
             if let Some(toplevel) = window.toplevel() {
                 send_frames(toplevel.wl_surface(), now);
             }
-    }
+        }
+
+        // Layer surfaces too, and their absence here is why the launcher and
+        // the cheatsheet looked dead.
+        //
+        // A client asks for a `wl_surface.frame` callback and does not draw
+        // again until it arrives — that is the whole flow-control mechanism of
+        // the protocol. This loop covered `space.elements()`, which is
+        // xdg-shell toplevels only, so no layer surface ever received one.
+        // Every panel drew exactly one frame, for free, before it needed a
+        // callback, and then never drew again.
+        //
+        // It presents as an input bug and is not one. The client is awake: it
+        // receives the click, runs `update`, changes its state, and launches
+        // the application. It simply cannot show that any of it happened. Hover
+        // highlights, typed text and scrolling all vanish together, while
+        // clicking still works — which reads as "the panel ignores everything
+        // except clicks" rather than "the panel is frozen".
+        //
+        // The dock hid it. It carries an unconditional one-second timer for the
+        // tray, and an iced timer forces a redraw whether or not a callback
+        // arrived, so the one layer-shell client anybody watched closely
+        // repainted once a second and looked fine. The launcher animates its
+        // slide on a timer that stops when the slide finishes — deliberately,
+        // to avoid keeping a core warm — so it froze at the exact moment it
+        // arrived and became usable. cusk-keys has no timer at all and froze on
+        // frame one.
+        //
+        // Sent unconditionally rather than only to damaged surfaces. Withholding
+        // a callback is how a compositor throttles a client that is off-screen
+        // or occluded, and cusk has no occlusion tracking to make that decision
+        // with — so the only honest choice is to say "you may draw" every frame.
+        let layers: Vec<WlSurface> = {
+            let map = layer_map_for_output(&state.output);
+            map.layers().map(|layer| layer.wl_surface().clone()).collect()
+        };
+        for surface in layers {
+            send_frames(&surface, now);
+        }
     Ok(())
 }
 /// Everything a driver needs to run a session, built once.
