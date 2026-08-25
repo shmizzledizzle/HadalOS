@@ -15,6 +15,7 @@
 //! `LayerMap::non_exclusive_zone`, which is the same path waybar exercises.
 
 mod menu;
+mod session;
 mod style;
 mod tray;
 mod windows;
@@ -197,12 +198,24 @@ struct App {
     /// blocked by a slow frame.
     tray: tray::Shared,
     items: Vec<tray::Item>,
-    /// The tray icon whose menu is open, and the menu itself.
+    /// What is open in the panel beside the strip, if anything.
     ///
-    /// Held rather than re-fetched per frame: `fetch_menu` is a blocking round
-    /// trip, and doing one per redraw would call into another process sixty
-    /// times a second to draw a menu that has not changed.
-    open_menu: Option<OpenMenu>,
+    /// One field rather than a `Option<OpenMenu>` beside a `session_open: bool`.
+    /// Both menus draw into the same surface and both widen it by the same
+    /// amount, so two independent fields would make "both open" representable —
+    /// and it would render one menu over the other while `update` sized the
+    /// surface for neither.
+    panel: Option<Panel>,
+    /// What logind says this session may do, asked once at start-up.
+    session: session::Availability,
+}
+
+/// The panel beside the strip.
+enum Panel {
+    /// A tray icon's own menu, fetched over D-Bus from the application.
+    Tray(OpenMenu),
+    /// The session menu, which is ours and needs no fetching.
+    Session,
 }
 
 /// A tray menu currently on screen.
@@ -246,6 +259,10 @@ enum Message {
     ToggleMinimize(u32),
     /// Middle-click a window tile: ask it to close.
     CloseWindow(u32),
+    /// Open or close the session menu.
+    OpenSession,
+    /// A row of the session menu.
+    SessionAction(session::Action),
 }
 
 impl App {
@@ -305,7 +322,11 @@ impl App {
             outbox,
             tray: tray_shared,
             items: Vec::new(),
-            open_menu: None,
+            panel: None,
+            // Asked once, here, rather than each time the menu opens: these do
+            // not change over a session, and four D-Bus round trips on the
+            // click that opens a menu is a menu that hitches.
+            session: session::probe(),
         }
     }
 
@@ -315,12 +336,12 @@ impl App {
         // change size — every arm that opens or closes a menu would otherwise
         // need to remember to resize, and the one that forgot would leave a
         // 260px invisible surface swallowing clicks over the desktop.
-        let was_open = self.open_menu.is_some();
+        let was_open = self.panel.is_some();
         let task = self.handle(message);
-        if self.open_menu.is_some() == was_open {
+        if self.panel.is_some() == was_open {
             return task;
         }
-        let width = if self.open_menu.is_some() {
+        let width = if self.panel.is_some() {
             WIDTH + MENU_WIDTH
         } else {
             WIDTH
@@ -353,13 +374,13 @@ impl App {
                     // timer, so this happens without the user touching
                     // anything — and a menu that outlived its icon would send
                     // its next click to whichever item took that position.
-                    if let Some(open) = &self.open_menu {
+                    if let Some(open) = self.tray_menu() {
                         let still_there = self
                             .items
                             .get(open.item)
                             .is_some_and(|i| i.service == open.service);
                         if !still_there {
-                            self.open_menu = None;
+                            self.panel = None;
                         }
                     }
                 }
@@ -376,14 +397,14 @@ impl App {
                     }
                     tray::activate(item);
                     // Any open menu belongs to the previous interaction.
-                    self.open_menu = None;
+                    self.panel = None;
                 }
             }
             Message::OpenMenu(index) => {
                 // Clicking the same icon again closes it, which is what every
                 // other tray does and what the pointer expects.
-                if self.open_menu.as_ref().is_some_and(|open| open.item == index) {
-                    self.open_menu = None;
+                if self.tray_menu().is_some_and(|open| open.item == index) {
+                    self.panel = None;
                     return Task::none();
                 }
                 let Some(item) = self.items.get(index) else { return Task::none() };
@@ -396,17 +417,19 @@ impl App {
                     return Task::none();
                 }
                 let entries = tray::fetch_menu(item);
-                self.open_menu = (!entries.is_empty()).then(|| OpenMenu {
-                    item: index,
-                    service: item.service.clone(),
-                    entries,
-                    expanded: Vec::new(),
+                self.panel = (!entries.is_empty()).then(|| {
+                    Panel::Tray(OpenMenu {
+                        item: index,
+                        service: item.service.clone(),
+                        entries,
+                        expanded: Vec::new(),
+                    })
                 });
             }
             Message::SecondaryActivate(index) => {
                 if let Some(item) = self.items.get(index) {
                     tray::secondary_activate(item);
-                    self.open_menu = None;
+                    self.panel = None;
                 }
             }
             Message::MenuEntry(id) => {
@@ -414,7 +437,7 @@ impl App {
                 // index alone, so a tray that refreshed between opening the
                 // menu and clicking it cannot deliver the click to a different
                 // application.
-                if let Some(open) = &self.open_menu {
+                if let Some(open) = self.tray_menu() {
                     let target = self
                         .items
                         .get(open.item)
@@ -424,10 +447,10 @@ impl App {
                         None => eprintln!("tray: the menu's item is gone; ignoring the click"),
                     }
                 }
-                self.open_menu = None;
+                self.panel = None;
             }
             Message::ToggleSubmenu(id) => {
-                if let Some(open) = &mut self.open_menu {
+                if let Some(open) = self.tray_menu_mut() {
                     match open.expanded.iter().position(|held| *held == id) {
                         Some(at) => {
                             open.expanded.remove(at);
@@ -436,7 +459,23 @@ impl App {
                     }
                 }
             }
-            Message::CloseMenu => self.open_menu = None,
+            Message::CloseMenu => self.panel = None,
+            Message::OpenSession => {
+                // Toggles, like the tray icons: clicking the button that
+                // opened a menu is how every other dock closes it.
+                self.panel = match self.panel {
+                    Some(Panel::Session) => None,
+                    _ => Some(Panel::Session),
+                };
+            }
+            Message::SessionAction(action) => {
+                // Closed first. `perform` detaches, so the menu would
+                // otherwise stay on screen through a suspend and be the
+                // first thing visible on resume — over a desktop the user
+                // last saw without it.
+                self.panel = None;
+                session::perform(action);
+            }
             Message::FocusWindow(id) => {
                 // A minimised window is unminimised rather than activated.
                 // Activating one the compositor is not showing would move focus
@@ -518,7 +557,7 @@ impl App {
                 (None, None) => letter_tile(&item.title, TRAY),
             };
 
-            let open = self.open_menu.as_ref().is_some_and(|m| m.item == index);
+            let open = self.tray_menu().is_some_and(|m| m.item == index);
             // `mouse_area` rather than `button`, because a button cannot tell
             // the three mouse buttons apart — and right-click is the primary
             // interaction for most tray items. The button stays inside it for
@@ -835,6 +874,7 @@ impl App {
                 launcher,
                 container(apps).height(Fill),
                 self.tray_icons(),
+                self.session_button(),
             ]
             .spacing(8)
             .align_x(iced::Center),
@@ -847,9 +887,147 @@ impl App {
         // Only the strip when nothing is open, so the surface is exactly the
         // dock and nothing of the desktop is covered. The menu is added to its
         // left, which is the direction the surface grew.
-        match &self.open_menu {
+        match &self.panel {
             None => strip.into(),
-            Some(open) => row![self.menu_panel(open), strip].height(Fill).into(),
+            Some(Panel::Tray(open)) => row![self.menu_panel(open), strip].height(Fill).into(),
+            Some(Panel::Session) => row![self.session_panel(), strip].height(Fill).into(),
+        }
+    }
+
+    /// The power button, at the foot of the strip.
+    ///
+    /// Below the tray rather than above it, because it is the one control on
+    /// this strip whose misfire is expensive: the bottom corner is the hardest
+    /// place to hit by accident on the way to something else.
+    ///
+    /// The glyph comes from the icon theme, like the tray's do, so it matches
+    /// whatever the rest of the desktop is using. `letter_tile` is the fallback
+    /// rather than a hardcoded "\u{23FB}" — that codepoint is missing from most
+    /// text fonts and renders as a replacement box, which is a worse landmark
+    /// than a letter.
+    fn session_button(&self) -> Element<'_, Message> {
+        let glyph: Element<Message> = ["system-shutdown", "system-log-out", "system-suspend"]
+            .into_iter()
+            .find_map(entry::find_icon)
+            .map(|path| -> Element<Message> {
+                if path.extension().is_some_and(|e| e == "svg") {
+                    svg(svg::Handle::from_path(path))
+                        .width(Length::Fixed(TRAY as f32))
+                        .height(Length::Fixed(TRAY as f32))
+                        .into()
+                } else {
+                    image(image::Handle::from_path(path))
+                        .width(Length::Fixed(TRAY as f32))
+                        .height(Length::Fixed(TRAY as f32))
+                        .into()
+                }
+            })
+            .unwrap_or_else(|| letter_tile("Power", TRAY));
+
+        tooltip(
+            button(glyph).padding(5).style(style::tile).on_press(Message::OpenSession),
+            container(text("Session").size(12)).padding(6).style(style::tip),
+            tooltip::Position::Left,
+        )
+        .into()
+    }
+
+    /// The session menu.
+    ///
+    /// Rendered here rather than through `menu_panel`, which parses
+    /// `com.canonical.dbusmenu` layouts an application sent us. These six items
+    /// are ours, are known at compile time, and have no ids, submenus or
+    /// toggles — routing them through a protocol parser to reuse a row style
+    /// would mean inventing a layout to immediately re-read.
+    fn session_panel(&self) -> Element<'_, Message> {
+        // Lock, Switch User and Suspend leave the session running; the rest end
+        // it. Partitioned on `Action::is_final` rather than written out twice,
+        // so the divider cannot drift from the meaning it marks — and so adding
+        // an action to `Action::ALL` places it correctly without touching this.
+        // The split itself is why power menus have a divider at all: Shut Down
+        // should not be adjacent to the item most likely to be aimed at.
+        let groups: [Vec<session::Action>; 2] = [
+            session::Action::ALL.into_iter().filter(|a| !a.is_final()).collect(),
+            session::Action::ALL.into_iter().filter(|a| a.is_final()).collect(),
+        ];
+
+        let mut rows: Vec<Element<Message>> = Vec::new();
+        for (index, group) in groups.iter().enumerate() {
+            if index > 0 {
+                rows.push(
+                    container(space().height(Length::Fixed(1.0)))
+                        .padding([4, 8])
+                        .width(Fill)
+                        .style(style::menu_divider)
+                        .into(),
+                );
+            }
+            for &action in group {
+                let enabled = self.session.allows(action);
+                let label = row![
+                    space().width(Length::Fixed(8.0)),
+                    text(action.label()).size(13),
+                    space().width(Fill),
+                ]
+                .align_y(iced::Center);
+
+                let mut tile = button(label)
+                    .padding([5, 6])
+                    .width(Fill)
+                    .style(style::menu_row(enabled));
+                if enabled {
+                    tile = tile.on_press(Message::SessionAction(action));
+                }
+
+                // A disabled row with no explanation is indistinguishable from
+                // a broken one, and this menu disables things for several
+                // different reasons — "no locker installed" and "logind says
+                // no" are not the same message.
+                rows.push(match self.session.why_not(action) {
+                    None => tile.into(),
+                    Some(reason) => tooltip(
+                        tile,
+                        container(text(reason).size(12)).padding(6).style(style::tip),
+                        tooltip::Position::Left,
+                    )
+                    .into(),
+                });
+            }
+        }
+
+        let panel = container(column(rows).spacing(1))
+            .padding(6)
+            .width(Length::Fixed(MENU_WIDTH as f32 - 10.0))
+            .style(style::menu_panel);
+
+        // Bottom-aligned and dismissed by the space above it, exactly as the
+        // tray menu is — see `menu_panel` for why that space has to be a
+        // dismissal target rather than dead surface.
+        mouse_area(
+            container(column![space().height(Fill), panel].spacing(0))
+                .padding([0, 4])
+                .height(Fill),
+        )
+        .on_press(Message::CloseMenu)
+        .on_right_press(Message::CloseMenu)
+        .into()
+    }
+
+    /// The tray menu, if that is what is open.
+    ///
+    /// An accessor rather than a field, so `Panel` stays the single place that
+    /// knows only one menu can be on screen.
+    fn tray_menu(&self) -> Option<&OpenMenu> {
+        match &self.panel {
+            Some(Panel::Tray(open)) => Some(open),
+            _ => None,
+        }
+    }
+
+    fn tray_menu_mut(&mut self) -> Option<&mut OpenMenu> {
+        match &mut self.panel {
+            Some(Panel::Tray(open)) => Some(open),
+            _ => None,
         }
     }
 }
