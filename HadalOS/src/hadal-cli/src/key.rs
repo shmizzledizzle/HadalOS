@@ -31,6 +31,7 @@ use std::io::{self, BufRead, IsTerminal, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 type Res<T> = Result<T, Box<dyn std::error::Error>>;
 
@@ -45,6 +46,11 @@ const ENV_FILE: &str = "/etc/hadal/hadald.env";
 /// these directions wrong, and wrong directions are worse than none.
 const SIGNUP_URL: &str = "https://build.nvidia.com/";
 const DEFAULT_UPSTREAM: &str = "https://integrate.api.nvidia.com/v1";
+
+/// The model asked of `DEFAULT_UPSTREAM`. Third member of the same set: an id
+/// is only meaningful at the endpoint that serves it, and this one 404s
+/// everywhere else.
+const DEFAULT_MODEL: &str = "nvidia/nemotron-3-ultra-550b-a55b";
 
 /// What NVIDIA's keys have looked like. Advisory only.
 ///
@@ -107,10 +113,31 @@ pub fn run() -> Res<()> {
     println!();
     println!("  Got {} characters, {}.", key.len(), mask(&key));
 
-    let model = prompt_line("  Model id [nvidia/llama-3.3-nemotron-super-49b-v1.5]: ")?;
-    let model = match model.trim() {
-        "" => "nvidia/llama-3.3-nemotron-super-49b-v1.5".to_string(),
-        chosen => chosen.to_string(),
+    // The line above ends "Got 64 characters, nvapi-…f3a." — which reads like a
+    // question, and on this machine it was answered like one: `yes` was taken
+    // as the model id, written to /etc/hadal/hadald.env, and asked of NVIDIA on
+    // every request for weeks. The daemon started, `hadal status` answered, and
+    // only the generations failed, with an HTTP error that looked like every
+    // other HTTP error. Nothing between the typo and the symptom mentioned the
+    // model id.
+    //
+    // So the answer is checked here rather than at the far end of a request:
+    // this is the only moment where the person who can fix it is present.
+    println!();
+    println!("  Next is the model id — not a yes/no question.");
+    let model = loop {
+        let answer = prompt_line("  Model id [nvidia/nemotron-3-ultra-550b-a55b]: ")?;
+        match answer.trim() {
+            "" => break DEFAULT_MODEL.to_string(),
+            chosen if looks_like_a_confirmation(chosen) => {
+                println!();
+                println!("  {chosen:?} is an answer to a yes/no question, and this is not one.");
+                println!("  Press Enter to take the default, or paste a model id such as");
+                println!("  {DEFAULT_MODEL:?}.");
+                println!();
+            }
+            chosen => break chosen.to_string(),
+        }
     };
 
     install(&key, &model)?;
@@ -132,6 +159,23 @@ pub fn run() -> Res<()> {
 ///
 /// Short keys are elided entirely rather than shown — a key short enough that
 /// eight characters would reveal most of it is a key worth not printing.
+/// Whether an answer is a yes/no reply rather than a model id.
+///
+/// Deliberately narrow. The cost of a false positive is a re-prompt the user
+/// can override by pasting the same thing again; the cost of a false negative
+/// is a daemon that starts, passes `hadal status`, and fails every generation.
+/// But a model id is a vendor's string and this must not become a filter on
+/// what vendors are allowed to call things — so it matches exactly the handful
+/// of words that mean "yes" or "no" and nothing else. No length rule, no
+/// character-class rule, no "must contain a slash": `gpt-oss-120b` has no
+/// slash, and next year's model may have no hyphen either.
+fn looks_like_a_confirmation(answer: &str) -> bool {
+    matches!(
+        answer.trim().to_ascii_lowercase().as_str(),
+        "y" | "n" | "yes" | "no" | "yeah" | "yep" | "nope" | "ok" | "okay" | "sure"
+    )
+}
+
 fn mask(key: &str) -> String {
     let chars: Vec<char> = key.chars().collect();
     if chars.len() < 16 {
@@ -296,8 +340,29 @@ impl Staging {
         let base = std::env::var("XDG_RUNTIME_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("/tmp"));
-        let dir = base.join(format!("hadal-key.{}", std::process::id()));
-        fs::create_dir_all(&dir)?;
+
+        // Unique per *instance*, not per process. The name used to be
+        // `hadal-key.<pid>`, and `Drop` shreds the whole directory — so two
+        // live `Staging` values in one process shared a directory and the
+        // first one dropped deleted the other's key from under it. The test
+        // suite reproduced this immediately, because the harness runs tests as
+        // threads of a single process, and it failed only sometimes, which is
+        // the worst way for a file-deletion bug to fail.
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let dir = base.join(format!(
+            "hadal-key.{}.{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+
+        // `create_dir`, not `create_dir_all`: this must fail rather than adopt
+        // a directory that already exists. A pid is reused after a reboot, so
+        // an interrupted run can leave one behind — and a directory this
+        // process did not create is one whose mode and ownership it did not
+        // choose, which is not somewhere to write an API key.
+        fs::create_dir(&dir).map_err(|e| {
+            format!("could not create a private staging directory at {}: {e}", dir.display())
+        })?;
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
         Ok(Staging { dir })
     }
@@ -346,6 +411,54 @@ fn shred(dir: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Two staging areas at once must not share a directory, because `Drop`
+    /// shreds the directory and not just the files it wrote. Pinned directly
+    /// rather than left to the harness: as a scheduling accident this
+    /// reproduced perhaps one run in three, which is exactly often enough to
+    /// be dismissed as a flake.
+    #[test]
+    fn two_staging_areas_do_not_share_a_directory() {
+        let a = Staging::new().expect("first staging area");
+        let b = Staging::new().expect("second staging area");
+        assert_ne!(a.dir, b.dir, "staging directories must be distinct");
+
+        a.write("upstream.key", "key-a\n").expect("write a");
+        b.write("upstream.key", "key-b\n").expect("write b");
+
+        // Dropping one must leave the other's key intact and readable.
+        drop(a);
+        assert_eq!(
+            fs::read_to_string(b.path("upstream.key")).expect("b's key must survive a's drop"),
+            "key-b\n"
+        );
+    }
+
+    /// The live misconfiguration this check exists for: `HADAL_MODEL=yes` in
+    /// /etc/hadal/hadald.env, from answering the masked-key line as though it
+    /// had asked a question.
+    #[test]
+    fn a_yes_no_answer_is_not_accepted_as_a_model_id() {
+        for answer in ["y", "n", "yes", "no", "YES", " Yes ", "ok", "sure", "nope"] {
+            assert!(looks_like_a_confirmation(answer), "{answer:?} should be re-prompted");
+        }
+    }
+
+    /// The check must not become an opinion about vendors' naming. These are
+    /// all real ids, and none of them share a shape.
+    #[test]
+    fn real_model_ids_are_left_alone() {
+        for id in [
+            "nvidia/nemotron-3-ultra-550b-a55b",
+            "llama-3.3-70b-versatile",
+            "qwen-3-235b-a22b-instruct-2507",
+            "gpt-oss-120b",
+            "hadal-reflex",
+            "o3",
+        ] {
+            assert!(!looks_like_a_confirmation(id), "{id:?} is a real model id");
+        }
+    }
 
     #[test]
     fn a_key_is_masked_to_its_ends() {

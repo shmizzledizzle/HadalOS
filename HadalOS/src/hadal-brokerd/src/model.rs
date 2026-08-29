@@ -56,6 +56,17 @@ Rules:
 struct GenerateChunk {
     #[serde(default)]
     response: String,
+    /// The model's working-out, when the upstream is a reasoning model.
+    ///
+    /// Separate from `response` all the way down, and deliberately so: this
+    /// text never reaches `ProposalScanner`. Reasoning is where a model tries
+    /// on action blocks it has not decided to emit, and scanning it would turn
+    /// "I could propose ```hadal-action …" into a proposal the model never
+    /// made — one that would then be well-typed, pass `action.rs`, and reach a
+    /// polkit prompt. The type system carries that boundary rather than the
+    /// prompt being asked to.
+    #[serde(default)]
+    thinking: String,
     #[serde(default)]
     done: bool,
 }
@@ -85,6 +96,12 @@ pub struct ModelClient {
 pub enum Event {
     /// Prose, for the `Delta` signal.
     Text(String),
+    /// The model's working-out, for the `Thinking` signal.
+    ///
+    /// Never produced by `ProposalScanner` — it arrives beside the scanner, not
+    /// through it, which is what guarantees a rehearsed action block in the
+    /// model's private reasoning cannot become a real proposal.
+    Thinking(String),
     /// A complete, validated proposal.
     Proposal(Action),
     /// A block that did not parse. Not shown to the user as an action; logged
@@ -202,13 +219,7 @@ impl ModelClient {
                     Ok(c) => c,
                     Err(e) => return Err(ModelError::Protocol(e.to_string())),
                 };
-                for ev in scanner.feed(&parsed.response) {
-                    on_event(ev);
-                }
-                if parsed.done {
-                    for ev in scanner.finish() {
-                        on_event(ev);
-                    }
+                if dispatch_chunk(&mut scanner, &parsed, &mut on_event) {
                     return Ok(());
                 }
             }
@@ -314,6 +325,35 @@ impl ProposalScanner {
     }
 }
 
+/// Turns one decoded NDJSON frame into events. Returns true when the stream is
+/// finished and the caller should stop reading.
+///
+/// This is a free function rather than an inline block so the routing decision
+/// it encodes — reasoning text goes *around* `ProposalScanner`, never through
+/// it — can be tested without standing up an HTTP server. A reasoning trace is
+/// the model talking to itself: it quotes protocol syntax, drafts actions it
+/// then rejects, and generally contains exactly the fences the scanner is
+/// looking for. Feeding it in would let a discarded draft become a real
+/// proposal the user is asked to approve.
+fn dispatch_chunk<F>(scanner: &mut ProposalScanner, parsed: &GenerateChunk, on_event: &mut F) -> bool
+where
+    F: FnMut(Event),
+{
+    if !parsed.thinking.is_empty() {
+        on_event(Event::Thinking(parsed.thinking.clone()));
+    }
+    for ev in scanner.feed(&parsed.response) {
+        on_event(ev);
+    }
+    if parsed.done {
+        for ev in scanner.finish() {
+            on_event(ev);
+        }
+        return true;
+    }
+    false
+}
+
 fn parse_block(raw: &str) -> Event {
     let trimmed = raw.trim();
     match serde_json::from_str::<Action>(trimmed) {
@@ -337,6 +377,73 @@ mod tests {
         }
         out.extend(s.finish());
         out
+    }
+
+    /// Runs NDJSON frames through the same dispatch `generate` uses, so what is
+    /// under test is the routing decision and not a re-implementation of it.
+    fn dispatch_all(lines: &[&str]) -> Vec<Event> {
+        let mut scanner = ProposalScanner::new();
+        let mut out = Vec::new();
+        for line in lines {
+            let parsed: GenerateChunk =
+                serde_json::from_str(line).expect("test frames must be valid NDJSON");
+            if dispatch_chunk(&mut scanner, &parsed, &mut |e| out.push(e)) {
+                break;
+            }
+        }
+        out
+    }
+
+    /// The safety property behind `GenerateChunk::thinking`.
+    ///
+    /// A reasoning model drafting an action inside its working-out must not
+    /// produce a proposal. The draft here is well-formed on purpose: correctly
+    /// fenced, valid JSON, an action `action.rs` would accept. If it ever
+    /// reached `ProposalScanner` it would parse cleanly and go on to a polkit
+    /// prompt for a deletion the model only considered and then rejected.
+    #[test]
+    fn a_fenced_action_inside_reasoning_never_becomes_a_proposal() {
+        let events = dispatch_all(&[
+            r#"{"thinking":"I could remove the stale file:\n```hadal-action\n{\"action\": \"read-portage-log\", \"path\": \"/var/log/portage/build.log\"}\n```\nNo — reading it first is safer."}"#,
+            r#"{"response":"The build failed while linking."}"#,
+            r#"{"response":"","done":true}"#,
+        ]);
+
+        assert!(
+            !events.iter().any(|e| matches!(e, Event::Proposal(_))),
+            "reasoning must never yield a proposal: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(e, Event::Malformed(_))),
+            "nor should it be reported as a failed one; the scanner never saw it"
+        );
+        assert!(
+            events.iter().any(|e| matches!(e, Event::Thinking(t) if t.contains("hadal-action"))),
+            "the trace itself still reaches the user verbatim"
+        );
+        assert!(text_of(&events).contains("failed while linking"));
+        assert!(
+            !text_of(&events).contains("hadal-action"),
+            "and it must not be mistaken for answer text"
+        );
+    }
+
+    /// The converse: routing reasoning around the scanner must not leave the
+    /// scanner unable to see a real proposal that follows it in the same
+    /// stream. Nemotron interleaves the two, so this is the common case.
+    #[test]
+    fn a_real_proposal_after_reasoning_still_parses() {
+        let events = dispatch_all(&[
+            r#"{"thinking":"Weighing whether to read the log."}"#,
+            r#"{"response":"Let me look at the log.\n```hadal-action\n"}"#,
+            r#"{"response":"{\"action\": \"read-portage-log\", \"path\": \"/var/log/portage/build.log\"}\n```\n"}"#,
+            r#"{"response":"","done":true}"#,
+        ]);
+
+        assert!(
+            events.iter().any(|e| matches!(e, Event::Proposal(_))),
+            "a proposal in `response` must still parse across frames: {events:?}"
+        );
     }
 
     /// Verbatim output from nvidia/llama-3.3-nemotron-super-49b-v1.5, shown a

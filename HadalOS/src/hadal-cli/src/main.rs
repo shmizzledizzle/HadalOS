@@ -343,13 +343,47 @@ async fn drain_until_finished(
 ) -> Res<Vec<(String, String, String)>> {
     let mut proposals: Vec<(String, String, String)> = Vec::new();
 
+    // Reasoning models spend a long time thinking before they say anything.
+    // Nemotron Super 49B measured 44s to first byte and ~half its frames as
+    // private working-out, during which the old CLI printed nothing at all and
+    // was indistinguishable from a hang.
+    //
+    // Shown as a counter rather than as text by default: the monologue runs to
+    // thousands of characters and would bury the answer it precedes. Set
+    // HADAL_SHOW_THINKING=1 to read it in full.
+    let show_thinking = std::env::var_os("HADAL_SHOW_THINKING").is_some_and(|v| v != "0");
+    let mut thought_chars = 0usize;
+    let mut status_shown = false;
+
+    // Erase the status line before writing anything else on it, so the answer
+    // never lands on top of "thinking…".
+    fn clear_status(shown: &mut bool) {
+        if *shown {
+            print!("\r\x1b[K");
+            io::stdout().flush().ok();
+            *shown = false;
+        }
+    }
+
     while let Some(Ok(msg)) = signals.next().await {
         let header = msg.header();
         let Some(member) = header.member() else { continue };
 
         match member.as_str() {
+            "Thinking" => {
+                let (_req, text): (u32, String) = msg.body().deserialize()?;
+                thought_chars += text.chars().count();
+                if show_thinking {
+                    print!("\x1b[2m{text}\x1b[0m");
+                } else {
+                    print!("\r\x1b[K\x1b[2m  thinking… {thought_chars} chars\x1b[0m");
+                    status_shown = true;
+                }
+                io::stdout().flush().ok();
+            }
             "Delta" => {
                 let (_req, text): (u32, String) = msg.body().deserialize()?;
+                clear_status(&mut status_shown);
                 print!("{text}");
                 io::stdout().flush().ok();
             }
@@ -367,10 +401,21 @@ async fn drain_until_finished(
             "CapabilityDenied" => {
                 let (_req, capability, detail): (u32, String, String) =
                     msg.body().deserialize()?;
+                clear_status(&mut status_shown);
                 eprintln!("\n\x1b[33m[{capability} is not enabled]\x1b[0m {detail}");
             }
             "Finished" => {
                 let (_req, reason): (u32, String) = msg.body().deserialize()?;
+                clear_status(&mut status_shown);
+                // Why that took so long, in one dim line. Suppressed when the
+                // reasoning was already printed, and when it was short enough
+                // not to be the explanation for anything.
+                if !show_thinking && thought_chars > 500 {
+                    println!(
+                        "\x1b[2m  ({thought_chars} chars of reasoning; \
+                         HADAL_SHOW_THINKING=1 to see it)\x1b[0m"
+                    );
+                }
                 println!();
                 if reason != "complete" {
                     eprintln!("\x1b[31m[{reason}]\x1b[0m");

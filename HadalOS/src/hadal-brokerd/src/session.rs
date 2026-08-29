@@ -182,6 +182,14 @@ impl Session {
                     Event::Text(t) => {
                         let _ = Session::delta(&emitter, request, &t).await;
                     }
+                    // A signal of its own rather than a `Delta` with a flag.
+                    // A client that has not been taught about reasoning simply
+                    // does not subscribe and sees the pre-existing behaviour;
+                    // a flag on `Delta` would have every old client render the
+                    // model's private working-out as the answer.
+                    Event::Thinking(t) => {
+                        let _ = Session::thinking(&emitter, request, &t).await;
+                    }
                     Event::Proposal(action) => {
                         let capability = action.capability();
                         let summary = action.summary();
@@ -343,6 +351,15 @@ impl Session {
     #[zbus(signal)]
     async fn delta(emitter: &SignalEmitter<'_>, request: u32, text: &str) -> zbus::Result<()>;
 
+    /// The model's working-out, when the upstream is a reasoning model.
+    ///
+    /// Carries the same shape as `delta` and deliberately not the same name:
+    /// this is not the answer, has not been through `ProposalScanner`, and must
+    /// never be presented as though it were either. Clients are free to ignore
+    /// it — that is the pre-existing behaviour, and it is why this is additive.
+    #[zbus(signal)]
+    async fn thinking(emitter: &SignalEmitter<'_>, request: u32, text: &str) -> zbus::Result<()>;
+
     #[zbus(signal)]
     async fn finished(emitter: &SignalEmitter<'_>, request: u32, reason: &str)
         -> zbus::Result<()>;
@@ -423,7 +440,10 @@ fn salient_lines(text: &str, max: usize) -> String {
     out.join("\n")
 }
 
-fn strip_ansi(s: &str) -> String {
+/// Shared with `executor::salient_excerpt`. Build logs carry colour escapes
+/// whether they are being summarised or excerpted, and two copies of an escape
+/// parser is one more than this needs.
+pub(crate) fn strip_ansi(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars();
     while let Some(c) = chars.next() {
