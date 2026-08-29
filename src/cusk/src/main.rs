@@ -52,7 +52,7 @@ use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
 use smithay::backend::renderer::utils::{draw_render_elements, on_commit_buffer_handler};
 use smithay::backend::renderer::{Bind, Color32F, Frame, ImportMem, Renderer, RendererSuper};
 use smithay::backend::winit::{self, WinitEvent};
-use smithay::desktop::{Space, Window, WindowSurfaceType};
+use smithay::desktop::{PopupKind, PopupManager, Space, Window, WindowSurfaceType};
 use smithay::output::{Mode as OutputMode, Output, PhysicalProperties, Subpixel};
 use smithay::wayland::output::OutputManagerState;
 use smithay::backend::input::KeyState;
@@ -265,6 +265,22 @@ struct Cusk {
     /// know it was taken: the seat only reports what has focus now, not what had
     /// it before a panel appeared.
     keyboard_layer: Option<LayerSurface>,
+    /// Menus, tooltips and combo drop-downs — every `xdg_popup` on screen.
+    ///
+    /// A popup is not a window and is not in the `Space`: it belongs to a
+    /// parent surface, is positioned relative to it, and dies with it. smithay
+    /// keeps that relationship, but only for popups it has been *told* about —
+    /// `PopupManager::popups_for_surface` reads state that `track_popup` puts
+    /// there, so an untracked popup is invisible to every part of smithay that
+    /// would otherwise handle it.
+    ///
+    /// This field did not exist until 2026-08-25 and neither did any of the
+    /// handling. `new_popup` was an empty stub, so no popup was ever tracked,
+    /// configured, drawn or hit-tested — and a client cannot attach a buffer
+    /// before its first configure, so no popup had ever mapped. Right-click
+    /// menus in Dolphin and Firefox's own menus could not open on this
+    /// compositor at all.
+    popups: PopupManager,
     /// Thumbnails of minimised windows, for the dock's stage strip.
     stage: cusk::stage::Stage,
     /// Who is being told about them.
@@ -357,9 +373,57 @@ impl CompositorHandler for Cusk {
             self.publish_toplevel(&window);
 
             if let Some(toplevel) = window.toplevel() {
-                toplevel.send_configure();
+                // `send_pending_configure`, not `send_configure`. The
+                // difference is the whole bug.
+                //
+                // `send_configure` always sends, and smithay's own
+                // documentation says so and points here. Sending one from the
+                // commit handler therefore means: client commits, compositor
+                // configures, client acks and commits, compositor configures.
+                // A loop with nothing to stop it. Measured on an idle konsole
+                // that nobody was touching: **392 configure events in ten
+                // seconds**, thirty-nine a second, forever.
+                //
+                // That is what "every application is slow except Konsole" was.
+                // Every Wayland client on the desktop was being told to
+                // reconfigure forty times a second, and toolkits treat a
+                // configure as a reason to relayout — so every app was
+                // relaying out continuously while appearing idle. Konsole was
+                // the exception because a terminal's layout is one grid
+                // calculation; Firefox's is the whole page.
+                //
+                // It is also why in-application menus stopped working. Qt and
+                // GTK dismiss an open popup when its parent is reconfigured,
+                // which is correct — a menu anchored to a window that just
+                // resized is a menu pointing at the wrong place. Against a
+                // configure every 25ms, a menu is dismissed before it can be
+                // drawn. Tiling made it worse rather than causing it: a
+                // relayout puts genuine size changes into a loop that was
+                // already spinning, so the client never reaches a state where
+                // the next configure is a no-op.
+                //
+                // The initial configure still happens. `has_pending_changes`
+                // is `!initial_configure_sent || ...`, so the deadlock the
+                // comment above warns about — a client waiting forever for a
+                // first configure — stays fixed.
+                toplevel.send_pending_configure();
             }
         }
+        // A popup cannot attach a buffer until it has been configured, and it
+        // must not be configured until it has committed. So the first
+        // configure belongs here and nowhere else — sending one from
+        // `new_popup` is a protocol error, and never sending one is a menu
+        // that quietly never appears, which is what this compositor did until
+        // this branch existed.
+        self.popups.commit(surface);
+        if let Some(PopupKind::Xdg(popup)) = self.popups.find_popup(surface) {
+            if !popup.is_initial_configure_sent() {
+                if let Err(err) = popup.send_configure() {
+                    tracing::warn!("could not configure a popup: {err}");
+                }
+            }
+        }
+
         // A layer surface's anchor, size and exclusive zone are *client*
         // state, and none of it exists until the client commits. Arranging
         // only at creation — as this did — computes a layout from an empty
@@ -553,16 +617,64 @@ impl XdgShellHandler for Cusk {
         }
     }
 
-    fn new_popup(&mut self, _surface: PopupSurface, _positioner: PositionerState) {}
+    /// A client wants to show a menu.
+    ///
+    /// Two things have to happen and neither is optional. The popup is
+    /// constrained to the output, because a positioner describes where the
+    /// client *would like* it and a menu opened near the right edge would
+    /// otherwise be half off-screen. And it is tracked, because everything
+    /// smithay does with popups — positioning, hit-testing, enumerating them
+    /// for rendering — reads state that `track_popup` writes and finds nothing
+    /// without it.
+    ///
+    /// The configure is deliberately *not* sent here. It goes on the first
+    /// commit, in `CompositorHandler::commit`, because the protocol requires
+    /// the client to have committed the surface before it is configured and
+    /// sending one early is a protocol error rather than an early menu.
+    fn new_popup(&mut self, surface: PopupSurface, _positioner: PositionerState) {
+        self.unconstrain_popup(&surface);
+        if let Err(err) = self.popups.track_popup(PopupKind::Xdg(surface)) {
+            tracing::warn!("could not track a popup: {err}");
+        }
+    }
 
+    /// A client asks for an exclusive grab while its menu is open.
+    ///
+    /// Not honoured as a protocol grab, and this is a real limitation rather
+    /// than an oversight. `PopupManager::grab_popup` requires
+    /// `SeatHandler::KeyboardFocus: From<PopupKind>`, and cusk's focus type is
+    /// `WlSurface` — two foreign types, so the conversion cannot be written
+    /// from here. Honouring it properly means replacing `WlSurface` with a
+    /// focus enum through the entire input path, which is a change to make
+    /// deliberately and not as a side effect of fixing menus.
+    ///
+    /// What the grab is *for* is handled directly instead: `press` closes open
+    /// popups when a click lands outside them, which is the behaviour a user
+    /// would notice missing. What is genuinely lost is keyboard grabbing —
+    /// arrow keys go to the parent window rather than the menu, so a menu is
+    /// navigable by mouse and not by keyboard.
     fn grab(&mut self, _surface: PopupSurface, _seat: wl_seat::WlSeat, _serial: Serial) {}
 
+    /// The client has moved the anchor and wants the popup moved with it.
+    ///
+    /// Used by long menus that flip above the pointer when there is no room
+    /// below. The token is echoed back so the client can tell this
+    /// repositioning from any other configure it has in flight.
     fn reposition_request(
         &mut self,
-        _surface: PopupSurface,
-        _positioner: PositionerState,
-        _token: u32,
+        surface: PopupSurface,
+        positioner: PositionerState,
+        token: u32,
     ) {
+        surface.with_pending_state(|state| {
+            state.geometry = positioner.get_geometry();
+            state.positioner = positioner;
+        });
+        self.unconstrain_popup(&surface);
+        surface.send_repositioned(token);
+        if let Err(err) = surface.send_configure() {
+            tracing::warn!("could not configure a repositioned popup: {err}");
+        }
     }
 
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
@@ -1047,10 +1159,58 @@ impl Cusk {
         space.element_location(window).unwrap_or_default() - window.geometry().loc
     }
 
+    /// A popup under the pointer, if any, tested before the windows are.
+    ///
+    /// Separate from `surface_under` because `Space::element_under` cannot
+    /// find these. It hit-tests against each window's cached bounding box, and
+    /// a window's bbox does not include its popups — smithay keeps that as
+    /// `bbox_with_popups()`, deliberately, because a popup is not part of the
+    /// window for layout purposes.
+    ///
+    /// The consequence without this is specific and would be baffling: a menu
+    /// that opens *inside* its parent window is clickable, and the same menu
+    /// opened near an edge, where it extends past the window, is not. Half a
+    /// working feature is harder to diagnose than none of one.
+    ///
+    /// Reverse order, so the topmost window's popups are tested first — the
+    /// same order `element_under` uses, for the same reason.
+    fn popup_under(
+        &self,
+        point: Point<f64, smithay::utils::Logical>,
+    ) -> Option<(Window, WlSurface, Point<f64, smithay::utils::Logical>)> {
+        for window in self.space.elements().rev() {
+            let toplevel = window.toplevel()?;
+            let root = toplevel.wl_surface();
+            let origin = Self::surface_origin(&self.space, window);
+            for (popup, offset) in PopupManager::popups_for_surface(root) {
+                let at = origin + offset;
+                // The popup's own tree, including its subsurfaces — a menu's
+                // highlight and its icons are subsurfaces in some toolkits,
+                // and `ALL` rather than `TOPLEVEL` is what makes them hit.
+                if let Some((surface, loc)) = smithay::desktop::utils::under_from_surface_tree(
+                    popup.wl_surface(),
+                    point - at.to_f64(),
+                    (0, 0),
+                    WindowSurfaceType::ALL,
+                ) {
+                    return Some((window.clone(), surface, (loc + at).to_f64()));
+                }
+            }
+        }
+        None
+    }
+
     fn surface_under(
         &self,
         point: Point<f64, smithay::utils::Logical>,
     ) -> Option<(Window, WlSurface, Point<f64, smithay::utils::Logical>)> {
+        // Popups first, and above everything. A menu is drawn over its window
+        // and over its neighbours, so it must be hit-tested that way too or
+        // the pointer goes through it to whatever is behind.
+        if let Some(found) = self.popup_under(point) {
+            return Some(found);
+        }
+
         let (window, _) = self.space.element_under(point)?;
         let window = window.clone();
         let window_loc = Self::surface_origin(&self.space, &window);
@@ -1651,6 +1811,80 @@ impl Cusk {
     /// rather than tracking dirtiness is deliberate at this size: a missed
     /// invalidation shows up as a window that silently stops participating in
     /// the layout, which is far harder to see than a redundant recompute.
+    /// Close every open popup.
+    ///
+    /// `popup_done` is how a compositor tells a client its menu is over. The
+    /// client tears it down and destroys the surface; nothing here unmaps
+    /// anything, because a popup belongs to the client and a compositor that
+    /// forgets it locally would leave the client believing it still has a
+    /// menu open.
+    ///
+    /// Children first. Dismissing a parent while a submenu is still open
+    /// leaves the submenu parented to a destroyed surface, and
+    /// `popups_for_surface` yields them in tree order — so the collected list
+    /// is reversed rather than walked as it comes.
+    fn dismiss_popups(&mut self) {
+        let roots: Vec<WlSurface> = self
+            .space
+            .elements()
+            .filter_map(|w| w.toplevel().map(|t| t.wl_surface().clone()))
+            .collect();
+        for root in roots {
+            let open: Vec<PopupKind> = PopupManager::popups_for_surface(&root)
+                .map(|(popup, _)| popup)
+                .collect();
+            for popup in open.into_iter().rev() {
+                match popup {
+                    PopupKind::Xdg(xdg) => xdg.send_popup_done(),
+                    // Not an xdg popup — an input method's, which cusk does
+                    // not offer. Left alone rather than guessed at.
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    /// Keep a popup on screen.
+    ///
+    /// A positioner says where the client would like the popup and how it may
+    /// be adjusted if that does not fit. Without this the request is taken
+    /// literally: a context menu opened near the bottom-right corner runs off
+    /// the output, and the half of it holding "Delete" is unreachable.
+    ///
+    /// The rectangle handed to smithay is the output in the *parent's*
+    /// coordinate space, because a positioner's geometry is relative to its
+    /// parent surface and the output is not. Getting that wrong does not fail
+    /// — it constrains against a rectangle in the wrong place, which moves
+    /// menus around for no visible reason.
+    fn unconstrain_popup(&self, popup: &PopupSurface) {
+        let Ok(root) = smithay::desktop::find_popup_root_surface(&PopupKind::Xdg(popup.clone()))
+        else {
+            return;
+        };
+        let Some(window) = self
+            .space
+            .elements()
+            .find(|w| w.toplevel().map(|t| t.wl_surface()) == Some(&root))
+            .cloned()
+        else {
+            // A popup on a layer surface — the dock's own menus are drawn
+            // in-process, but nothing stops another layer client having one.
+            // Left unconstrained rather than constrained against the wrong
+            // window.
+            return;
+        };
+        let Some(loc) = self.space.element_location(&window) else { return };
+
+        let output = self.usable_area();
+        let mut target = output;
+        target.loc -= loc;
+        target.loc -= window.geometry().loc;
+
+        popup.with_pending_state(|state| {
+            state.geometry = state.positioner.get_unconstrained_geometry(target);
+        });
+    }
+
     pub fn relayout(&mut self) {
         if !self.tiling() {
             return;
@@ -2683,6 +2917,25 @@ impl Cusk {
             return true;
         }
 
+        // A click inside a popup belongs to the popup and changes nothing
+        // else: no focus move, no window raise, and above all no dismissal —
+        // clicking a menu item must not close the menu before the item is
+        // delivered.
+        if self.popup_under(self.pointer_location).is_some() {
+            return true;
+        }
+
+        // Anywhere else closes whatever menus are open, which is what the
+        // protocol grab would have done. cusk cannot take that grab — see
+        // `XdgShellHandler::grab` — so the behaviour is produced directly
+        // here. Without it a menu stays on screen after you click away from
+        // it, which reads as a stuck window rather than a missing grab.
+        //
+        // Done before the click is acted on, so dismissing a menu and
+        // focusing the window underneath happen on the same press rather than
+        // costing two.
+        self.dismiss_popups();
+
         if self.panel_click(self.pointer_location.to_i32_round()) {
             return false;
         }
@@ -2884,6 +3137,12 @@ fn draw_frame(
         return draw_locked(renderer, framebuffer, state, size, transform, start);
     }
 
+    // Drop popups whose surfaces are gone. smithay does not do this on its
+    // own — `track_popup` adds and nothing removes — so without a periodic
+    // sweep every menu ever opened stays in the tree, gets hit-tested, and
+    // gets a frame callback sent to a dead surface, forever.
+    state.popups.cleanup();
+
     // Before the presented frame is touched, alongside the other offscreen
     // work. See `capture_pending` for what happened when this ran against the
     // backend's own framebuffer instead.
@@ -2961,7 +3220,7 @@ fn draw_frame(
             // the correct origin. `Space::element_under` already returns
             // `render_location()`, which is this; only rendering disagreed.
             let origin = Cusk::surface_origin(&state.space, window);
-            let elements = render_elements_from_surface_tree(
+            let mut elements = render_elements_from_surface_tree(
                 renderer,
                 &surface,
                 (origin.x, origin.y),
@@ -2969,6 +3228,40 @@ fn draw_frame(
                 current.window_opacity as f32,
                 Kind::Unspecified,
             );
+
+            // Popups, in front of the window they belong to.
+            //
+            // `render_elements_from_surface_tree` walks subsurfaces and stops:
+            // an xdg_popup is a separate surface with its own tree, so a menu
+            // is not drawn by the call above and was not drawn by anything
+            // else. It could be configured, mapped, and holding a buffer, and
+            // still be invisible.
+            //
+            // Prepended rather than appended, because these elements are
+            // painted in order and the first one is on top. A menu behind its
+            // own window is the same bug as not drawing it.
+            //
+            // The offset from `popups_for_surface` is relative to the parent
+            // surface, so it is added to the same origin the window is drawn
+            // at — not to `geometry().loc`, which is where the equivalent
+            // mistake put the whole window 35 pixels too low.
+            let popups: Vec<_> = PopupManager::popups_for_surface(&surface)
+                .map(|(popup, offset)| (popup.wl_surface().clone(), offset))
+                .collect();
+            for (popup_surface, offset) in popups {
+                let at = origin + offset;
+                let mut drawn = render_elements_from_surface_tree(
+                    renderer,
+                    &popup_surface,
+                    (at.x, at.y),
+                    1.0,
+                    current.window_opacity as f32,
+                    Kind::Unspecified,
+                );
+                drawn.append(&mut elements);
+                elements = drawn;
+            }
+
             let focused = state.focused().as_ref() == Some(window);
             layers.push((Rectangle::new(loc, window.geometry().size), focused, elements));
         }
@@ -3444,7 +3737,16 @@ fn draw_frame(
         let now = start.elapsed().as_millis() as u32;
         for window in state.space.elements() {
             if let Some(toplevel) = window.toplevel() {
-                send_frames(toplevel.wl_surface(), now);
+                let surface = toplevel.wl_surface();
+                send_frames(surface, now);
+                // And its popups. Exactly the omission that made every layer
+                // surface look frozen, one surface type further out: a menu
+                // that never gets a frame callback draws once and then stops,
+                // so hover highlights and submenus do nothing while the menu
+                // sits there looking present.
+                for (popup, _) in PopupManager::popups_for_surface(surface) {
+                    send_frames(popup.wl_surface(), now);
+                }
             }
         }
 
@@ -3767,6 +4069,7 @@ fn build_compositor(cfg: &config::Config) -> Result<Compositor, Box<dyn std::err
         keyboard_layer: None,
         lock: None,
         minimized: Vec::new(),
+        popups: PopupManager::default(),
         stage: cusk::stage::Stage::default(),
         stage_state: cusk::stage_server::StageState::new::<Cusk>(&dh),
         pending_capture: Vec::new(),
