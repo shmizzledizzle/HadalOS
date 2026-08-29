@@ -20,8 +20,21 @@ HERE="$(cd "$(dirname "$0")/.." && pwd)"
 OS="$HERE/HadalOS"
 BIN="$OS/src/target/debug"
 HADALD="$HERE/src/hadald/target/debug/hadald"
-MODEL="${HADAL_MODEL:-nvidia/llama-3.3-nemotron-super-49b-v1.5}"
+MODEL="${HADAL_MODEL:-nvidia/nemotron-3-ultra-550b-a55b}"
 KEY="${HADAL_KEY:-$HOME/.config/hadal/upstream.key}"
+# Extra providers, tried in order when the primary is rate-limited or down.
+# Whole flags, so that empty means a one-link chain rather than a bare
+# `--fallback` with nothing after it:
+#
+#   HADAL_FALLBACKS='--fallback https://api.groq.com/openai/v1,llama-3.3-70b-versatile,'"$HOME"'/.config/hadal/groq.key'
+#
+# Order by context window, not by model size: Groq serves the full 131k, while
+# Cerebras' free tier caps at 64k and would refuse the ~88k-token prompts
+# `hadal explain` builds from a large log. See src/hadald/README.md.
+#
+# Unquoted below on purpose — word-splitting is what lets one variable carry
+# several fallbacks. No field may contain a space; none ever does.
+FALLBACKS="${HADAL_FALLBACKS:-}"
 # Retrieval index. Absent or unreadable means hadald answers from the model
 # alone and says so at startup — it never silently skips retrieval.
 INDEX="${HADAL_INDEX:-$HOME/Documents/Hadal/rag/index-gentoo}"
@@ -76,8 +89,10 @@ run)
     else
         say "  no retrieval index at $INDEX — answering from the model alone"
     fi
+    [[ -n $FALLBACKS ]] && say "  fallbacks: $(grep -o -- '--fallback' <<<"$FALLBACKS" | wc -l) configured"
+    # shellcheck disable=SC2086  # unquoted: $FALLBACKS must word-split
     runuser -u "$OWNER" -- "$HADALD" --serve --model "$MODEL" \
-        "${index_args[@]}" \
+        "${index_args[@]}" $FALLBACKS \
         --key-file "$KEY" --egress-log "$RUNDIR/egress.log" \
         > "$RUNDIR/hadald.log" 2>&1 &
     echo $! > "$RUNDIR/hadald.pid"

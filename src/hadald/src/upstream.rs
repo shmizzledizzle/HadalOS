@@ -10,8 +10,24 @@ use serde::Deserialize;
 /// One decoded delta from the upstream stream.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Delta {
-    /// Text to forward to the broker.
+    /// Text to forward to the broker as the answer.
     Text(String),
+    /// The model's private working-out, forwarded as a *separate* kind.
+    ///
+    /// Reasoning models — Nemotron Super 49B among them — emit a long stretch
+    /// of internal monologue before any answer. Measured on the reference
+    /// laptop: 103 SSE frames, of which 49 were reasoning and 54 were content,
+    /// so roughly half a 220-second request produced nothing the user could
+    /// see and the daemon looked hung.
+    ///
+    /// This must never be merged into `Text`. The broker feeds `Text` to
+    /// `ProposalScanner`, and reasoning is exactly where a model rehearses
+    /// action blocks it has not committed to — "I could propose
+    /// ```hadal-action …" in the middle of thinking out loud would become a
+    /// real proposal the model never actually made. Keeping the two variants
+    /// distinct is what makes that structurally impossible rather than a thing
+    /// the prompt has to discourage.
+    Reasoning(String),
     /// The upstream said it is finished.
     Done,
 }
@@ -34,6 +50,27 @@ struct ChatChoice {
 struct ChatDelta {
     #[serde(default)]
     content: Option<String>,
+    /// The field DeepSeek established and most reasoning models copied.
+    #[serde(default)]
+    reasoning_content: Option<String>,
+    /// NVIDIA sends both `reasoning` and `reasoning_content`, byte-identical.
+    /// Read as a fallback so a provider that ships only the short name still
+    /// produces a visible stream rather than silence.
+    #[serde(default)]
+    reasoning: Option<String>,
+}
+
+impl ChatDelta {
+    /// Whichever reasoning field this provider populated.
+    ///
+    /// Never both: NVIDIA duplicates them, so taking each in turn would emit
+    /// every thought twice.
+    fn reasoning_text(&self) -> Option<&str> {
+        self.reasoning_content
+            .as_deref()
+            .or(self.reasoning.as_deref())
+            .filter(|s| !s.is_empty())
+    }
 }
 
 /// Incremental SSE decoder.
@@ -86,9 +123,15 @@ impl SseDecoder {
             };
 
             for choice in parsed.choices {
-                if let Some(text) = choice.delta.content {
+                // Reasoning first: it precedes the answer in every stream that
+                // has both, and a frame carrying both fields is the model
+                // finishing a thought and starting to speak in the same breath.
+                if let Some(thought) = choice.delta.reasoning_text() {
+                    out.push(Delta::Reasoning(thought.to_string()));
+                }
+                if let Some(text) = &choice.delta.content {
                     if !text.is_empty() {
-                        out.push(Delta::Text(text));
+                        out.push(Delta::Text(text.clone()));
                     }
                 }
                 if choice.finish_reason.is_some() {
@@ -97,6 +140,274 @@ impl SseDecoder {
             }
         }
         out
+    }
+}
+
+/// Whether a failed status justifies trying the next link in the chain.
+///
+/// The distinction is whether the *endpoint* failed or the *request* is wrong.
+/// A wrong request is wrong everywhere, and walking a five-link chain to
+/// collect five identical 400s turns one fast error into five slow ones while
+/// sending the prompt to four more third parties than necessary — which is a
+/// privacy cost, not just a latency one.
+///
+/// - `429` is the case this whole mechanism exists for: free tiers cap by day
+///   or by minute, and the cap is per provider, so the next one is unaffected.
+/// - `401`/`403` mean this link's key is wrong or expired. Retryable, because
+///   the chain should still answer, but logged at `warn` — it is a standing
+///   misconfiguration that will not fix itself, and a chain quietly running one
+///   link short is how you discover the outage only when the last link goes.
+/// - `404` usually means the model id retired out from under the config, which
+///   free tiers do without notice. The next link serves a different id.
+/// - `413` and `5xx` are per-endpoint by nature — context windows differ, and
+///   someone else's bad day is not ours.
+/// - `400` is ours to fix. `chat_body` built it, so no other endpoint will like
+///   it any better.
+pub fn is_retryable(status: u16) -> bool {
+    match status {
+        400 => false,
+        401 | 403 | 404 | 408 | 409 | 413 | 429 => true,
+        s => s >= 500,
+    }
+}
+
+#[cfg(test)]
+mod policy_tests {
+    use super::*;
+
+    /// The reason the chain exists. A daily cap at one provider says nothing
+    /// about the next.
+    #[test]
+    fn rate_limits_and_outages_move_to_the_next_link() {
+        for s in [429, 500, 502, 503, 504, 529] {
+            assert!(is_retryable(s), "{s} should fail over");
+        }
+    }
+
+    /// A standing misconfiguration should still be answered by the chain — but
+    /// `generate` logs these differently, because they will not clear on their
+    /// own the way a 429 does.
+    #[test]
+    fn a_dead_key_or_retired_model_moves_on() {
+        for s in [401, 403, 404] {
+            assert!(is_retryable(s), "{s} should fail over");
+        }
+    }
+
+    /// The one that must not walk the chain. A 400 is `chat_body`'s fault, so
+    /// every link will reject it identically — and each attempt ships the
+    /// prompt to another third party for nothing.
+    ///
+    /// The exception is handled in `generate` rather than here: a
+    /// context-length 400 describes the *link*, not the request, and does
+    /// advance the chain. `is_retryable` stays a pure function of the status
+    /// code, because the body is what distinguishes the two cases.
+    #[test]
+    fn a_malformed_request_stops_at_the_first_link() {
+        assert!(!is_retryable(400));
+    }
+
+    /// Verbatim from integrate.api.nvidia.com, 2026-08-25, on a 707 KB Portage
+    /// log — the rejection that started all of this.
+    const NVIDIA_OVERFLOW: &str = "This model's maximum context length is 131072 tokens. \
+        However, you requested 2048 output tokens and your prompt contains at least 129025 \
+        input tokens, for a total of at least 131073 tokens.";
+
+    #[test]
+    fn the_window_is_read_from_the_phrase_that_names_it() {
+        let s = summarise_context_error(NVIDIA_OVERFLOW);
+        assert!(s.contains("131073"), "the total sent: {s}");
+        assert!(s.contains("limit of 131072"), "the window, not the output reserve: {s}");
+        // 2048 is the reserved output, and was previously reported as the
+        // limit — telling the operator to cut a log 64x when it was over by one
+        // token. Any summary naming it is wrong.
+        assert!(!s.contains("2048"), "the output reservation is not the limit: {s}");
+    }
+
+    /// The same message from a narrower free tier, which is the shape the
+    /// heterogeneous chain will actually produce.
+    #[test]
+    fn a_narrower_window_is_reported_as_its_own_number() {
+        let s = summarise_context_error(
+            "This model's maximum context length is 65536 tokens. However, you requested \
+             2048 output tokens and your prompt contains at least 87931 input tokens, for a \
+             total of at least 89979 tokens.",
+        );
+        assert!(s.contains("limit of 65536"), "{s}");
+        assert!(s.contains("89979"), "{s}");
+    }
+
+    /// No anchor phrase, so there is no way to know which figure is the window.
+    /// It must degrade to the one true statement rather than guess.
+    #[test]
+    fn an_unrecognised_shape_does_not_invent_a_limit() {
+        let s = summarise_context_error("context_length_exceeded: 40000 tokens");
+        assert!(s.contains("40000") && !s.contains("limit of"), "{s}");
+    }
+
+    /// The rule the carve-out is a hole in: digits and hadald's own words only.
+    #[test]
+    fn the_summary_never_quotes_the_upstream_prose() {
+        let s = summarise_context_error(NVIDIA_OVERFLOW);
+        assert!(!s.contains("However, you requested"), "upstream prose leaked: {s}");
+        assert!(!s.contains("This model's"), "upstream prose leaked: {s}");
+    }
+
+    /// Verbatim from the live NVIDIA endpoint, 2026-08-25, reproducing the
+    /// failure that made `hadal explain` unusable. Pinned as a fixture so a
+    /// rewording of the matcher cannot quietly stop recognising the one error
+    /// this daemon is most likely to receive.
+    const NVIDIA_400: &str = "{\"error\":{\"message\":\"This model's maximum context \
+        length is 131072 tokens. However, you requested 2048 output tokens and your prompt \
+        contains at least 129025 input tokens, for a total of at least 131073 tokens. Please \
+        reduce the length of the input prompt or the number of requested output tokens. \
+        (parameter=input_tokens, value=129025)\",\"type\":\"BadRequestError\",\
+        \"param\":\"input_tokens\",\"code\":400}}";
+
+    #[test]
+    fn recognises_a_context_length_rejection() {
+        assert!(is_context_length_error(NVIDIA_400));
+        assert!(is_context_length_error("error: context_length_exceeded"));
+        assert!(is_context_length_error("prompt exceeds context size"));
+    }
+
+    /// An ordinary 400 must keep the old opaque path — the carve-out is for
+    /// arithmetic, and widening it would start forwarding bodies that can echo
+    /// the prompt.
+    #[test]
+    fn an_ordinary_400_is_not_mistaken_for_one() {
+        assert!(!is_context_length_error("{\"error\":\"invalid model id\"}"));
+        assert!(!is_context_length_error("temperature must be <= 2"));
+    }
+
+    /// Verbatim frame shape from NVIDIA Nemotron, 2026-08-25. Both fields are
+    /// populated and byte-identical, which is the case that would double every
+    /// thought if they were read independently.
+    #[test]
+    fn reasoning_is_decoded_once_not_twice() {
+        let mut d = SseDecoder::new();
+        let out = d.feed(
+            "data: {\"choices\":[{\"delta\":{\"content\":null,\
+             \"reasoning\":\"Okay, the user\",\
+             \"reasoning_content\":\"Okay, the user\"}}]}\n\n",
+        );
+        assert_eq!(out, vec![Delta::Reasoning("Okay, the user".into())]);
+    }
+
+    /// A provider that ships only the short field still produces a stream.
+    #[test]
+    fn the_short_reasoning_field_is_a_fallback() {
+        let mut d = SseDecoder::new();
+        let out = d.feed("data: {\"choices\":[{\"delta\":{\"reasoning\":\"hm\"}}]}\n\n");
+        assert_eq!(out, vec![Delta::Reasoning("hm".into())]);
+    }
+
+    /// The safety property, stated as a test.
+    ///
+    /// A model rehearsing an action block inside its private reasoning must not
+    /// produce anything the broker would scan. If this ever yields
+    /// `Delta::Text`, a thought becomes a proposal — well-typed, accepted by
+    /// `action.rs`, and carried to a polkit prompt the model never asked for.
+    #[test]
+    fn a_rehearsed_action_block_in_reasoning_is_never_text() {
+        let mut d = SseDecoder::new();
+        let out = d.feed(
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\
+             \"I could propose ```hadal-action\\n{\\\"action\\\":\\\"read-journal\\\"}\\n```\"}}]}\n\n",
+        );
+        assert_eq!(out.len(), 1);
+        assert!(
+            matches!(out[0], Delta::Reasoning(_)),
+            "reasoning containing a fence must stay Reasoning, got {:?}",
+            out[0]
+        );
+    }
+
+    /// One frame can carry the end of a thought and the start of the answer.
+    /// Both must come out, in that order, as different kinds.
+    #[test]
+    fn a_frame_carrying_both_emits_both_in_order() {
+        let mut d = SseDecoder::new();
+        let out = d.feed(
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"...so\",\
+             \"content\":\"The build failed\"}}]}\n\n",
+        );
+        assert_eq!(
+            out,
+            vec![
+                Delta::Reasoning("...so".into()),
+                Delta::Text("The build failed".into()),
+            ]
+        );
+    }
+
+    /// The summary carries numbers, not the upstream's prose — the prompt must
+    /// not come back out through the error path.
+    #[test]
+    fn the_summary_reports_size_without_echoing_the_body() {
+        let s = summarise_context_error(NVIDIA_400);
+        assert!(s.contains("131073"), "should name the total: {s}");
+        assert!(!s.contains("However"), "must not quote the upstream: {s}");
+        assert!(!s.to_lowercase().contains("please reduce"));
+    }
+}
+
+/// Whether a 400 body is the endpoint saying "your prompt is too long".
+///
+/// Matched on wording rather than a code because the OpenAI-compatible
+/// ecosystem has no shared one: NVIDIA returns `type: BadRequestError` with
+/// `param: input_tokens`, others use `code: context_length_exceeded`, llama.cpp
+/// says "exceeds context size". The phrasings below cover what the shipped
+/// chain actually returns; an unmatched one degrades to the ordinary 400 path,
+/// which is the pre-existing behaviour and not a regression.
+pub fn is_context_length_error(detail: &str) -> bool {
+    let d = detail.to_ascii_lowercase();
+    d.contains("context_length_exceeded")
+        || d.contains("input_tokens")
+        || (d.contains("context") && (d.contains("maximum") || d.contains("exceed")))
+        || d.contains("too many tokens")
+}
+
+/// Pull the numbers out of a context-length rejection, discarding prose.
+///
+/// Returns only digits and the words around them that the caller needs to act:
+/// how big the window is and how far over the prompt went. Deliberately does
+/// not return the upstream's message verbatim — that is what keeps the "never
+/// forward an upstream body" rule intact while still answering the question the
+/// user actually has, which is "by how much?".
+pub fn summarise_context_error(detail: &str) -> String {
+    let lower = detail.to_ascii_lowercase();
+
+    let nums = |s: &str| -> Vec<u64> {
+        s.split(|c: char| !c.is_ascii_digit())
+            .filter(|t| !t.is_empty())
+            .filter_map(|t| t.parse().ok())
+            .filter(|n| *n >= 1000)
+            .collect()
+    };
+
+    // The window has to be read from the phrase that names it, not inferred as
+    // "the smallest number present". These messages carry four figures — the
+    // limit, the reserved output, the input, and the total — and the smallest
+    // is the output reservation. Guessing produced "roughly 89979 tokens were
+    // sent against a limit near 2048", which is wrong in the one direction that
+    // matters: it tells the operator to shorten a log by 40x when the real
+    // overage is 37%.
+    let limit = ["maximum context length is", "context length is", "context window is"]
+        .iter()
+        .find_map(|anchor| {
+            let at = lower.find(anchor)? + anchor.len();
+            nums(&lower[at..]).into_iter().next()
+        });
+
+    let total = nums(&lower).into_iter().max();
+
+    match (total, limit) {
+        (Some(hi), Some(lo)) if hi > lo => {
+            format!("Roughly {hi} tokens were sent against a limit of {lo}. Shorten the log.")
+        }
+        (Some(hi), _) => format!("Roughly {hi} tokens were involved. Shorten the log."),
+        _ => "Shorten the log.".to_string(),
     }
 }
 

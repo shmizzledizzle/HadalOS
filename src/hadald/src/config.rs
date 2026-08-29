@@ -34,9 +34,12 @@ pub const DEFAULT_EMBED_MODEL: &str = "nvidia/nemotron-3-embed-1b";
 ///    party" is false when pointed at loopback, and a warning that cries wolf
 ///    is a warning people learn to skip.
 ///
-/// This is the mechanism `docs/tier-routing.md` needs and does not have. That
-/// document routes on whether data *must stay here*; it cannot route anywhere
-/// until there are two places to route to, and hadald has had exactly one.
+/// This is the mechanism `docs/tier-routing.md` needs. That document routes on
+/// whether data *must stay here*; it could not route anywhere while hadald had
+/// exactly one place to send things. With `--fallback` there is now a chain,
+/// each link carrying its own locality, so a chain may legitimately mix a
+/// loopback reflex model with remote flagships — and every per-link decision
+/// below (key, egress line, warning) is made per link rather than once.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Locality {
     Local,
@@ -102,25 +105,109 @@ impl Locality {
     }
 }
 
+/// One place hadald can send a chat completion.
+///
+/// The three fields travel together because they are not independent: a model
+/// id is meaningful only against the endpoint that serves it, and a key is
+/// meaningful only against the endpoint that issued it. The bug this shape
+/// prevents is a fallback chain that shares one model name across providers —
+/// `nvidia/nemotron-3-ultra-550b-a55b` is a 404 at Groq, and a chain
+/// whose every link 404s is a chain that has quietly become a single point of
+/// failure with extra latency.
+#[derive(Debug, Clone)]
+pub struct Upstream {
+    /// OpenAI-compatible base URL, no trailing slash.
+    pub base: String,
+    /// Model id passed through to this endpoint, and only this one.
+    pub model: String,
+    /// File holding this endpoint's API key. `None` iff local — a loopback
+    /// server needs no credential, and requiring one is how a real key ends up
+    /// mode 0644 in someone's notes.
+    pub key_file: Option<PathBuf>,
+    /// Whether `base` is on this machine. Derived from it, not configured.
+    pub locality: Locality,
+}
+
+/// Parse one `--fallback URL,MODEL[,KEYFILE]`.
+///
+/// Comma-separated rather than three more flags because the fields must stay
+/// bound to each other. The alternative — repeated `--upstream`/`--model` where
+/// the latter attaches to the former — makes correctness depend on argument
+/// *order*, and `hadald.service` already passes `--model` before `--upstream`.
+/// A silent misgrouping there would send the primary model id to a fallback.
+///
+/// A comma is legal in a URL and in a path, and this will mis-split such a
+/// value. That is accepted: the failure is loud (a nonsense host, refused at
+/// config time or at connect) rather than silent, and no endpoint in practice
+/// has one.
+fn parse_fallback(spec: &str) -> Result<Upstream, ConfigError> {
+    let parts: Vec<&str> = spec.split(',').map(str::trim).collect();
+    let (base, model, key) = match parts.as_slice() {
+        [b, m] => (*b, *m, None),
+        [b, m, k] => (*b, *m, Some(*k)),
+        _ => {
+            return Err(ConfigError::Usage(format!(
+                "--fallback {spec:?}: expected URL,MODEL or URL,MODEL,KEYFILE"
+            )))
+        }
+    };
+    if base.is_empty() || model.is_empty() {
+        return Err(ConfigError::Usage(format!(
+            "--fallback {spec:?}: URL and MODEL must both be non-empty"
+        )));
+    }
+
+    let base = base.trim_end_matches('/').to_string();
+    let locality = Locality::of(&base);
+    let key_file = match (locality, key) {
+        // Dropped rather than honoured — a loopback server needs no credential
+        // — but said out loud, because the author clearly expected it to be
+        // used, and a key silently going unsent is exactly the kind of thing
+        // someone re-derives from a 401 an hour later.
+        (Locality::Local, Some(k)) if !k.is_empty() => {
+            tracing::warn!(
+                "--fallback {base}: ignoring key file {k}; the endpoint is on this machine \
+                 and no Authorization header will be sent"
+            );
+            None
+        }
+        (Locality::Local, _) => None,
+        // Refused, not defaulted to the primary's key. Sharing one key across
+        // providers cannot work — they are issued by different parties — so a
+        // default here would only produce a 401 at the moment the chain is
+        // being relied on, which is the moment it must not fail.
+        (Locality::Remote, None) => {
+            return Err(ConfigError::Usage(format!(
+                "--fallback {spec:?}: {base} is remote and needs its own key file \
+                 (URL,MODEL,KEYFILE)"
+            )))
+        }
+        (Locality::Remote, Some("")) => {
+            return Err(ConfigError::Usage(format!(
+                "--fallback {spec:?}: empty key file path"
+            )))
+        }
+        (Locality::Remote, Some(k)) => Some(PathBuf::from(k)),
+    };
+
+    Ok(Upstream { base, model: model.to_string(), key_file, locality })
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     /// Where the broker reaches us. Loopback only, by default and by intent.
     pub listen: SocketAddr,
-    /// OpenAI-compatible base URL.
-    pub upstream: String,
-    /// Whether `upstream` is on this machine. Derived from it, not configured.
-    pub locality: Locality,
-    /// Model id passed through to the upstream.
-    pub model: String,
-    /// Retrieval model for /api/embed. Separate from `model` because
+    /// Where chat completions may go, in the order they are tried. Never
+    /// empty; `chain[0]` is the primary and is the only link `/api/embed` and
+    /// `/api/retrieve` will ever use — see `Config::primary`.
+    pub chain: Vec<Upstream>,
+    /// Retrieval model for /api/embed. Separate from a chat model because
     /// embedding and chat are different model families — nothing sensible
     /// serves both.
     pub embed_model: String,
     /// Directory holding manifest.json, vectors.f32 and chunks.jsonl.
     /// Absent means no retrieval — hadald answers from the model alone.
     pub index_dir: Option<PathBuf>,
-    /// File holding the API key. Never an environment variable — see below.
-    pub key_file: PathBuf,
     /// Append a line per outbound request here, so "what left this machine"
     /// has an answer that is not "trust me".
     pub egress_log: Option<PathBuf>,
@@ -128,6 +215,24 @@ pub struct Config {
     /// prompts contain the build logs and journal excerpts that are the whole
     /// privacy question, so writing them to a second file is a deliberate act.
     pub log_bodies: bool,
+}
+
+impl Config {
+    /// The first link, which is also the *only* link retrieval may use.
+    ///
+    /// Embeddings deliberately do not fail over, and this accessor is where
+    /// that is enforced. Vectors are not comparable across models: the warning
+    /// on `DEFAULT_EMBED_MODEL` about changing it invalidating the index
+    /// applies just as much to changing it *for one request*. A chat request
+    /// that lands on a fallback returns a slightly different answer; an embed
+    /// request that lands on a fallback returns a vector from a different
+    /// space, `search` ranks it against the index anyway, and retrieval becomes
+    /// approximately random with no error anywhere. Degrading loudly is the
+    /// whole point of the chain — so the half that cannot degrade loudly does
+    /// not get one.
+    pub fn primary(&self) -> &Upstream {
+        &self.chain[0]
+    }
 }
 
 #[derive(Debug)]
@@ -178,15 +283,14 @@ pub fn read_key(path: &Path) -> Result<String, ConfigError> {
     if key.is_empty() {
         return Err(ConfigError::Key(format!("{} is empty", path.display())));
     }
-    // NVIDIA Build keys are `nvapi-...`. Warn rather than reject: the same
-    // daemon should work against any OpenAI-compatible endpoint.
-    if !key.starts_with("nvapi-") {
-        tracing::warn!(
-            "key in {} does not look like an NVIDIA Build key (expected nvapi-…); \
-             continuing in case this is another OpenAI-compatible endpoint",
-            path.display()
-        );
-    }
+    // There was a warning here for keys not starting with `nvapi-`, on the
+    // reasoning that NVIDIA Build was the expected endpoint. A chain makes that
+    // backwards: `csk-`, `gsk_`, `sk-or-v1-` and the rest are now the normal
+    // case, so the check fired on correct configurations and stayed silent on
+    // the only one it was aimed at. config.rs's own note on the startup banner
+    // applies to itself — "a warning that cries wolf is a warning people learn
+    // to skip". The shape of a key is the issuing endpoint's business; the
+    // things hadald can actually check, mode and emptiness, are checked above.
     Ok(key)
 }
 
@@ -201,6 +305,8 @@ impl Config {
         let mut egress_log = None;
         let mut log_bodies = false;
 
+        let mut fallbacks: Vec<Upstream> = Vec::new();
+
         let mut it = args.into_iter().skip(1).peekable();
         while let Some(arg) = it.next() {
             let mut val = |name: &str| -> Result<String, ConfigError> {
@@ -211,6 +317,7 @@ impl Config {
                 "--listen" => listen = val("--listen")?,
                 "--upstream" => upstream = val("--upstream")?,
                 "--model" => model = val("--model")?,
+                "--fallback" => fallbacks.push(parse_fallback(&val("--fallback")?)?),
                 "--embed-model" => embed_model = val("--embed-model")?,
                 "--index" => index_dir = Some(PathBuf::from(val("--index")?)),
                 "--key-file" => key_file = PathBuf::from(val("--key-file")?),
@@ -237,20 +344,42 @@ impl Config {
             )));
         }
 
-        let upstream = upstream.trim_end_matches('/').to_string();
-        let locality = Locality::of(&upstream);
-
-        Ok(Config {
-            listen,
-            locality,
-            upstream,
+        let base = upstream.trim_end_matches('/').to_string();
+        let locality = Locality::of(&base);
+        let primary = Upstream {
+            base,
             model,
-            embed_model,
-            index_dir,
-            key_file,
-            egress_log,
-            log_bodies,
-        })
+            key_file: match locality {
+                Locality::Local => None,
+                Locality::Remote => Some(key_file),
+            },
+            locality,
+        };
+
+        let mut chain = Vec::with_capacity(1 + fallbacks.len());
+        chain.push(primary);
+        chain.append(&mut fallbacks);
+
+        // A repeated endpoint is a chain that cannot fail over: the second
+        // attempt hits the same rate limit that sent us there, one round trip
+        // later. Refused rather than deduplicated, because which of the two the
+        // author meant to change — the URL or the model — is not knowable here.
+        for i in 0..chain.len() {
+            if let Some(j) = (i + 1..chain.len())
+                .find(|&j| chain[j].base == chain[i].base && chain[j].model == chain[i].model)
+            {
+                return Err(ConfigError::Usage(format!(
+                    "links {} and {} of the chain are both {} serving {} — a fallback to the \
+                     endpoint that just failed is not a fallback",
+                    i + 1,
+                    j + 1,
+                    chain[i].base,
+                    chain[i].model
+                )));
+            }
+        }
+
+        Ok(Config { listen, chain, embed_model, index_dir, egress_log, log_bodies })
     }
 }
 
@@ -271,8 +400,146 @@ mod tests {
     fn defaults_are_loopback_and_nvidia() {
         let c = Config::from_args(args(&["--model", "m"])).unwrap();
         assert_eq!(c.listen.to_string(), DEFAULT_LISTEN);
-        assert_eq!(c.upstream, DEFAULT_UPSTREAM);
+        assert_eq!(c.primary().base, DEFAULT_UPSTREAM);
         assert!(c.listen.ip().is_loopback());
+    }
+
+    /// No `--fallback` must stay exactly the daemon that existed before the
+    /// chain did — one link, no behaviour change, `hadald.service` and
+    /// `wire-hadal.sh` unmodified.
+    #[test]
+    fn without_fallbacks_the_chain_is_one_link() {
+        let c = Config::from_args(args(&[
+            "--serve",
+            "--model",
+            "m",
+            "--upstream",
+            "https://a.example/v1",
+            "--key-file",
+            "/etc/hadal/upstream.key",
+        ]))
+        .unwrap();
+        assert_eq!(c.chain.len(), 1);
+        assert_eq!(c.primary().model, "m");
+        assert_eq!(c.primary().key_file.as_deref(), Some(Path::new("/etc/hadal/upstream.key")));
+    }
+
+    /// `hadald.service` passes `--model` before `--upstream`. Any scheme that
+    /// grouped flags by position would bind the primary's model to nothing —
+    /// which is precisely why `--fallback` carries its own fields.
+    #[test]
+    fn flag_order_does_not_regroup_the_primary() {
+        let a = Config::from_args(args(&["--model", "m", "--upstream", "https://x.example/v1"]))
+            .unwrap();
+        let b = Config::from_args(args(&["--upstream", "https://x.example/v1", "--model", "m"]))
+            .unwrap();
+        assert_eq!(a.chain.len(), 1);
+        assert_eq!(a.primary().model, b.primary().model);
+        assert_eq!(a.primary().base, b.primary().base);
+    }
+
+    #[test]
+    fn fallbacks_keep_their_own_model_and_key() {
+        let c = Config::from_args(args(&[
+            "--model",
+            "primary-model",
+            "--upstream",
+            "https://a.example/v1",
+            "--fallback",
+            "https://b.example/v1/,b-model,/etc/hadal/b.key",
+            "--fallback",
+            "http://127.0.0.1:8080/v1,local-model",
+        ]))
+        .unwrap();
+        assert_eq!(c.chain.len(), 3);
+
+        // Trailing slash normalised on fallbacks too, or `{base}/chat/completions`
+        // becomes a double slash and some gateways 404 on it.
+        assert_eq!(c.chain[1].base, "https://b.example/v1");
+        assert_eq!(c.chain[1].model, "b-model");
+        assert_eq!(c.chain[1].key_file.as_deref(), Some(Path::new("/etc/hadal/b.key")));
+        assert_eq!(c.chain[1].locality, Locality::Remote);
+
+        // A local link carries no key even though one was never offered.
+        assert_eq!(c.chain[2].model, "local-model");
+        assert_eq!(c.chain[2].key_file, None);
+        assert_eq!(c.chain[2].locality, Locality::Local);
+    }
+
+    /// Sharing the primary's key with a fallback cannot work — different
+    /// parties issue them — so the omission is refused at startup rather than
+    /// producing a 401 at the moment the chain is being relied on.
+    #[test]
+    fn a_remote_fallback_without_a_key_is_refused() {
+        assert!(Config::from_args(args(&[
+            "--model",
+            "m",
+            "--fallback",
+            "https://b.example/v1,b-model"
+        ]))
+        .is_err());
+    }
+
+    #[test]
+    fn malformed_fallbacks_are_refused() {
+        for spec in [
+            "https://b.example/v1",            // no model
+            "https://b.example/v1,m,k,extra",  // too many fields
+            ",m,k",                            // empty url
+            "https://b.example/v1,,k",         // empty model
+            "https://b.example/v1,m,",         // empty key path
+        ] {
+            assert!(
+                Config::from_args(args(&["--model", "m", "--fallback", spec])).is_err(),
+                "{spec:?} should be refused"
+            );
+        }
+    }
+
+    /// A chain whose links are the same endpoint and model retries into the
+    /// same rate limit one round trip later. That is not redundancy.
+    #[test]
+    fn a_duplicate_link_is_refused() {
+        assert!(Config::from_args(args(&[
+            "--model",
+            "m",
+            "--upstream",
+            "https://a.example/v1",
+            "--fallback",
+            "https://a.example/v1,m,/etc/hadal/a.key",
+        ]))
+        .is_err());
+
+        // Same endpoint, different model, is a legitimate chain: providers
+        // retire free models one at a time.
+        assert!(Config::from_args(args(&[
+            "--model",
+            "m",
+            "--upstream",
+            "https://a.example/v1",
+            "--fallback",
+            "https://a.example/v1,other,/etc/hadal/a.key",
+        ]))
+        .is_ok());
+    }
+
+    /// The chain may mix tiers, which is the arrangement `docs/tier-routing.md`
+    /// wants: try the local reflex model first and only reach for a third party
+    /// when it cannot answer.
+    #[test]
+    fn a_chain_may_start_local_and_end_remote() {
+        let c = Config::from_args(args(&[
+            "--model",
+            "reflex",
+            "--upstream",
+            "http://127.0.0.1:8080/v1",
+            "--fallback",
+            "https://b.example/v1,flagship,/etc/hadal/b.key",
+        ]))
+        .unwrap();
+        assert_eq!(c.primary().locality, Locality::Local);
+        assert_eq!(c.primary().key_file, None, "a local primary must not demand a key");
+        assert_eq!(c.chain[1].locality, Locality::Remote);
     }
 
     /// Binding off-loopback would expose both a plaintext API and, indirectly,
@@ -291,7 +558,7 @@ mod tests {
         let c =
             Config::from_args(args(&["--model", "m", "--upstream", "https://x.example/v1/"]))
                 .unwrap();
-        assert_eq!(c.upstream, "https://x.example/v1");
+        assert_eq!(c.primary().base, "https://x.example/v1");
     }
 
     #[test]
@@ -328,7 +595,7 @@ mod tests {
     #[test]
     fn nvidia_default_is_remote() {
         let c = Config::from_args(args(&["--model", "m"])).unwrap();
-        assert_eq!(c.locality, Locality::Remote);
+        assert_eq!(c.primary().locality, Locality::Remote);
     }
 
     /// The case that makes a local reflex model possible at all: llama-server
@@ -344,7 +611,7 @@ mod tests {
             "http://foo.localhost:8080/v1",
         ] {
             let c = Config::from_args(args(&["--model", "m", "--upstream", url])).unwrap();
-            assert_eq!(c.locality, Locality::Local, "{url} should be local");
+            assert_eq!(c.primary().locality, Locality::Local, "{url} should be local");
         }
     }
 
@@ -361,7 +628,7 @@ mod tests {
             "http://localhost.evil.example/v1",
         ] {
             let c = Config::from_args(args(&["--model", "m", "--upstream", url])).unwrap();
-            assert_eq!(c.locality, Locality::Remote, "{url} should be remote");
+            assert_eq!(c.primary().locality, Locality::Remote, "{url} should be remote");
         }
     }
 

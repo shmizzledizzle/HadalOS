@@ -50,8 +50,13 @@ use upstream::{Delta, SseDecoder};
 
 struct Ctx {
     cfg: Config,
-    /// `None` when the upstream is local — a loopback server needs no key.
-    key: Option<String>,
+    /// One entry per link of `cfg.chain`, same order. `None` where that link is
+    /// local — a loopback server needs no key.
+    ///
+    /// Read once at startup rather than per request, so an unreadable or
+    /// world-readable key file is a refusal to start rather than a 401 at the
+    /// moment the chain is being leaned on.
+    keys: Vec<Option<String>>,
     http: reqwest::Client,
     /// None when no index is configured, or when loading failed. Retrieval is
     /// an enhancement, so a broken index degrades to answering without it —
@@ -61,11 +66,15 @@ struct Ctx {
 }
 
 impl Ctx {
-    /// Attach the API key if there is one. Sending `Bearer` to a loopback
-    /// llama-server would be noise; omitting it against the remote endpoint
-    /// would be a 401.
-    fn auth(&self, rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        match &self.key {
+    /// Attach link `i`'s API key if it has one. Sending `Bearer` to a loopback
+    /// llama-server would be noise; omitting it against a remote endpoint would
+    /// be a 401.
+    ///
+    /// Indexed by link, never by "the" key: the whole point of a chain is that
+    /// the credential differs per hop, and one shared key would 401 on every
+    /// link but the one that issued it.
+    fn auth(&self, i: usize, rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match &self.keys[i] {
             Some(k) => rb.bearer_auth(k),
             None => rb,
         }
@@ -97,28 +106,39 @@ async fn main() -> std::process::ExitCode {
             eprintln!("hadald: {e}");
             eprintln!(
                 "\nusage: hadald --serve --model <id> [--key-file PATH] [--listen ADDR]\n\
-                 [--upstream URL] [--egress-log PATH] [--log-bodies]"
+                 [--upstream URL] [--fallback URL,MODEL[,KEYFILE]]... [--egress-log PATH]\n\
+                 [--log-bodies]\n\n\
+                 --fallback may be given more than once. Links are tried in the order\n\
+                 written, and only until one accepts the request — see README.md."
             );
             return std::process::ExitCode::from(2);
         }
     };
 
-    // A local upstream needs no credential, and requiring one would make the
-    // local tier impossible to run without inventing a dummy key file — which
-    // is how a real key ends up mode 0644 in someone's notes.
-    let key = match cfg.locality {
-        Locality::Local => {
-            tracing::info!("upstream is local ({}); no API key required", cfg.upstream);
-            None
-        }
-        Locality::Remote => match config::read_key(&cfg.key_file) {
-            Ok(k) => Some(k),
-            Err(e) => {
-                eprintln!("hadald: {e}");
-                return std::process::ExitCode::FAILURE;
+    // A local link needs no credential, and requiring one would make the local
+    // tier impossible to run without inventing a dummy key file — which is how
+    // a real key ends up mode 0644 in someone's notes.
+    //
+    // Every key is read here, before the socket is bound. A chain whose third
+    // link has an unreadable key file is broken at configuration time, and
+    // discovering that on the day the first two are rate-limited would be
+    // discovering it at the worst available moment.
+    let mut keys = Vec::with_capacity(cfg.chain.len());
+    for up in &cfg.chain {
+        match &up.key_file {
+            None => {
+                tracing::info!("upstream {} is local; no API key required", up.base);
+                keys.push(None);
             }
-        },
-    };
+            Some(path) => match config::read_key(path) {
+                Ok(k) => keys.push(Some(k)),
+                Err(e) => {
+                    eprintln!("hadald: {} ({e})", up.base);
+                    return std::process::ExitCode::FAILURE;
+                }
+            },
+        }
+    }
 
     let index = match &cfg.index_dir {
         None => None,
@@ -151,7 +171,7 @@ async fn main() -> std::process::ExitCode {
             .build()
             .expect("http client"),
         cfg: cfg.clone(),
-        key,
+        keys,
         index,
     });
 
@@ -173,27 +193,55 @@ async fn main() -> std::process::ExitCode {
     // Say which tier is serving, unprompted. docs/tier-routing.md §5: a reader
     // cannot tell from a model name whether it ran here or in someone else's
     // datacentre, and locality is the part that matters.
-    tracing::info!(
-        "hadald listening on {} — model {} via {} [{}]",
-        cfg.listen,
-        cfg.model,
-        cfg.upstream,
-        cfg.locality.as_str()
-    );
-    if cfg.locality == Locality::Remote {
+    //
+    // Every link is named, not just the primary. The chain's failure mode is
+    // that it works — a prompt lands somewhere the operator forgot was
+    // configured, and nothing about the answer says so. Listing the whole chain
+    // at startup is the one place that is cheap to state.
+    tracing::info!("hadald listening on {} — {} upstream(s):", cfg.listen, cfg.chain.len());
+    for (i, up) in cfg.chain.iter().enumerate() {
+        tracing::info!(
+            "  {}. model {} via {} [{}]",
+            i + 1,
+            up.model,
+            up.base,
+            up.locality.as_str()
+        );
+    }
+
+    let remote: Vec<&str> =
+        cfg.chain.iter().filter(|u| u.locality == Locality::Remote).map(|u| u.base.as_str()).collect();
+    if !remote.is_empty() {
         if cfg.egress_log.is_none() {
             tracing::warn!(
                 "no --egress-log: outbound prompts will not be recorded anywhere. \
-                 This daemon sends system logs to a third party."
+                 This daemon sends system logs to {} third part{}: {}",
+                remote.len(),
+                if remote.len() == 1 { "y" } else { "ies" },
+                remote.join(", ")
             );
         }
-        if cfg.upstream.starts_with("http://") {
-            tracing::warn!(
-                "upstream {} is remote and plaintext — the API key and every prompt \
-                 cross the network unencrypted",
-                cfg.upstream
-            );
+        for base in &remote {
+            if base.starts_with("http://") {
+                tracing::warn!(
+                    "upstream {base} is remote and plaintext — the API key and every prompt \
+                     cross the network unencrypted"
+                );
+            }
         }
+    }
+
+    // The unit ships PrivateNetwork=yes with a socket proxy "pinned to exactly
+    // one upstream". A chain has more than one, so that pin has to grow a
+    // destination per remote link or the chain silently collapses to whichever
+    // link the proxy can still reach. Said here because the daemon is the only
+    // component that knows how many there are.
+    if remote.len() > 1 {
+        tracing::info!(
+            "{} remote links configured — under systemd's PrivateNetwork=yes each needs its \
+             own socket proxy destination; see README.md",
+            remote.len()
+        );
     }
 
     if let Err(e) = axum::serve(listener, app)
@@ -210,26 +258,49 @@ async fn main() -> std::process::ExitCode {
 
 /// Readiness probe. `ModelClient::ready()` only checks for a 2xx, but report
 /// the configured model so a human running `curl` learns something.
+///
+/// Advertises the primary's name only — the broker names one model and expects
+/// one back — but lists the chain under `details` so the answer to "where can
+/// this thing send my journal" is available without reading the unit file.
 async fn tags(State(ctx): State<Arc<Ctx>>) -> impl IntoResponse {
+    let primary = ctx.cfg.primary();
     Json(serde_json::json!({
         "models": [{
-            "name": ctx.cfg.model,
-            "model": ctx.cfg.model,
+            "name": primary.model,
+            "model": primary.model,
             "details": {
                 "family": "hadald-upstream",
-                "upstream": ctx.cfg.upstream,
-                "locality": ctx.cfg.locality.as_str(),
+                "upstream": primary.base,
+                "locality": primary.locality.as_str(),
+                "chain": ctx.cfg.chain.iter().map(|u| serde_json::json!({
+                    "upstream": u.base,
+                    "model": u.model,
+                    "locality": u.locality.as_str(),
+                })).collect::<Vec<_>>(),
             },
         }]
     }))
 }
 
 /// Record one outbound request. Appends; never truncates.
-fn note_egress(cfg: &Config, prompt: &str, system: &str) {
+///
+/// Called once per *attempt*, not once per request, and before the attempt is
+/// made. A prompt that went to the first link and came back 429 still left this
+/// machine; a log that recorded only the link which eventually answered would
+/// understate the exposure by exactly the number of providers the chain walked
+/// past. `attempt=` makes the walk legible after the fact.
+fn note_egress(
+    cfg: &Config,
+    up: &config::Upstream,
+    attempt: usize,
+    of: usize,
+    prompt: &str,
+    system: &str,
+) {
     // Nothing left the machine, so nothing belongs in the record of what left
     // the machine. A log that answers a different question than its name is
     // worse than no log.
-    if cfg.locality.is_local() {
+    if up.locality.is_local() {
         return;
     }
     let Some(path) = &cfg.egress_log else { return };
@@ -241,9 +312,11 @@ fn note_egress(cfg: &Config, prompt: &str, system: &str) {
         .unwrap_or(0);
 
     let mut line = format!(
-        "{stamp} model={} upstream={} prompt_bytes={} system_bytes={}\n",
-        cfg.model,
-        cfg.upstream,
+        "{stamp} model={} upstream={} attempt={}/{} prompt_bytes={} system_bytes={}\n",
+        up.model,
+        up.base,
+        attempt + 1,
+        of,
         prompt.len(),
         system.len()
     );
@@ -279,6 +352,11 @@ struct EmbedRequest {
 ///
 /// Non-streaming, so unlike `generate` this waits for the whole reply. Batches
 /// are the caller's business; `build_index.py` sends 32 at a time.
+///
+/// **Does not fail over.** `--fallback` is a chat mechanism only; see
+/// `Config::primary` for why extending it here would corrupt retrieval instead
+/// of rescuing it. An embedding request that cannot be served fails, and the
+/// caller — `retrieve_handler` below, or `build_index.py` — finds out.
 async fn embed(
     State(ctx): State<Arc<Ctx>>,
     Json(req): Json<EmbedRequest>,
@@ -287,11 +365,12 @@ async fn embed(
         return Err((StatusCode::BAD_REQUEST, "empty input").into_response());
     }
 
+    let up = ctx.cfg.primary();
     let (body, kind) = upstream::embed_body(&ctx.cfg.embed_model, &req.input);
-    note_egress_embed(&ctx.cfg, &req.input, kind.as_str());
+    note_egress_embed(&ctx.cfg, up, &req.input, kind.as_str());
 
     let resp = ctx
-        .auth(ctx.http.post(format!("{}/embeddings", ctx.cfg.upstream)))
+        .auth(0, ctx.http.post(format!("{}/embeddings", up.base)))
         .json(&body)
         .send()
         .await
@@ -334,8 +413,8 @@ async fn embed(
     Ok(Json(serde_json::json!({ "embeddings": vectors })).into_response())
 }
 
-fn note_egress_embed(cfg: &Config, inputs: &[String], kind: &str) {
-    if cfg.locality.is_local() {
+fn note_egress_embed(cfg: &Config, up: &config::Upstream, inputs: &[String], kind: &str) {
+    if up.locality.is_local() {
         return;
     }
     let Some(path) = &cfg.egress_log else { return };
@@ -348,7 +427,7 @@ fn note_egress_embed(cfg: &Config, inputs: &[String], kind: &str) {
     let line = format!(
         "{stamp} embed model={} upstream={} input_type={kind} count={} bytes={bytes}\n",
         cfg.embed_model,
-        cfg.upstream,
+        up.base,
         inputs.len()
     );
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
@@ -388,12 +467,17 @@ async fn retrieve_handler(
     // Embedded as a *query*, not a passage. Retrieval models place questions
     // and documents in different regions of the space; using the document
     // encoding for a question silently degrades every result.
+    //
+    // Primary only, for the same reason `embed` is: the index was built by one
+    // model, and a query vector from any other is not in the space `search`
+    // ranks against.
+    let up = ctx.cfg.primary();
     let (body, _) = upstream::embed_body(
         &ctx.cfg.embed_model,
         &[format!("search_query: {}", req.query)],
     );
     let resp = ctx
-        .auth(ctx.http.post(format!("{}/embeddings", ctx.cfg.upstream)))
+        .auth(0, ctx.http.post(format!("{}/embeddings", up.base)))
         .json(&body)
         .send()
         .await
@@ -428,6 +512,26 @@ async fn retrieve_handler(
     .into_response())
 }
 
+/// Chat completion, walking the chain until a link accepts.
+///
+/// # Where the failover boundary is, and why it is there
+///
+/// A link may be abandoned only up to the moment its response headers arrive
+/// and prove successful. After that hadald has committed: the body is streamed
+/// straight through to the broker, and the broker's `ProposalScanner` is a
+/// single pass over a single token stream. Restarting on link two mid-answer
+/// would splice a second model's output onto the first's — the scanner would
+/// see one prefix, then a second unrelated prefix, and the concatenation can
+/// form a *valid* proposal that neither model actually made. That is the one
+/// failure this daemon must not have: `main.rs`'s header claims safety survives
+/// a remote model because proposals are typed and validated, and a spliced
+/// proposal is well-typed.
+///
+/// So an upstream that returns 200 and then dies four tokens in is a failed
+/// request, not a failover. Buffering the stream's opening to widen the window
+/// was considered and rejected: it would add latency to every request that
+/// works in order to rescue the rare one that does not, and time-to-first-token
+/// is the budget the reflex tier exists to protect.
 async fn generate(
     State(ctx): State<Arc<Ctx>>,
     Json(req): Json<GenerateRequest>,
@@ -436,49 +540,170 @@ async fn generate(
         return Err((StatusCode::BAD_REQUEST, "empty prompt").into_response());
     }
 
-    // The broker names a model; hadald serves exactly one. Say so rather than
-    // silently answering as something else.
-    if !req.model.is_empty() && req.model != ctx.cfg.model {
+    // The broker names a model; hadald answers with whichever link takes the
+    // request. Compare against the primary — that is what `/api/tags`
+    // advertised, so that is what the broker had to go on.
+    let primary = ctx.cfg.primary();
+    if !req.model.is_empty() && req.model != primary.model {
         tracing::warn!(
             "broker asked for model '{}', serving '{}'",
             req.model,
-            ctx.cfg.model
+            primary.model
         );
     }
 
-    note_egress(&ctx.cfg, &req.prompt, &req.system);
+    let n = ctx.cfg.chain.len();
+    // Kept so the caller gets the reason the *chain* failed rather than only
+    // the reason its last link did — with one bad key at the front, the last
+    // link's error is usually the least informative one.
+    let mut trail: Vec<String> = Vec::with_capacity(n);
+    // Set when a link rejected the prompt on length. Held rather than
+    // returned, because a later link with a wider window may still accept it.
+    let mut too_large: Option<String> = None;
 
-    let body = upstream::chat_body(&ctx.cfg.model, &req.system, &req.prompt);
-    let resp = ctx
-        .auth(ctx.http.post(format!("{}/chat/completions", ctx.cfg.upstream)))
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| {
-            tracing::error!("upstream unreachable: {e}");
-            (StatusCode::BAD_GATEWAY, format!("upstream unreachable: {e}")).into_response()
-        })?;
+    for (i, up) in ctx.cfg.chain.iter().enumerate() {
+        // Before the request, so the record of what left this machine is
+        // written even if the process dies mid-flight.
+        note_egress(&ctx.cfg, up, i, n, &req.prompt, &req.system);
 
-    if !resp.status().is_success() {
+        let body = upstream::chat_body(&up.model, &req.system, &req.prompt);
+        let sent = ctx
+            .auth(i, ctx.http.post(format!("{}/chat/completions", up.base)))
+            .json(&body)
+            .send()
+            .await;
+
+        let resp = match sent {
+            Ok(r) => r,
+            // Unreachable is always worth trying the next link for: DNS, TLS
+            // and connect failures say nothing about whether the request is
+            // acceptable elsewhere.
+            Err(e) => {
+                tracing::warn!("upstream {}/{} ({}) unreachable: {e}", i + 1, n, up.base);
+                trail.push(format!("{}: unreachable ({e})", up.base));
+                continue;
+            }
+        };
+
         let status = resp.status();
+        if status.is_success() {
+            if i > 0 {
+                tracing::info!(
+                    "upstream {}/{} ({}, model {}) served the request after {} failure(s)",
+                    i + 1,
+                    n,
+                    up.base,
+                    up.model,
+                    i
+                );
+            }
+            // Committed. Translate SSE to the newline-delimited JSON the broker
+            // parses; from here a failure is a truncated answer, not a retry.
+            let stream = async_stream::stream(resp);
+            return Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "application/x-ndjson")
+                .body(Body::from_stream(stream))
+                .expect("response"));
+        }
+
         let detail = resp.text().await.unwrap_or_default();
-        tracing::error!("upstream returned {status}: {detail}");
-        // Do not forward the upstream body verbatim — it can echo the request,
-        // and the request is the thing we are being careful about.
+        let detail = detail.trim();
+
+        if !upstream::is_retryable(status.as_u16()) {
+            // One 400 gets its cause forwarded: the prompt did not fit.
+            //
+            // The standing rule is that an upstream body is never passed on,
+            // because it can echo the request and the request is the thing
+            // being careful about. A context-length rejection is the exception
+            // worth carving out — it is arithmetic, not content, and it is the
+            // single most likely 400 this daemon will ever see, because the
+            // prompt is a build log and build logs have no upper bound.
+            //
+            // Withholding it cost a real diagnosis: `hadal explain` on a 707 KB
+            // log failed with a bare "upstream returned 400 Bad Request" for
+            // long enough to be mistaken for a rate limit and an expired key in
+            // turn, while the endpoint had been saying "your prompt contains at
+            // least 129025 input tokens" the whole time. Same finding as the
+            // one already recorded in `embed` above, on the path where the
+            // payload is larger and the guess is harder.
+            // It is also the one 400 that *does* advance the chain. The general
+            // rule below — a 400 is hadald's own bad request, so every link will
+            // reject it identically — is exactly false here, because a context
+            // window is a property of the link and not of the request. The
+            // chain is deliberately heterogeneous: free tiers cap context as
+            // well as throughput, so a prompt that overflows a 64k link may sit
+            // comfortably inside the 131k one behind it. Stopping here would
+            // let the smallest window in the chain decide the largest log the
+            // whole chain can explain.
+            //
+            // The rejection is remembered rather than returned, so that if
+            // nothing downstream serves it the user still gets the arithmetic
+            // instead of a generic 502.
+            if upstream::is_context_length_error(detail) {
+                tracing::warn!(
+                    "upstream {}/{} ({}, model {}) rejected the prompt on length; {} — \
+                     trying the next link, whose window may be larger",
+                    i + 1,
+                    n,
+                    up.base,
+                    up.model,
+                    upstream::summarise_context_error(detail)
+                );
+                too_large = Some(upstream::summarise_context_error(detail));
+                trail.push(format!("{}: {status} (context window)", up.base));
+                continue;
+            }
+
+            // Wrong request, not a wrong endpoint. Stop rather than send the
+            // same rejected prompt to everyone else in the chain.
+            tracing::error!("upstream {} returned {status}: {detail}", up.base);
+            return Err((
+                StatusCode::BAD_GATEWAY,
+                format!("upstream returned {status}"),
+            )
+                .into_response());
+        }
+
+        // A key that will never work, distinguished from a cap that will clear
+        // on its own. Both fail over; only one of them is the operator's to fix.
+        if matches!(status.as_u16(), 401 | 403 | 404) {
+            tracing::warn!(
+                "upstream {}/{} ({}) returned {status} — this is a standing \
+                 misconfiguration (key or model id), not a transient limit; the chain is \
+                 running one link short until it is fixed",
+                i + 1,
+                n,
+                up.base
+            );
+        } else {
+            tracing::warn!("upstream {}/{} ({}) returned {status}", i + 1, n, up.base);
+        }
+        tracing::debug!("upstream {} detail: {detail}", up.base);
+        trail.push(format!("{}: {status}", up.base));
+    }
+
+    // Do not forward any upstream body verbatim — it can echo the request, and
+    // the request is the thing we are being careful about. The endpoint names
+    // and status codes below are hadald's own words.
+    tracing::error!("all {n} upstream(s) failed: {}", trail.join("; "));
+
+    // If any link turned it away on length, that is the actionable finding and
+    // it outranks the tail of statuses: the log is too long, and no amount of
+    // waiting for a rate limit to clear will change that.
+    if let Some(summary) = too_large {
         return Err((
-            StatusCode::BAD_GATEWAY,
-            format!("upstream returned {status}"),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!("the prompt did not fit the model's context window. {summary}"),
         )
             .into_response());
     }
 
-    // Translate SSE to the newline-delimited JSON the broker parses.
-    let stream = async_stream::stream(resp);
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header("content-type", "application/x-ndjson")
-        .body(Body::from_stream(stream))
-        .expect("response"))
+    Err((
+        StatusCode::BAD_GATEWAY,
+        format!("all {n} upstream(s) failed: {}", trail.join("; ")),
+    )
+        .into_response())
 }
 
 /// SSE in, Ollama NDJSON out.
@@ -513,6 +738,15 @@ mod async_stream {
                                 Delta::Text(t) => {
                                     out.push_str(&ndjson(&t, false));
                                 }
+                                // A distinct field, not `response`. Ollama's
+                                // own schema grew `thinking` for this, so the
+                                // name is borrowed rather than invented, and a
+                                // broker that does not know it ignores it —
+                                // `GenerateChunk` takes unknown fields in
+                                // silence, so old and new can be mixed.
+                                Delta::Reasoning(t) => {
+                                    out.push_str(&thinking_ndjson(&t));
+                                }
                                 Delta::Done => {
                                     out.push_str(&ndjson("", true));
                                     finished = true;
@@ -541,6 +775,20 @@ mod async_stream {
         format!(
             "{}\n",
             serde_json::json!({ "response": text, "done": done })
+        )
+    }
+
+    /// A reasoning frame. Carries an empty `response` on purpose.
+    ///
+    /// The broker reads `response` unconditionally and feeds it to
+    /// `ProposalScanner`; emitting the thought there would let a rehearsed
+    /// action block become a real proposal. Empty means the scanner sees
+    /// nothing, and a broker that ignores `thinking` degrades to exactly the
+    /// old behaviour rather than to a wrong one.
+    fn thinking_ndjson(text: &str) -> String {
+        format!(
+            "{}\n",
+            serde_json::json!({ "response": "", "thinking": text, "done": false })
         )
     }
 }
@@ -580,9 +828,10 @@ mod egress_tests {
     fn a_local_upstream_writes_no_egress_line() {
         let log = tmp("local");
         let cfg = cfg_for("http://127.0.0.1:8080/v1", &log);
-        assert_eq!(cfg.locality, Locality::Local);
-        note_egress(&cfg, "why did my build fail", "you are hadal");
-        note_egress_embed(&cfg, &["a chunk of the journal".to_string()], "query");
+        let up = cfg.primary();
+        assert_eq!(up.locality, Locality::Local);
+        note_egress(&cfg, up, 0, 1, "why did my build fail", "you are hadal");
+        note_egress_embed(&cfg, up, &["a chunk of the journal".to_string()], "query");
         assert!(
             !log.exists() || std::fs::read_to_string(&log).unwrap().is_empty(),
             "a local request must leave the egress log untouched"
@@ -597,11 +846,58 @@ mod egress_tests {
     fn a_remote_upstream_still_writes_one() {
         let log = tmp("remote");
         let cfg = cfg_for("https://integrate.api.nvidia.com/v1", &log);
-        assert_eq!(cfg.locality, Locality::Remote);
-        note_egress(&cfg, "why did my build fail", "you are hadal");
+        let up = cfg.primary();
+        assert_eq!(up.locality, Locality::Remote);
+        note_egress(&cfg, up, 0, 1, "why did my build fail", "you are hadal");
         let body = std::fs::read_to_string(&log).expect("egress log must exist");
         assert!(body.contains("upstream=https://integrate.api.nvidia.com/v1"));
         assert!(body.contains("prompt_bytes=21"));
+        let _ = std::fs::remove_file(&log);
+    }
+
+    /// The failure this test exists for: a chain that walks past two providers
+    /// and is answered by the third has sent the journal excerpt to three
+    /// companies, and the egress log is the only place that fact is recorded.
+    /// One line per *attempt*, not one per request.
+    #[test]
+    fn every_attempt_in_the_chain_is_recorded() {
+        let log = tmp("chain");
+        let cfg = Config::from_args(
+            [
+                "hadald",
+                "--model",
+                "primary-model",
+                "--upstream",
+                "https://a.example/v1",
+                "--fallback",
+                "https://b.example/v1,b-model,/dev/null",
+                "--fallback",
+                "http://127.0.0.1:8080/v1,local-model",
+                "--egress-log",
+                log.to_str().unwrap(),
+            ]
+            .iter()
+            .map(|s| s.to_string()),
+        )
+        .expect("config");
+        assert_eq!(cfg.chain.len(), 3);
+
+        for (i, up) in cfg.chain.iter().enumerate() {
+            note_egress(&cfg, up, i, cfg.chain.len(), "why did my build fail", "sys");
+        }
+
+        let body = std::fs::read_to_string(&log).expect("egress log must exist");
+        let lines: Vec<&str> = body.lines().collect();
+        assert_eq!(lines.len(), 2, "two remote attempts, and the local one must not appear");
+        assert!(lines[0].contains("upstream=https://a.example/v1"));
+        assert!(lines[0].contains("model=primary-model"));
+        assert!(lines[0].contains("attempt=1/3"));
+        assert!(lines[1].contains("upstream=https://b.example/v1"));
+        // The fallback's own model id, not the primary's. Logging the primary's
+        // here would misreport what the second provider was actually asked for.
+        assert!(lines[1].contains("model=b-model"));
+        assert!(lines[1].contains("attempt=2/3"));
+        assert!(!body.contains("127.0.0.1"), "a local link must not appear in an egress log");
         let _ = std::fs::remove_file(&log);
     }
 }

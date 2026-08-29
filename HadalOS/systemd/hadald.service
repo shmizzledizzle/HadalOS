@@ -52,6 +52,33 @@ EnvironmentFile=/etc/hadal/hadald.env
 # variable would pass `--upstream ""` — which is neither local nor a usable URL.
 Environment=HADAL_UPSTREAM=https://integrate.api.nvidia.com/v1
 
+# Fallback links, as zero or more whole `--fallback URL,MODEL,KEYFILE` pairs.
+#
+# Empty by default, and empty is the pre-fallback daemon exactly: a one-link
+# chain. Set it in /etc/hadal/hadald.env to add providers, e.g.
+#
+#   HADAL_FALLBACKS=--fallback https://api.groq.com/openai/v1,llama-3.3-70b-versatile,/etc/hadal/groq.key --fallback https://api.cerebras.ai/v1,qwen-3-235b-a22b-instruct-2507,/etc/hadal/cerebras.key
+#
+# Order by context window rather than by model size. Groq serves the full 131k;
+# Cerebras' free tier holds its models to 64k, and `hadal explain` on a large
+# build log builds an ~88k-token prompt, so the narrow link goes second-to-last
+# where it still answers everything that fits it. See src/hadald/README.md.
+#
+# The flag name lives *inside* the variable rather than being written below,
+# because an empty value must expand to nothing at all. A literal
+# `--fallback $HADAL_FALLBACKS` would leave a bare `--fallback` with no value
+# and fail every start until someone configured it — the same class of bug as
+# the missing --upstream recorded above: a directive that only works once it
+# has been configured is a directive that breaks the default.
+#
+# Referenced below as `$HADAL_FALLBACKS`, NOT `${HADAL_FALLBACKS}`. systemd
+# splits the former on whitespace and passes the latter as one single argument,
+# so the braced form would hand hadald one long string as the value of `--serve`
+# and take the whole chain down. The unbraced form is why several fallbacks fit
+# in one variable — and why no field may contain a space. None of URL, model id
+# or key path ever does.
+Environment=HADAL_FALLBACKS=
+
 # --upstream was missing, and its absence was documented as though it worked.
 # hadald takes the upstream as a CLI flag; this unit never passed one, so it
 # always used config.rs's DEFAULT_UPSTREAM — the NVIDIA endpoint — and therefore
@@ -63,6 +90,7 @@ Environment=HADAL_UPSTREAM=https://integrate.api.nvidia.com/v1
 ExecStart=/usr/bin/hadald --serve --model ${HADAL_MODEL} \
     --upstream ${HADAL_UPSTREAM} \
     --key-file /etc/hadal/upstream.key \
+    $HADAL_FALLBACKS \
     --egress-log /var/log/hadal/egress.log
 Restart=on-failure
 RestartSec=2s

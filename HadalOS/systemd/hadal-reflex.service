@@ -1,0 +1,102 @@
+# The last link in hadald's fallback chain: a small model on this machine.
+#
+# It exists for the case every remote link is gone — no network, every free
+# tier spent, keys expired — where the alternative is no assistant at all. It
+# is not trying to compete with a 49B model; a 1.7B answer to "what does
+# `cannot find -lssl` mean" is a correct answer, and it is available when
+# nothing else is.
+#
+# Named "reflex" rather than "local" because HadalOS already uses "local" to
+# mean "on this machine", which every link in a chain may or may not be.
+#
+# Deliberately NOT WantedBy hadald.service. The chain tolerates a dead last
+# link — that is what a chain is — and a reflex model that fails to load
+# should not keep the daemon that could still reach four working providers
+# from starting.
+
+[Unit]
+Description=Hadal reflex model (llama.cpp, last resort in the fallback chain)
+Documentation=file:///usr/share/doc/hadal/hadald-README.md
+After=network.target
+
+[Service]
+Type=exec
+User=hadal
+Group=hadal
+
+# hadald reaches this over loopback, so both must be in the same network
+# namespace. If hadald keeps PrivateNetwork=yes, uncomment the line below:
+# without it hadald's 127.0.0.1:8080 is its own namespace's port 8080, this
+# server is on the host's, and the link is configured but permanently silent.
+# With the documented PrivateNetwork=no drop-in in place, leave it commented —
+# both are then in the host namespace already.
+#
+# JoinsNamespaceOf=hadald.service
+
+Environment=HADAL_REFLEX_MODEL=/var/lib/hadal/models/Qwen3-1.7B-Q8_0.gguf
+Environment=HADAL_REFLEX_CTX=8192
+
+# --alias fixes the model id the API answers to, so the `--fallback` line names
+# a string this unit controls rather than a filename that changes with every
+# requant. hadald sends the model id per-link and a mismatch is a 404.
+#
+# --host 127.0.0.1 is not a default worth inheriting: this server has no
+# authentication of any kind, and the port is explicit because llama.cpp has
+# announced it is moving its own default off 8080.
+ExecStart=/usr/bin/llama-server \
+    --model ${HADAL_REFLEX_MODEL} \
+    --alias hadal-reflex \
+    --host 127.0.0.1 \
+    --port 8080 \
+    --ctx-size ${HADAL_REFLEX_CTX} \
+    --threads 4
+
+Restart=on-failure
+RestartSec=5s
+
+# This is the tier that runs on the machine the user is typing on, and the
+# reference machine is a GPU-less ultrabook. Losing a race against the
+# compositor for CPU is a worse outcome than a slow answer.
+Nice=15
+CPUWeight=10
+IOWeight=10
+MemoryMax=40%
+OOMPolicy=stop
+OOMScoreAdjust=700
+
+# It reads one model file and serves one loopback port. Nothing else.
+ProtectSystem=strict
+ProtectHome=yes
+ReadOnlyPaths=/var/lib/hadal/models
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectProc=invisible
+ProcSubset=pid
+ProtectClock=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+# Loopback only; it must never be reachable from off the machine.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+IPAddressDeny=any
+IPAddressAllow=localhost
+
+# MemoryDenyWriteExecute stays off: llama.cpp maps model weights and some
+# builds JIT their kernels.
+MemoryDenyWriteExecute=no
+
+[Install]
+WantedBy=multi-user.target

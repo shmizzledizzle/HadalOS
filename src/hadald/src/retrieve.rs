@@ -171,10 +171,48 @@ impl Index {
 /// Each carries its `ref` so the model can cite a real location rather than
 /// inventing one — which is the entire point. A passage without provenance is
 /// indistinguishable from a hallucination once it reaches the answer.
+/// Retrieval's share of the context window, in bytes.
+///
+/// Mirrors `RESERVED_RETRIEVAL_TOKENS` in the broker's `executor.rs`, converted
+/// at a conservative 3 bytes/token — documentation prose packs better than the
+/// build-log text that sets the read cap, but not by enough to guess at.
+///
+/// This existed as no limit at all, which was survivable only because nothing
+/// else was near the window either. `k` is caller-supplied and clamped to 20,
+/// chunks run to ~6 KB, so an unlucky query could contribute ~120 KB — around
+/// 40k tokens — on top of a read that had already claimed most of the budget.
+/// Two unbounded inputs sharing one fixed window is the shape of the bug that
+/// made `hadal explain` fail; capping one and not the other only moves it.
+const MAX_PASSAGE_BYTES: usize = 24_000 * 3;
+
+/// Render ranked passages, newest-relevance first, within the retrieval budget.
+///
+/// Truncation drops whole passages from the tail rather than cutting one
+/// mid-sentence: `hits` arrives sorted by descending relevance, so the last one
+/// is the least useful, and half a passage costs its citation the credibility
+/// the `[ref]` prefix exists to give it.
 pub fn format_passages(hits: &[(f32, &Chunk)]) -> String {
     let mut out = String::new();
+    let mut dropped = 0usize;
     for (score, chunk) in hits {
-        out.push_str(&format!("[{}] (relevance {score:.2})\n{}\n\n", chunk.r#ref, chunk.text));
+        let piece = format!("[{}] (relevance {score:.2})\n{}\n\n", chunk.r#ref, chunk.text);
+        // Always emit the first passage even if it alone exceeds the budget.
+        // Returning nothing because the single best hit is oversized would be a
+        // silent retrieval failure, which is the outcome retrieval exists to
+        // prevent; an oversized prompt at least fails loudly upstream.
+        if !out.is_empty() && out.len() + piece.len() > MAX_PASSAGE_BYTES {
+            dropped += 1;
+            continue;
+        }
+        out.push_str(&piece);
+    }
+    if dropped > 0 {
+        tracing::debug!(
+            "retrieval budget: kept {} of {} passages ({} bytes)",
+            hits.len() - dropped,
+            hits.len(),
+            out.len()
+        );
     }
     out
 }
